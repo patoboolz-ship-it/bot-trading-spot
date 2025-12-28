@@ -1784,7 +1784,7 @@ class OptimizerGUI:
                         self.root.after(0, self.log, "[FIN] Mejor encontrado:")
                         self.root.after(0, self.log, json.dumps(asdict(self.best_genome), indent=2, ensure_ascii=False))
                 except Exception as e:
-                    self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+                    self.root.after(0, lambda err=e: messagebox.showerror("Error", str(err)))
 
             self.worker = threading.Thread(target=job, daemon=True)
             self.worker.start()
