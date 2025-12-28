@@ -1832,6 +1832,13 @@ def build_main_ui(root: tk.Tk):
     def apply_params_to_bot(params):
         bot_gui.set_params(params, log_msg="[OK] Parámetros del optimizador cargados en Bot.")
 
+    if "OptimizerGUI" not in globals():
+        messagebox.showerror(
+            "Error",
+            "OptimizerGUI no está definido. Asegúrate de usar el archivo completo con la sección del optimizador.",
+        )
+        return bot_gui
+
     OptimizerGUI(opt_frame, apply_params_to_bot)
 
     bot_gui.log(f"DRY_RUN={DRY_RUN} | SYMBOL={SYMBOL} | INTERVAL={INTERVAL}")
