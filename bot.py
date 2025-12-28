@@ -31,6 +31,8 @@ from binance.exceptions import BinanceAPIException
 
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
+from typing import Optional
+import requests
 
 
 # =========================
@@ -745,9 +747,15 @@ class SpotBot:
 # =========================
 
 class BotGUI:
-    def __init__(self, root: tk.Tk):
-        self.root = root
-        self.root.title("Bot SPOT (RSI+MACD+Consec) - Binance")
+    def __init__(self, parent: tk.Misc):
+        self.root = parent
+
+        # Si parent es un Frame, igual podemos setear el título del toplevel (la ventana)
+        toplevel = parent.winfo_toplevel()
+        try:
+            toplevel.title("Bot SPOT (RSI+MACD+Consec) - Binance")
+        except Exception:
+            pass
 
         # client
         self.client = None
@@ -869,6 +877,12 @@ class BotGUI:
         self._refresh_params_box()
         self.log("[OK] GEN235 cargado en parámetros.")
 
+    def set_params(self, params: dict, log_msg: Optional[str] = None):
+        self.params = params.copy()
+        self._refresh_params_box()
+        if log_msg:
+            self.log(log_msg)
+
     def start(self):
         if not self.client:
             messagebox.showwarning("Aviso", "Primero conecta.")
@@ -910,11 +924,940 @@ class BotGUI:
             messagebox.showerror("Error", str(e))
 
 
+# =========================
+# Optimizer / GA
+# =========================
+
+BINANCE_BASE = "https://api.binance.com"
+INTERVAL_MS = {
+    "1m": 60_000,
+    "3m": 180_000,
+    "5m": 300_000,
+    "15m": 900_000,
+    "30m": 1_800_000,
+    "45m": 2_700_000,
+    "1h": 3_600_000,
+    "2h": 7_200_000,
+    "4h": 14_400_000,
+    "1d": 86_400_000,
+}
+
+
+def fetch_klines_public(symbol: str, interval: str, limit: int):
+    if interval not in INTERVAL_MS:
+        raise ValueError(f"Intervalo no soportado: {interval}")
+
+    out = []
+    remaining = int(limit)
+    end_time = None
+
+    while remaining > 0:
+        batch = min(1000, remaining)
+        params = {"symbol": symbol.upper(), "interval": interval, "limit": batch}
+        if end_time is not None:
+            params["endTime"] = end_time
+
+        r = requests.get(BINANCE_BASE + "/api/v3/klines", params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        if not data:
+            break
+
+        chunk = []
+        for k in data:
+            chunk.append({
+                "t": int(k[0]),
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+                "v": float(k[5]),
+            })
+
+        out = chunk + out
+        remaining -= len(chunk)
+
+        first_t = chunk[0]["t"]
+        end_time = first_t - 1
+
+        if len(chunk) < batch:
+            break
+
+        time.sleep(0.12)
+
+    if len(out) > limit:
+        out = out[-limit:]
+    return out
+
+
+@dataclass
+class Genome:
+    use_ha: int
+    rsi_period: int
+    rsi_oversold: float
+    rsi_overbought: float
+    macd_fast: int
+    macd_slow: int
+    macd_signal: int
+    consec_red: int
+    consec_green: int
+
+    w_buy_rsi: float
+    w_buy_macd: float
+    w_buy_consec: float
+    buy_th: float
+
+    w_sell_rsi: float
+    w_sell_macd: float
+    w_sell_consec: float
+    sell_th: float
+
+    take_profit: float
+    stop_loss: float
+    cooldown: int
+    edge_trigger: int
+
+
+class ParamSpace:
+    def __init__(self):
+        self.spec = {}
+
+    def add(self, name: str, lo, hi, step, ptype: str):
+        self.spec[name] = {"min": lo, "max": hi, "step": step, "type": ptype}
+
+    def quantize(self, name: str, x):
+        s = self.spec[name]
+        lo, hi, st, tp = s["min"], s["max"], s["step"], s["type"]
+        x = max(lo, min(x, hi))
+        if tp == "int":
+            return int(round(x))
+        if st <= 0:
+            return float(x)
+        q = round((x - lo) / st) * st + lo
+        q = float(f"{q:.10f}")
+        return max(lo, min(q, hi))
+
+    def sample(self):
+        g = {}
+        for k, s in self.spec.items():
+            lo, hi, tp = s["min"], s["max"], s["type"]
+            if tp == "int":
+                g[k] = random.randint(int(lo), int(hi))
+            else:
+                g[k] = lo + (hi - lo) * random.random()
+                g[k] = self.quantize(k, g[k])
+
+        g["w_buy_rsi"], g["w_buy_macd"], g["w_buy_consec"] = normalize3(
+            g["w_buy_rsi"], g["w_buy_macd"], g["w_buy_consec"]
+        )
+        g["w_sell_rsi"], g["w_sell_macd"], g["w_sell_consec"] = normalize3(
+            g["w_sell_rsi"], g["w_sell_macd"], g["w_sell_consec"]
+        )
+        if g["macd_slow"] <= g["macd_fast"]:
+            g["macd_slow"] = min(self.spec["macd_slow"]["max"], g["macd_fast"] + 5)
+        return Genome(**g)
+
+    def clamp_genome(self, ge: Genome):
+        d = asdict(ge)
+        for k in d:
+            d[k] = self.quantize(k, d[k])
+
+        d["w_buy_rsi"], d["w_buy_macd"], d["w_buy_consec"] = normalize3(
+            d["w_buy_rsi"], d["w_buy_macd"], d["w_buy_consec"]
+        )
+        d["w_sell_rsi"], d["w_sell_macd"], d["w_sell_consec"] = normalize3(
+            d["w_sell_rsi"], d["w_sell_macd"], d["w_sell_consec"]
+        )
+        if d["macd_slow"] <= d["macd_fast"]:
+            d["macd_slow"] = min(self.spec["macd_slow"]["max"], d["macd_fast"] + 5)
+        return Genome(**d)
+
+
+@dataclass
+class Metrics:
+    score: float
+    net: float
+    max_dd: float
+    dd_pct: float
+    trades: int
+    wins: int
+    losses: int
+    winrate: float
+    pf: float
+
+
+def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float):
+    if len(candles) < 200:
+        return Metrics(score=-1e9, net=-1.0, max_dd=1.0, dd_pct=100.0,
+                       trades=0, wins=0, losses=0, winrate=0.0, pf=0.0)
+
+    data = heikin_ashi(candles) if ge.use_ha == 1 else candles
+    close = [c["close"] for c in data]
+
+    rsi_arr = rsi(close, ge.rsi_period)
+    mh_arr = macd_hist(close, ge.macd_fast, ge.macd_slow, ge.macd_signal)
+
+    def buy_score(i: int) -> float:
+        rsi_val = rsi_arr[i]
+        mh = mh_arr[i]
+        mh_prev = mh_arr[i - 1] if i > 0 else mh
+        rsi_sig = buy_rsi_signal(rsi_val, ge.rsi_oversold, ge.rsi_overbought)
+        macd_sig = buy_macd_signal(mh, mh_prev, ge.edge_trigger)
+        cons_sig = consec_up(close[: i + 1], ge.consec_green)
+        wbr, wbm, wbc = normalize3(ge.w_buy_rsi, ge.w_buy_macd, ge.w_buy_consec)
+        return wbr * rsi_sig + wbm * macd_sig + wbc * cons_sig
+
+    def sell_score(i: int) -> float:
+        rsi_val = rsi_arr[i]
+        mh = mh_arr[i]
+        mh_prev = mh_arr[i - 1] if i > 0 else mh
+        rsi_sig = sell_rsi_signal(rsi_val, ge.rsi_oversold, ge.rsi_overbought)
+        macd_sig = sell_macd_signal(mh, mh_prev, ge.edge_trigger)
+        cons_sig = consec_down(close[: i + 1], ge.consec_red)
+        wsr, wsm, wsc = normalize3(ge.w_sell_rsi, ge.w_sell_macd, ge.w_sell_consec)
+        return wsr * rsi_sig + wsm * macd_sig + wsc * cons_sig
+
+    equity = 1.0
+    peak = equity
+    max_dd = 0.0
+
+    in_pos = False
+    entry = 0.0
+    entry_i = -10_000
+    last_trade_i = -10_000
+
+    gross_profit = 0.0
+    gross_loss = 0.0
+    wins = 0
+    losses = 0
+    trades = 0
+
+    for i in range(2, len(close)):
+        peak = max(peak, equity)
+        dd = peak - equity
+        if dd > max_dd:
+            max_dd = dd
+
+        sig_i = i - 1
+        exec_px = close[i]
+
+        bs = buy_score(sig_i)
+        ss = sell_score(sig_i)
+
+        if i - last_trade_i < int(ge.cooldown):
+            continue
+
+        if not in_pos:
+            if bs >= ge.buy_th:
+                buy_price = exec_px * (1.0 + slip_per_side)
+                equity *= (1.0 - fee_per_side)
+                entry = buy_price
+                in_pos = True
+                entry_i = i
+                last_trade_i = i
+        else:
+            if i <= entry_i:
+                continue
+
+            px = exec_px
+            tp_px = entry * (1.0 + float(ge.take_profit))
+            sl_px = entry * (1.0 - float(ge.stop_loss))
+
+            exit_reason = None
+            if px >= tp_px:
+                exit_reason = "TP"
+            elif px <= sl_px:
+                exit_reason = "SL"
+            elif ss >= ge.sell_th:
+                exit_reason = "SIG"
+
+            if exit_reason is not None:
+                sell_price = px * (1.0 - slip_per_side)
+                gross_ratio = (sell_price / (entry + 1e-12))
+                trade_ratio = (1.0 - fee_per_side) * gross_ratio
+                trade_ret = trade_ratio - 1.0
+
+                equity *= trade_ratio
+
+                trades += 1
+                if trade_ret >= 0:
+                    wins += 1
+                    gross_profit += trade_ret
+                else:
+                    losses += 1
+                    gross_loss += (-trade_ret)
+
+                in_pos = False
+                entry = 0.0
+                entry_i = -10_000
+                last_trade_i = i
+
+    net = equity - 1.0
+    dd_pct = (max_dd / (peak + 1e-12)) * 100.0
+
+    pf_raw = gross_profit / (gross_loss + 1e-6)
+    pf = max(0.0, min(pf_raw, 10.0))
+    winrate = (wins / trades * 100.0) if trades > 0 else 0.0
+
+    score = math.log1p(max(0.0, pf)) + net - (max_dd * 1.0)
+
+    return Metrics(score=score, net=net, max_dd=max_dd, dd_pct=dd_pct,
+                   trades=trades, wins=wins, losses=losses, winrate=winrate, pf=pf)
+
+
+@dataclass
+class GAConfig:
+    population: int
+    generations: int
+    elite: int
+    n_cons: int
+    n_exp: int
+    n_wild: int
+
+    fee_side: float
+    fee_mult: float
+    slip_side: float
+
+    dd_weight: float
+    trade_floor: int
+    pen_per_missing_trade: float
+
+
+BLOCKS = {
+    "RSI": ["rsi_period", "rsi_oversold", "rsi_overbought"],
+    "MACD": ["macd_fast", "macd_slow", "macd_signal"],
+    "CONSEC": ["consec_red", "consec_green"],
+    "RISK": ["take_profit", "stop_loss", "cooldown", "edge_trigger", "use_ha"],
+    "CONF": [
+        "w_buy_rsi", "w_buy_macd", "w_buy_consec", "buy_th",
+        "w_sell_rsi", "w_sell_macd", "w_sell_consec", "sell_th",
+    ],
+}
+
+
+def mutate_block(child, space: ParamSpace, block_name: str, strength: float):
+    keys = BLOCKS[block_name]
+    for gk in keys:
+        spec = space.spec[gk]
+        lo, hi, tp = spec["min"], spec["max"], spec["type"]
+
+        if tp == "int":
+            if random.random() < (0.60 * strength + 0.15):
+                child[gk] = random.randint(int(lo), int(hi))
+            else:
+                cur = int(child[gk])
+                step = max(1, int(spec["step"]))
+                delta = step * random.randint(1, max(1, int(1 + 4 * strength)))
+                child[gk] = int(max(lo, min(cur + (delta if random.random() < 0.5 else -delta), hi)))
+        else:
+            span = (hi - lo)
+            if random.random() < (0.60 * strength + 0.15):
+                child[gk] = lo + (hi - lo) * random.random()
+            else:
+                cur = float(child[gk])
+                delta = span * (0.03 + 0.18 * strength * random.random())
+                child[gk] = cur + (delta if random.random() < 0.5 else -delta)
+                child[gk] = space.quantize(gk, child[gk])
+
+        child[gk] = space.quantize(gk, child[gk])
+
+    if block_name == "CONF":
+        child["w_buy_rsi"], child["w_buy_macd"], child["w_buy_consec"] = normalize3(
+            child["w_buy_rsi"], child["w_buy_macd"], child["w_buy_consec"]
+        )
+        child["w_sell_rsi"], child["w_sell_macd"], child["w_sell_consec"] = normalize3(
+            child["w_sell_rsi"], child["w_sell_macd"], child["w_sell_consec"]
+        )
+
+    if block_name == "MACD":
+        if child["macd_slow"] <= child["macd_fast"]:
+            child["macd_slow"] = min(space.spec["macd_slow"]["max"], child["macd_fast"] + 5)
+            child["macd_slow"] = space.quantize("macd_slow", child["macd_slow"])
+
+
+def make_child_blocky(
+    space: ParamSpace,
+    p1: Genome,
+    p2: Genome,
+    mut_rate: float,
+    max_blocks_per_child: int,
+    forced_block: Optional[str] = None,
+    strength: float = 0.8,
+):
+    d1 = asdict(p1)
+    d2 = asdict(p2)
+    child = {}
+
+    for k in d1:
+        child[k] = d1[k] if random.random() < 0.5 else d2[k]
+
+    if random.random() < mut_rate:
+        block_names = list(BLOCKS.keys())
+        random.shuffle(block_names)
+
+        chosen = []
+        if forced_block and forced_block in BLOCKS:
+            chosen.append(forced_block)
+
+        need = random.randint(1, max_blocks_per_child)
+        for bn in block_names:
+            if bn in chosen:
+                continue
+            chosen.append(bn)
+            if len(chosen) >= need:
+                break
+
+        for bn in chosen:
+            mutate_block(child, space, bn, strength=strength)
+
+    ge = Genome(**child)
+    return space.clamp_genome(ge)
+
+
+def force_coverage(space: ParamSpace, n: int):
+    keys = list(space.spec.keys())
+    out = []
+    for i in range(n):
+        g = space.sample()
+        d = asdict(g)
+        k = keys[i % len(keys)]
+        if space.spec[k]["type"] == "int":
+            d[k] = int(space.spec[k]["min"] if (i // len(keys)) % 2 == 0 else space.spec[k]["max"])
+        else:
+            d[k] = float(space.spec[k]["min"] if (i // len(keys)) % 2 == 0 else space.spec[k]["max"])
+        ge = space.clamp_genome(Genome(**d))
+        out.append(ge)
+    return out
+
+
+def run_ga(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
+    fee_per_side = cfg.fee_side * cfg.fee_mult
+    slip_per_side = cfg.slip_side
+
+    log_fn(f"[COSTOS] SPOT | fee_lado={fee_per_side:.6f} (incluye mult) | slip_lado={slip_per_side:.6f}")
+
+    pop = [space.sample() for _ in range(cfg.population)]
+    cov = force_coverage(space, max(12, cfg.population // 6))
+    pop[:len(cov)] = cov
+    log_fn(f"[COBERTURA] forcé {len(cov)} individuos para cubrir rangos completos (inicio)")
+
+    best_global = None
+    best_metrics = None
+    stuck = 0
+
+    for gen in range(1, cfg.generations + 1):
+        if stop_flag():
+            log_fn("[STOP] detenido por el usuario.")
+            return best_global, best_metrics
+
+        scored = []
+        for ge in pop:
+            m = simulate_spot(candles, ge, fee_per_side, slip_per_side)
+
+            missing = max(0, cfg.trade_floor - m.trades)
+            penalty_trades = missing * cfg.pen_per_missing_trade
+            score = (math.log1p(max(0.0, m.pf)) + m.net) - (cfg.dd_weight * m.max_dd) - penalty_trades
+
+            scored.append((score, ge, m))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        best_score, best_ge, best_m = scored[0]
+
+        if best_global is None or best_score > best_global[0] + 1e-9:
+            best_global = (best_score, best_ge)
+            best_metrics = best_m
+            stuck = 0
+        else:
+            stuck += 1
+
+        log_fn(
+            f"[GEN {gen}] score={best_score:.4f} | net={best_m.net:.4f} | "
+            f"DD={best_m.max_dd:.4f} ({best_m.dd_pct:.2f}%) | trades={best_m.trades} "
+            f"wr={best_m.winrate:.1f}% PF={best_m.pf:.2f} | "
+            f"HA={best_ge.use_ha} RSI(p={best_ge.rsi_period},os={best_ge.rsi_oversold:.0f},ob={best_ge.rsi_overbought:.0f}) | "
+            f"MACD({best_ge.macd_fast},{best_ge.macd_slow},{best_ge.macd_signal}) | "
+            f"consec(R={best_ge.consec_red},G={best_ge.consec_green}) | "
+            f"TP={best_ge.take_profit:.3f} SL={best_ge.stop_loss:.3f} cd={best_ge.cooldown} edge={best_ge.edge_trigger} | "
+            f"buy_th={best_ge.buy_th:.2f} sell_th={best_ge.sell_th:.2f} | "
+            f"Wbuy({best_ge.w_buy_rsi:.2f},{best_ge.w_buy_macd:.2f},{best_ge.w_buy_consec:.2f}) "
+            f"Wsell({best_ge.w_sell_rsi:.2f},{best_ge.w_sell_macd:.2f},{best_ge.w_sell_consec:.2f})"
+        )
+
+        if stuck >= 15:
+            stuck = 0
+            log_fn("[ANTI-PEGADO] se pegó -> meto más wild + más cobertura")
+            cfg.n_wild = min(cfg.population - cfg.elite, cfg.n_wild + 20)
+            extra_cov = force_coverage(space, max(10, cfg.population // 8))
+        else:
+            extra_cov = []
+
+        elite = [x[1] for x in scored[:cfg.elite]]
+        pool = [x[1] for x in scored[:max(cfg.elite * 6, cfg.population // 2)]]
+
+        children = []
+
+        block_cycle = ["RSI", "MACD", "CONSEC", "RISK", "CONF"]
+        bc_i = 0
+
+        for _ in range(cfg.n_cons):
+            p1 = random.choice(pool)
+            p2 = random.choice(pool)
+            forced = block_cycle[bc_i % len(block_cycle)]
+            bc_i += 1
+            children.append(make_child_blocky(space, p1, p2, mut_rate=0.28, max_blocks_per_child=1,
+                                              forced_block=forced, strength=0.55))
+
+        for _ in range(cfg.n_exp):
+            p1 = random.choice(pool)
+            p2 = random.choice(pool)
+            forced = block_cycle[bc_i % len(block_cycle)]
+            bc_i += 1
+            children.append(make_child_blocky(space, p1, p2, mut_rate=0.60, max_blocks_per_child=2,
+                                              forced_block=forced, strength=0.80))
+
+        for _ in range(cfg.n_wild):
+            if random.random() < 0.35:
+                children.append(space.sample())
+            else:
+                p1 = random.choice(pool)
+                p2 = random.choice(pool)
+                forced = block_cycle[bc_i % len(block_cycle)]
+                bc_i += 1
+                children.append(make_child_blocky(space, p1, p2, mut_rate=0.90, max_blocks_per_child=3,
+                                                  forced_block=forced, strength=1.00))
+
+        new_pop = elite + children
+        if extra_cov:
+            k = min(len(extra_cov), max(5, cfg.population // 10))
+            new_pop[-k:] = extra_cov[:k]
+
+        if len(new_pop) > cfg.population:
+            new_pop = new_pop[:cfg.population]
+        while len(new_pop) < cfg.population:
+            new_pop.append(space.sample())
+
+        pop = new_pop
+
+    return best_global, best_metrics
+
+
+class OptimizerGUI:
+    def __init__(self, root: tk.Widget, apply_callback):
+        self.root = root
+        self.apply_callback = apply_callback
+
+        self.worker = None
+        self._stop = False
+        self.best_genome = None
+        self.best_metrics = None
+        self.cached_candles = None
+
+        self.var_symbol = tk.StringVar(value=SYMBOL)
+        self.var_tf = tk.StringVar(value=INTERVAL)
+        self.var_candles = tk.IntVar(value=3000)
+
+        self.var_pop = tk.IntVar(value=160)
+        self.var_gens = tk.IntVar(value=120)
+        self.var_elite = tk.IntVar(value=6)
+
+        self.var_cons = tk.IntVar(value=50)
+        self.var_exp = tk.IntVar(value=50)
+        self.var_wild = tk.IntVar(value=54)
+
+        self.var_fee = tk.DoubleVar(value=0.001)
+        self.var_fee_mult = tk.DoubleVar(value=1.1)
+        self.var_slip = tk.DoubleVar(value=0.0002)
+
+        self.var_dd_w = tk.DoubleVar(value=2.5)
+        self.var_trade_floor = tk.IntVar(value=120)
+        self.var_pen_missing = tk.DoubleVar(value=0.35)
+
+        self.space = self.build_space_defaults()
+        self.build_ui()
+
+    def build_space_defaults(self):
+        sp = ParamSpace()
+        sp.add("use_ha", 0, 1, 1, "int")
+
+        sp.add("rsi_period", 6, 30, 1, "int")
+        sp.add("rsi_oversold", 20.0, 40.0, 1.0, "float")
+        sp.add("rsi_overbought", 60.0, 90.0, 1.0, "float")
+
+        sp.add("macd_fast", 3, 25, 1, "int")
+        sp.add("macd_slow", 10, 120, 1, "int")
+        sp.add("macd_signal", 3, 50, 1, "int")
+
+        sp.add("consec_red", 1, 8, 1, "int")
+        sp.add("consec_green", 1, 8, 1, "int")
+
+        sp.add("w_buy_rsi", 0.0, 1.0, 0.01, "float")
+        sp.add("w_buy_macd", 0.0, 1.0, 0.01, "float")
+        sp.add("w_buy_consec", 0.0, 1.0, 0.01, "float")
+        sp.add("buy_th", 0.45, 0.85, 0.01, "float")
+
+        sp.add("w_sell_rsi", 0.0, 1.0, 0.01, "float")
+        sp.add("w_sell_macd", 0.0, 1.0, 0.01, "float")
+        sp.add("w_sell_consec", 0.0, 1.0, 0.01, "float")
+        sp.add("sell_th", 0.45, 0.85, 0.01, "float")
+
+        sp.add("take_profit", 0.01, 0.08, 0.001, "float")
+        sp.add("stop_loss", 0.005, 0.06, 0.001, "float")
+
+        sp.add("cooldown", 0, 12, 1, "int")
+        sp.add("edge_trigger", 0, 1, 1, "int")
+        return sp
+
+    def build_ui(self):
+        pad = 6
+        frm = ttk.Frame(self.root, padding=10)
+        frm.pack(fill="both", expand=True)
+
+        top = ttk.Frame(frm)
+        top.pack(fill="x", padx=pad, pady=pad)
+
+        def add_labeled(entry_parent, label, var, w=10):
+            f = ttk.Frame(entry_parent)
+            ttk.Label(f, text=label).pack(side="left")
+            e = ttk.Entry(f, textvariable=var, width=w)
+            e.pack(side="left", padx=4)
+            f.pack(side="left", padx=8)
+            return e
+
+        add_labeled(top, "Símbolo:", self.var_symbol, 10)
+        ttk.Label(top, text="Temporalidad:").pack(side="left", padx=4)
+        cb = ttk.Combobox(top, textvariable=self.var_tf, values=list(INTERVAL_MS.keys()), width=6, state="readonly")
+        cb.pack(side="left", padx=4)
+        add_labeled(top, "Velas:", self.var_candles, 8)
+
+        mid = ttk.Frame(frm)
+        mid.pack(fill="x", padx=pad, pady=pad)
+        add_labeled(mid, "Población:", self.var_pop, 8)
+        add_labeled(mid, "Generaciones:", self.var_gens, 8)
+        add_labeled(mid, "Elite:", self.var_elite, 6)
+
+        kids = ttk.Frame(frm)
+        kids.pack(fill="x", padx=pad, pady=pad)
+        add_labeled(kids, "Hijos cons:", self.var_cons, 6)
+        add_labeled(kids, "exp:", self.var_exp, 6)
+        add_labeled(kids, "wild:", self.var_wild, 6)
+
+        costs = ttk.Frame(frm)
+        costs.pack(fill="x", padx=pad, pady=pad)
+        add_labeled(costs, "fee/lado:", self.var_fee, 8)
+        add_labeled(costs, "mult fee:", self.var_fee_mult, 6)
+        add_labeled(costs, "slip/lado:", self.var_slip, 8)
+
+        fit = ttk.Frame(frm)
+        fit.pack(fill="x", padx=pad, pady=pad)
+        add_labeled(fit, "DD weight:", self.var_dd_w, 6)
+        add_labeled(fit, "Trade floor:", self.var_trade_floor, 8)
+        add_labeled(fit, "Pen/trade falt.:", self.var_pen_missing, 8)
+
+        ranges = ttk.LabelFrame(frm, text="Rangos (min / max / step)")
+        ranges.pack(fill="both", expand=False, padx=pad, pady=pad)
+
+        self.range_entries = {}
+        headers = ("Parámetro", "Min", "Max", "Step", "Tipo")
+        for j, h in enumerate(headers):
+            ttk.Label(ranges, text=h, font=("Segoe UI", 9, "bold")).grid(row=0, column=j, padx=6, pady=4, sticky="w")
+            ttk.Label(ranges, text=h, font=("Segoe UI", 9, "bold")).grid(row=0, column=j + 6, padx=6, pady=4, sticky="w")
+
+        items = list(self.space.spec.items())
+        per_col = math.ceil(len(items) / 2)
+        separator = ttk.Separator(ranges, orient="vertical")
+        separator.grid(row=0, column=5, rowspan=per_col + 1, sticky="ns", padx=4)
+
+        for idx, (name, s) in enumerate(items):
+            col_block = 0 if idx < per_col else 1
+            row = 1 + (idx if idx < per_col else idx - per_col)
+            base_col = col_block * 6
+
+            ttk.Label(ranges, text=self.pretty_name(name)).grid(row=row, column=base_col + 0, padx=6, pady=2, sticky="w")
+            vmin = tk.StringVar(value=str(s["min"]))
+            vmax = tk.StringVar(value=str(s["max"]))
+            vstep = tk.StringVar(value=str(s["step"]))
+            ttk.Entry(ranges, textvariable=vmin, width=10).grid(row=row, column=base_col + 1, padx=6, pady=2)
+            ttk.Entry(ranges, textvariable=vmax, width=10).grid(row=row, column=base_col + 2, padx=6, pady=2)
+            ttk.Entry(ranges, textvariable=vstep, width=10).grid(row=row, column=base_col + 3, padx=6, pady=2)
+            ttk.Label(ranges, text=s["type"]).grid(row=row, column=base_col + 4, padx=6, pady=2, sticky="w")
+            self.range_entries[name] = (vmin, vmax, vstep)
+
+        btns = ttk.Frame(frm)
+        btns.pack(fill="x", padx=pad, pady=pad)
+
+        ttk.Button(btns, text="Guardar parámetros", command=self.save_params).pack(side="left", padx=4)
+        ttk.Button(btns, text="Cargar parámetros", command=self.load_params).pack(side="left", padx=4)
+        ttk.Button(btns, text="Iniciar optimización", command=self.start).pack(side="left", padx=20)
+        ttk.Button(btns, text="Detener", command=self.stop).pack(side="left")
+        ttk.Button(btns, text="Backtest rápido", command=self.quick_backtest).pack(side="left", padx=8)
+        ttk.Button(btns, text="Usar mejor en Bot", command=self.apply_best).pack(side="right")
+
+        self.txt = tk.Text(frm, height=16, wrap="word")
+        self.txt.pack(fill="both", expand=True, padx=pad, pady=pad)
+
+        self.log("Listo. Defaults cargados (recomendados).")
+
+    def pretty_name(self, key: str) -> str:
+        m = {
+            "use_ha": "Usar Heikin Ashi (0/1)",
+            "rsi_period": "RSI periodo",
+            "rsi_oversold": "RSI sobrevendido",
+            "rsi_overbought": "RSI sobrecomprado",
+            "macd_fast": "MACD rápido",
+            "macd_slow": "MACD lento",
+            "macd_signal": "MACD señal",
+            "consec_red": "Consec rojas N",
+            "consec_green": "Consec verdes N",
+            "w_buy_rsi": "Peso compra RSI",
+            "w_buy_macd": "Peso compra MACD",
+            "w_buy_consec": "Peso compra Consecutivas",
+            "buy_th": "Umbral compra",
+            "w_sell_rsi": "Peso venta RSI",
+            "w_sell_macd": "Peso venta MACD",
+            "w_sell_consec": "Peso venta Consecutivas",
+            "sell_th": "Umbral venta",
+            "take_profit": "Take Profit",
+            "stop_loss": "Stop Loss",
+            "cooldown": "Cooldown (velas)",
+            "edge_trigger": "EdgeTrigger (0/1)",
+        }
+        return m.get(key, key)
+
+    def log(self, s: str):
+        print(s, flush=True)
+        try:
+            self.txt.insert("end", s + "\n")
+            self.txt.see("end")
+            self.root.update_idletasks()
+        except Exception:
+            pass
+
+    def read_space_from_ui(self):
+        for name, (vmin, vmax, vstep) in self.range_entries.items():
+            s = self.space.spec[name]
+            try:
+                smin = float(vmin.get())
+                smax = float(vmax.get())
+                sst = float(vstep.get())
+            except Exception:
+                raise ValueError(f"Rango inválido en {name}")
+            if s["type"] == "int":
+                smin, smax, sst = int(round(smin)), int(round(smax)), int(round(sst)) if sst != 0 else 1
+                if sst <= 0:
+                    sst = 1
+            else:
+                if sst <= 0:
+                    sst = s["step"]
+            if smax < smin:
+                smin, smax = smax, smin
+            s["min"], s["max"], s["step"] = smin, smax, sst
+
+    def build_cfg(self):
+        pop = int(self.var_pop.get())
+        elite = int(self.var_elite.get())
+        n_cons = int(self.var_cons.get())
+        n_exp = int(self.var_exp.get())
+        n_wild = int(self.var_wild.get())
+        if elite < 1:
+            elite = 1
+        if elite >= pop:
+            elite = max(1, pop // 10)
+
+        total_kids = n_cons + n_exp + n_wild
+        max_kids = pop - elite
+        if total_kids > max_kids:
+            scale = max_kids / max(1, total_kids)
+            n_cons = int(round(n_cons * scale))
+            n_exp = int(round(n_exp * scale))
+            n_wild = max_kids - n_cons - n_exp
+
+        return GAConfig(
+            population=pop,
+            generations=int(self.var_gens.get()),
+            elite=elite,
+            n_cons=n_cons,
+            n_exp=n_exp,
+            n_wild=n_wild,
+            fee_side=float(self.var_fee.get()),
+            fee_mult=float(self.var_fee_mult.get()),
+            slip_side=float(self.var_slip.get()),
+            dd_weight=float(self.var_dd_w.get()),
+            trade_floor=int(self.var_trade_floor.get()),
+            pen_per_missing_trade=float(self.var_pen_missing.get()),
+        )
+
+    def save_params(self):
+        try:
+            self.read_space_from_ui()
+            cfg = self.build_cfg()
+            payload = {
+                "symbol": self.var_symbol.get().strip(),
+                "timeframe": self.var_tf.get().strip(),
+                "candles": int(self.var_candles.get()),
+                "ga": asdict(cfg),
+                "space": self.space.spec,
+            }
+            path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")])
+            if not path:
+                return
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, indent=2, ensure_ascii=False)
+            self.log(f"[OK] Guardado: {path}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def load_params(self):
+        try:
+            path = filedialog.askopenfilename(filetypes=[("JSON", "*.json")])
+            if not path:
+                return
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+
+            self.var_symbol.set(payload.get("symbol", SYMBOL))
+            self.var_tf.set(payload.get("timeframe", INTERVAL))
+            self.var_candles.set(int(payload.get("candles", 3000)))
+
+            ga = payload.get("ga", {})
+            self.var_pop.set(int(ga.get("population", self.var_pop.get())))
+            self.var_gens.set(int(ga.get("generations", self.var_gens.get())))
+            self.var_elite.set(int(ga.get("elite", self.var_elite.get())))
+            self.var_cons.set(int(ga.get("n_cons", self.var_cons.get())))
+            self.var_exp.set(int(ga.get("n_exp", self.var_exp.get())))
+            self.var_wild.set(int(ga.get("n_wild", self.var_wild.get())))
+
+            self.var_fee.set(float(ga.get("fee_side", self.var_fee.get())))
+            self.var_fee_mult.set(float(ga.get("fee_mult", self.var_fee_mult.get())))
+            self.var_slip.set(float(ga.get("slip_side", self.var_slip.get())))
+
+            self.var_dd_w.set(float(ga.get("dd_weight", self.var_dd_w.get())))
+            self.var_trade_floor.set(int(ga.get("trade_floor", self.var_trade_floor.get())))
+            self.var_pen_missing.set(float(ga.get("pen_per_missing_trade", self.var_pen_missing.get())))
+
+            space = payload.get("space", {})
+            for k in self.space.spec:
+                if k in space:
+                    self.space.spec[k].update(space[k])
+                    vmin, vmax, vstep = self.range_entries[k]
+                    vmin.set(str(self.space.spec[k]["min"]))
+                    vmax.set(str(self.space.spec[k]["max"]))
+                    vstep.set(str(self.space.spec[k]["step"]))
+
+            self.log(f"[OK] Cargado: {path}")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def start(self):
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo("Info", "Ya está corriendo.")
+            return
+
+        try:
+            self.read_space_from_ui()
+            cfg = self.build_cfg()
+            symbol = self.var_symbol.get().strip().upper()
+            tf = self.var_tf.get().strip()
+            n = int(self.var_candles.get())
+
+            self._stop = False
+            self.txt.delete("1.0", "end")
+
+            self.log(f"[OK] Temporalidad objetivo: {tf} -> {n} velas")
+            self.log(f"[GA] pop={cfg.population} gens={cfg.generations} elite={cfg.elite} | cons={cfg.n_cons} exp={cfg.n_exp} wild={cfg.n_wild}")
+            self.log("[DESCARGA] Bajando datos desde Binance...")
+
+            def job():
+                try:
+                    candles = fetch_klines_public(symbol, tf, n)
+                    self.cached_candles = candles
+                    self.log(f"[OK] {symbol} cargado: {len(candles)} velas ({tf})")
+                    best_global, best_metrics = run_ga(
+                        candles=candles,
+                        space=self.space,
+                        cfg=cfg,
+                        stop_flag=lambda: self._stop,
+                        log_fn=lambda s: self.root.after(0, self.log, s),
+                    )
+                    self.best_genome = best_global[1] if best_global else None
+                    self.best_metrics = best_metrics
+                    if self.best_genome:
+                        self.root.after(0, self.log, "[FIN] Mejor encontrado:")
+                        self.root.after(0, self.log, json.dumps(asdict(self.best_genome), indent=2, ensure_ascii=False))
+                except Exception as e:
+                    self.root.after(0, lambda: messagebox.showerror("Error", str(e)))
+
+            self.worker = threading.Thread(target=job, daemon=True)
+            self.worker.start()
+
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def stop(self):
+        self._stop = True
+        self.log("[STOP] señal enviada.")
+
+    def quick_backtest(self):
+        try:
+            if not self.cached_candles:
+                symbol = self.var_symbol.get().strip().upper()
+                tf = self.var_tf.get().strip()
+                n = int(self.var_candles.get())
+                self.log("[DESCARGA] Bajando datos desde Binance para backtest...")
+                self.cached_candles = fetch_klines_public(symbol, tf, n)
+
+            ge = self.space.sample()
+            metrics = simulate_spot(self.cached_candles, ge, self.var_fee.get() * self.var_fee_mult.get(), self.var_slip.get())
+            self.log(
+                f"[BACKTEST] net={metrics.net:.4f} DD={metrics.max_dd:.4f} ({metrics.dd_pct:.2f}%) "
+                f"trades={metrics.trades} wr={metrics.winrate:.1f}% PF={metrics.pf:.2f}"
+            )
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def apply_best(self):
+        if not self.best_genome:
+            messagebox.showwarning("Aviso", "Primero ejecuta la optimización.")
+            return
+        params = asdict(self.best_genome)
+        self.apply_callback(params)
+        self.log("[OK] Parámetros aplicados al Bot.")
+
+
+def build_main_ui(root: tk.Tk):
+    root.title("Bot + Optimizador (RSI+MACD+Consec)")
+
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill="both", expand=True)
+
+    opt_frame = ttk.Frame(notebook)
+    bot_frame = ttk.Frame(notebook)
+
+    notebook.add(opt_frame, text="Optimizador")
+    notebook.add(bot_frame, text="Bot")
+
+    bot_gui = BotGUI(bot_frame)
+
+    def apply_params_to_bot(params):
+        bot_gui.set_params(params, log_msg="[OK] Parámetros del optimizador cargados en Bot.")
+
+    if "OptimizerGUI" not in globals():
+        messagebox.showerror(
+            "Error",
+            "OptimizerGUI no está definido. Asegúrate de usar el archivo completo con la sección del optimizador.",
+        )
+        return bot_gui
+
+    OptimizerGUI(opt_frame, apply_params_to_bot)
+
+    bot_gui.log(f"DRY_RUN={DRY_RUN} | SYMBOL={SYMBOL} | INTERVAL={INTERVAL}")
+    bot_gui.log("TIP: Parte con DRY_RUN=True. Cuando estés seguro, cambia DRY_RUN=False.")
+
+    return bot_gui
+
+
 def main():
     root = tk.Tk()
-    gui = BotGUI(root)
-    gui.log(f"DRY_RUN={DRY_RUN} | SYMBOL={SYMBOL} | INTERVAL={INTERVAL}")
-    gui.log("TIP: Parte con DRY_RUN=True. Cuando estés seguro, cambia DRY_RUN=False.")
+    build_main_ui(root)
     root.mainloop()
 
 
