@@ -1560,19 +1560,27 @@ class OptimizerGUI:
         headers = ("Parámetro", "Min", "Max", "Step", "Tipo")
         for j, h in enumerate(headers):
             ttk.Label(ranges, text=h, font=("Segoe UI", 9, "bold")).grid(row=0, column=j, padx=6, pady=4, sticky="w")
+            ttk.Label(ranges, text=h, font=("Segoe UI", 9, "bold")).grid(row=0, column=j + 6, padx=6, pady=4, sticky="w")
 
-        row = 1
-        for name, s in self.space.spec.items():
-            ttk.Label(ranges, text=self.pretty_name(name)).grid(row=row, column=0, padx=6, pady=2, sticky="w")
+        items = list(self.space.spec.items())
+        per_col = math.ceil(len(items) / 2)
+        separator = ttk.Separator(ranges, orient="vertical")
+        separator.grid(row=0, column=5, rowspan=per_col + 1, sticky="ns", padx=4)
+
+        for idx, (name, s) in enumerate(items):
+            col_block = 0 if idx < per_col else 1
+            row = 1 + (idx if idx < per_col else idx - per_col)
+            base_col = col_block * 6
+
+            ttk.Label(ranges, text=self.pretty_name(name)).grid(row=row, column=base_col + 0, padx=6, pady=2, sticky="w")
             vmin = tk.StringVar(value=str(s["min"]))
             vmax = tk.StringVar(value=str(s["max"]))
             vstep = tk.StringVar(value=str(s["step"]))
-            ttk.Entry(ranges, textvariable=vmin, width=10).grid(row=row, column=1, padx=6, pady=2)
-            ttk.Entry(ranges, textvariable=vmax, width=10).grid(row=row, column=2, padx=6, pady=2)
-            ttk.Entry(ranges, textvariable=vstep, width=10).grid(row=row, column=3, padx=6, pady=2)
-            ttk.Label(ranges, text=s["type"]).grid(row=row, column=4, padx=6, pady=2, sticky="w")
+            ttk.Entry(ranges, textvariable=vmin, width=10).grid(row=row, column=base_col + 1, padx=6, pady=2)
+            ttk.Entry(ranges, textvariable=vmax, width=10).grid(row=row, column=base_col + 2, padx=6, pady=2)
+            ttk.Entry(ranges, textvariable=vstep, width=10).grid(row=row, column=base_col + 3, padx=6, pady=2)
+            ttk.Label(ranges, text=s["type"]).grid(row=row, column=base_col + 4, padx=6, pady=2, sticky="w")
             self.range_entries[name] = (vmin, vmax, vstep)
-            row += 1
 
         btns = ttk.Frame(frm)
         btns.pack(fill="x", padx=pad, pady=pad)
