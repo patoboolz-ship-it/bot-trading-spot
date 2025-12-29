@@ -113,6 +113,15 @@ def read_key(path: str) -> str:
         return f.read().strip()
 
 
+def normalize_tp_sl(tp_input: float, sl_input: float) -> tuple[float, float]:
+    # [TP/SL ABS NORMALIZATION] magnitudes only (no signo)
+    tp_pct = abs(float(tp_input))
+    sl_pct = abs(float(sl_input))
+    if tp_pct >= 1.0 or sl_pct >= 1.0:
+        raise ValueError("TP/SL inválido: porcentaje debe ser < 1 (100%).")
+    return tp_pct, sl_pct
+
+
 # =========================
 # Dataclasses
 # =========================
@@ -127,6 +136,13 @@ class Trade:
     quote_spent: float    # USDT
     time_utc: str
     reason: str           # SIGNAL / TP / SL / CLOSE
+    entry_price: float = 0.0
+    tp_pct: float = 0.0
+    sl_pct: float = 0.0
+    tp_price: float = 0.0
+    sl_price: float = 0.0
+    pnl_pct_real: float = 0.0
+    pnl_usdt_real: float = 0.0
     order_id: str = ""
     raw: str = ""
 
@@ -136,9 +152,12 @@ class Position:
     symbol: str
     qty: float
     entry_price: float
+    entry_quote_spent: float
     entry_time_utc: str
-    tp_price: float
-    sl_price: float
+    tp_price: Optional[float]
+    sl_price: Optional[float]
+    tp_pct: float
+    sl_pct: float
 
 
 # =========================
@@ -399,6 +418,9 @@ class SpotBot:
         self.symbol = symbol
         self.interval = interval
         self.params = params.copy()
+        tp_pct, sl_pct = normalize_tp_sl(self.params.get("take_profit", 0.0), self.params.get("stop_loss", 0.0))
+        self.params["take_profit"] = tp_pct
+        self.params["stop_loss"] = sl_pct
         self.ui_cb = ui_cb  # callback para UI
 
         self.tick, self.step, self.min_notional = get_filters(client, symbol)
@@ -445,6 +467,7 @@ class SpotBot:
         self.running = False
 
     def export_excel(self, path: str):
+        # [EXCEL EXPORT] incluye entry_price, tp/sl, y PNL con signo
         open_rows = [asdict(t) for t in self.open_trades]
         closed_rows = [asdict(t) for t in self.closed_trades]
         df_open = pd.DataFrame(open_rows)
@@ -607,17 +630,27 @@ class SpotBot:
     def _open_position_from_trade(self, buy_trade: Trade, last_close_time_ms: int):
         ep = buy_trade.price
         qty = buy_trade.qty
-        tp = ep * (1.0 + float(self.params["take_profit"]))
-        sl = ep * (1.0 - float(self.params["stop_loss"]))
+        tp_pct, sl_pct = normalize_tp_sl(self.params["take_profit"], self.params["stop_loss"])
+        # [TP/SL PRICE CALCULATION] usando magnitudes abs
+        tp = ep * (1.0 + tp_pct) if tp_pct > 0 else None
+        sl = ep * (1.0 - sl_pct) if sl_pct > 0 else None
         self.position = Position(
             symbol=self.symbol,
             qty=qty,
             entry_price=ep,
+            entry_quote_spent=buy_trade.quote_spent,
             entry_time_utc=buy_trade.time_utc,
             tp_price=tp,
-            sl_price=sl
+            sl_price=sl,
+            tp_pct=tp_pct,
+            sl_pct=sl_pct
         )
         self.last_action_bar_close_time = last_close_time_ms
+        buy_trade.entry_price = ep
+        buy_trade.tp_pct = tp_pct
+        buy_trade.sl_pct = sl_pct
+        buy_trade.tp_price = tp or 0.0
+        buy_trade.sl_price = sl or 0.0
         self.open_trades.append(buy_trade)
         self._append_journal(buy_trade)
 
@@ -637,6 +670,16 @@ class SpotBot:
 
         sell_trade = self._place_market_sell_qty(qty, reason=reason)
         if sell_trade:
+            # [P&L WITH SIGN] resultado real con signo
+            pnl_pct_real = (sell_trade.price - self.position.entry_price) / (self.position.entry_price + 1e-12)
+            pnl_usdt_real = sell_trade.quote_spent - self.position.entry_quote_spent
+            sell_trade.entry_price = self.position.entry_price
+            sell_trade.tp_pct = self.position.tp_pct
+            sell_trade.sl_pct = self.position.sl_pct
+            sell_trade.tp_price = self.position.tp_price or 0.0
+            sell_trade.sl_price = self.position.sl_price or 0.0
+            sell_trade.pnl_pct_real = pnl_pct_real
+            sell_trade.pnl_usdt_real = pnl_usdt_real
             self.closed_trades.append(sell_trade)
             self._append_journal(sell_trade)
 
@@ -676,9 +719,9 @@ class SpotBot:
                 # TP/SL (si hay posición)
                 tp_hit = sl_hit = False
                 if in_pos:
-                    if last_close >= self.position.tp_price:
+                    if self.position.tp_price is not None and last_close >= self.position.tp_price:
                         tp_hit = True
-                    if last_close <= self.position.sl_price:
+                    if self.position.sl_price is not None and last_close <= self.position.sl_price:
                         sl_hit = True
 
                 self._emit("tick", {
@@ -725,8 +768,11 @@ class SpotBot:
                         time.sleep(RETRY_SLEEP_SEC)
 
                     if last_trade:
-                        # Consolidar posición por “precio” usando último trade (simple). En real podrías promediar.
-                        self._open_position_from_trade(last_trade, close_time)
+                        if spent_total >= (MIN_FILL_RATIO * target):
+                            # Consolidar posición por “precio” usando último trade (simple). En real podrías promediar.
+                            self._open_position_from_trade(last_trade, close_time)
+                        else:
+                            self._emit("log", {"msg": f"[BUY] Fill insuficiente: spent={spent_total:.4f} < {MIN_FILL_RATIO*100:.0f}% target={target:.4f}. No abro posición."})
 
                 # Cierre por TP/SL primero
                 if in_pos and tp_hit:
@@ -824,7 +870,21 @@ class BotGUI:
         tfrm = ttk.LabelFrame(frm, text="Trades (cerradas)")
         tfrm.pack(fill="both", expand=True, pady=8)
 
-        cols = ("time_utc", "side", "qty", "price", "quote_spent", "reason")
+        cols = (
+            "time_utc",
+            "side",
+            "qty",
+            "price",
+            "quote_spent",
+            "reason",
+            "entry_price",
+            "tp_pct",
+            "sl_pct",
+            "tp_price",
+            "sl_price",
+            "pnl_pct_real",
+            "pnl_usdt_real",
+        )
         self.tree = ttk.Treeview(tfrm, columns=cols, show="headings", height=10)
         for c in cols:
             self.tree.heading(c, text=c)
@@ -861,13 +921,36 @@ class BotGUI:
                     self.var_pos.set("pos: NONE")
                 else:
                     pos = payload["pos"]
-                    self.var_pos.set(f"pos: qty={pos['qty']:.6f} entry={pos['entry_price']:.4f} tp={pos['tp_price']:.4f} sl={pos['sl_price']:.4f}")
+                    tp_disp = f"{pos['tp_price']:.4f}" if pos["tp_price"] is not None else "OFF"
+                    sl_disp = f"{pos['sl_price']:.4f}" if pos["sl_price"] is not None else "OFF"
+                    self.var_pos.set(
+                        f"pos: qty={pos['qty']:.6f} entry={pos['entry_price']:.4f} "
+                        f"TP={pos['tp_pct']*100:.2f}%({tp_disp}) SL={pos['sl_pct']*100:.2f}%({sl_disp})"
+                    )
             # refresh table
             if self.bot:
                 # render last 200 closed trades
                 self.tree.delete(*self.tree.get_children())
                 for tr in self.bot.closed_trades[-200:]:
-                    self.tree.insert("", "end", values=(tr.time_utc, tr.side, f"{tr.qty:.6f}", f"{tr.price:.4f}", f"{tr.quote_spent:.4f}", tr.reason))
+                    self.tree.insert(
+                        "",
+                        "end",
+                        values=(
+                            tr.time_utc,
+                            tr.side,
+                            f"{tr.qty:.6f}",
+                            f"{tr.price:.4f}",
+                            f"{tr.quote_spent:.4f}",
+                            tr.reason,
+                            f"{tr.entry_price:.4f}",
+                            f"{tr.tp_pct*100:.2f}%",
+                            f"{tr.sl_pct*100:.2f}%",
+                            f"{tr.tp_price:.4f}",
+                            f"{tr.sl_price:.4f}",
+                            f"{tr.pnl_pct_real:+.4f}",
+                            f"{tr.pnl_usdt_real:+.4f}",
+                        ),
+                    )
 
         self.root.after(0, _upd)
 
@@ -905,7 +988,11 @@ class BotGUI:
             messagebox.showerror("Parámetros", f"JSON inválido: {e}")
             return
 
-        self.bot = SpotBot(self.client, SYMBOL, INTERVAL, self.params, ui_cb=self.ui_callback)
+        try:
+            self.bot = SpotBot(self.client, SYMBOL, INTERVAL, self.params, ui_cb=self.ui_callback)
+        except ValueError as e:
+            messagebox.showerror("Parámetros", str(e))
+            return
         self.bot.start()
         self.var_status.set("RUN")
         self.log("[BOT] Iniciado.")
@@ -1171,6 +1258,31 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
     losses = 0
     trades = 0
 
+    # [TP/SL ABS NORMALIZATION] magnitudes only (no signo)
+    tp_pct = abs(float(ge.take_profit))
+    sl_pct = abs(float(ge.stop_loss))
+    if tp_pct >= 1.0 or sl_pct >= 1.0:
+        metrics = Metrics(
+            score=-1e9,
+            net=-1.0,
+            balance=0.0,
+            profit=0.0,
+            gross_profit=0.0,
+            gross_loss=0.0,
+            max_dd=1.0,
+            dd_pct=100.0,
+            trades=0,
+            wins=0,
+            losses=0,
+            winrate=0.0,
+            pf=0.0,
+            years=0.0,
+            trades_per_year=0.0,
+            buy_signal_rate=0.0,
+            sell_signal_rate=0.0,
+        )
+        return (metrics, {"events": [], "equity_curve": [], "dd_curve": [], "returns": []}) if trace else metrics
+
     events = []
     equity_curve = []
     dd_curve = []
@@ -1214,13 +1326,14 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
                 continue
 
             px = exec_px
-            tp_px = entry * (1.0 + float(ge.take_profit))
-            sl_px = entry * (1.0 - float(ge.stop_loss))
+            # [TP/SL PRICE CALCULATION] usando magnitudes abs
+            tp_px = entry * (1.0 + tp_pct) if tp_pct > 0 else None
+            sl_px = entry * (1.0 - sl_pct) if sl_pct > 0 else None
 
             exit_reason = None
-            if px >= tp_px:
+            if tp_px is not None and px >= tp_px:
                 exit_reason = "TP"
-            elif px <= sl_px:
+            elif sl_px is not None and px <= sl_px:
                 exit_reason = "SL"
             elif ss >= ge.sell_th:
                 exit_reason = "SIG"
