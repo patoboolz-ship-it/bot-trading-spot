@@ -22,6 +22,8 @@ import time
 import math
 import json
 import random
+import statistics
+import copy
 import threading
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -33,6 +35,9 @@ from binance.exceptions import BinanceAPIException
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from typing import Optional
+
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 import requests
 
 
@@ -66,6 +71,9 @@ DRY_RUN = True
 
 # Logs / journal
 JOURNAL_CSV = "bot_journal.csv"
+
+# Capital inicial para reportes de optimización
+START_CAPITAL = 100000.0
 
 
 # =========================
@@ -1078,6 +1086,10 @@ class ParamSpace:
 class Metrics:
     score: float
     net: float
+    balance: float
+    profit: float
+    gross_profit: float
+    gross_loss: float
     max_dd: float
     dd_pct: float
     trades: int
@@ -1085,12 +1097,34 @@ class Metrics:
     losses: int
     winrate: float
     pf: float
+    years: float
+    trades_per_year: float
+    buy_signal_rate: float
+    sell_signal_rate: float
 
 
-def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float):
+def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float, trace: bool = False):
     if len(candles) < 200:
-        return Metrics(score=-1e9, net=-1.0, max_dd=1.0, dd_pct=100.0,
-                       trades=0, wins=0, losses=0, winrate=0.0, pf=0.0)
+        metrics = Metrics(
+            score=-1e9,
+            net=-1.0,
+            balance=0.0,
+            profit=0.0,
+            gross_profit=0.0,
+            gross_loss=0.0,
+            max_dd=1.0,
+            dd_pct=100.0,
+            trades=0,
+            wins=0,
+            losses=0,
+            winrate=0.0,
+            pf=0.0,
+            years=0.0,
+            trades_per_year=0.0,
+            buy_signal_rate=0.0,
+            sell_signal_rate=0.0,
+        )
+        return (metrics, {"events": [], "equity_curve": [], "dd_curve": [], "returns": []}) if trace else metrics
 
     data = heikin_ashi(candles) if ge.use_ha == 1 else candles
     close = [c["close"] for c in data]
@@ -1126,12 +1160,23 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
     entry = 0.0
     entry_i = -10_000
     last_trade_i = -10_000
+    entry_buy_score = 0.0
+    entry_rsi = 0.0
+    entry_macd = 0.0
+    entry_close = 0.0
 
     gross_profit = 0.0
     gross_loss = 0.0
     wins = 0
     losses = 0
     trades = 0
+
+    events = []
+    equity_curve = []
+    dd_curve = []
+    returns = []
+    buy_signal_hits = 0
+    sell_signal_hits = 0
 
     for i in range(2, len(close)):
         peak = max(peak, equity)
@@ -1144,6 +1189,10 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
 
         bs = buy_score(sig_i)
         ss = sell_score(sig_i)
+        if bs >= ge.buy_th:
+            buy_signal_hits += 1
+        if ss >= ge.sell_th:
+            sell_signal_hits += 1
 
         if i - last_trade_i < int(ge.cooldown):
             continue
@@ -1156,6 +1205,10 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
                 in_pos = True
                 entry_i = i
                 last_trade_i = i
+                entry_buy_score = bs
+                entry_rsi = rsi_arr[sig_i]
+                entry_macd = mh_arr[sig_i]
+                entry_close = close[sig_i]
         else:
             if i <= entry_i:
                 continue
@@ -1179,6 +1232,25 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
                 trade_ret = trade_ratio - 1.0
 
                 equity *= trade_ratio
+                if trace:
+                    candle_time = candles[i].get("close_time", candles[i].get("t"))
+                    events.append({
+                        "i": i,
+                        "time": candle_time,
+                        "side": "SELL",
+                        "reason": exit_reason,
+                        "entry": entry,
+                        "exit": px,
+                        "ret": trade_ret,
+                        "equity": equity,
+                        "dd": (peak - equity) / peak if peak > 0 else 0.0,
+                        "buyScore": entry_buy_score,
+                        "sellScore": ss,
+                        "RSI": entry_rsi,
+                        "MACD_hist": entry_macd,
+                        "close": entry_close,
+                    })
+                    returns.append(trade_ret)
 
                 trades += 1
                 if trade_ret >= 0:
@@ -1193,17 +1265,56 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
                 entry_i = -10_000
                 last_trade_i = i
 
+        if trace:
+            equity_curve.append(equity)
+            dd_curve.append((peak - equity) / peak if peak > 0 else 0.0)
+
     net = equity - 1.0
+    balance = START_CAPITAL * equity
+    profit = balance - START_CAPITAL
     dd_pct = (max_dd / (peak + 1e-12)) * 100.0
 
     pf_raw = gross_profit / (gross_loss + 1e-6)
-    pf = max(0.0, min(pf_raw, 10.0))
+    pf = max(0.0, min(pf_raw, 50.0))
     winrate = (wins / trades * 100.0) if trades > 0 else 0.0
 
-    score = math.log1p(max(0.0, pf)) + net - (max_dd * 1.0)
+    first_ts = candles[0].get("open_time", candles[0].get("t"))
+    last_ts = candles[-1].get("close_time", candles[-1].get("t"))
+    years = max((last_ts - first_ts) / (1000 * 60 * 60 * 24 * 365), 1e-9)
+    trades_per_year = trades / years
+    buy_signal_rate = buy_signal_hits / len(close)
+    sell_signal_rate = sell_signal_hits / len(close)
 
-    return Metrics(score=score, net=net, max_dd=max_dd, dd_pct=dd_pct,
-                   trades=trades, wins=wins, losses=losses, winrate=winrate, pf=pf)
+    score = pf
+
+    metrics = Metrics(
+        score=score,
+        net=net,
+        balance=balance,
+        profit=profit,
+        gross_profit=gross_profit,
+        gross_loss=gross_loss,
+        max_dd=max_dd,
+        dd_pct=dd_pct,
+        trades=trades,
+        wins=wins,
+        losses=losses,
+        winrate=winrate,
+        pf=pf,
+        years=years,
+        trades_per_year=trades_per_year,
+        buy_signal_rate=buy_signal_rate,
+        sell_signal_rate=sell_signal_rate,
+    )
+
+    if trace:
+        return metrics, {
+            "events": events,
+            "equity_curve": equity_curve,
+            "dd_curve": dd_curve,
+            "returns": returns,
+        }
+    return metrics
 
 
 @dataclass
@@ -1223,6 +1334,46 @@ class GAConfig:
     trade_floor: int
     pen_per_missing_trade: float
 
+
+def fitness_from_metrics(m: Metrics, cfg: GAConfig) -> float:
+    if m.trades == 0:
+        return -1e9
+
+    pf_cap = min(m.pf, 50.0)
+    pf_term = math.log1p(pf_cap)
+    dd_pen = cfg.dd_weight * (m.dd_pct / 100.0)
+    missing = max(0, cfg.trade_floor - m.trades)
+    trade_pen = missing * cfg.pen_per_missing_trade
+    bonus = max(0.0, m.net) * 0.2
+    return pf_term - dd_pen - trade_pen + bonus
+
+
+WEIGHT_GENES = [
+    "w_buy_rsi",
+    "w_buy_macd",
+    "w_buy_consec",
+    "w_sell_rsi",
+    "w_sell_macd",
+    "w_sell_consec",
+]
+
+PARAM_GENES = [
+    "rsi_period",
+    "rsi_oversold",
+    "rsi_overbought",
+    "macd_fast",
+    "macd_slow",
+    "macd_signal",
+    "consec_red",
+    "consec_green",
+    "buy_th",
+    "sell_th",
+    "take_profit",
+    "stop_loss",
+    "cooldown",
+    "edge_trigger",
+    "use_ha",
+]
 
 BLOCKS = {
     "RSI": ["rsi_period", "rsi_oversold", "rsi_overbought"],
@@ -1284,6 +1435,7 @@ def make_child_blocky(
     max_blocks_per_child: int,
     forced_block: Optional[str] = None,
     strength: float = 0.8,
+    allowed_blocks: Optional[list[str]] = None,
 ):
     d1 = asdict(p1)
     d2 = asdict(p2)
@@ -1293,7 +1445,7 @@ def make_child_blocky(
         child[k] = d1[k] if random.random() < 0.5 else d2[k]
 
     if random.random() < mut_rate:
-        block_names = list(BLOCKS.keys())
+        block_names = allowed_blocks if allowed_blocks else list(BLOCKS.keys())
         random.shuffle(block_names)
 
         chosen = []
@@ -1331,19 +1483,65 @@ def force_coverage(space: ParamSpace, n: int):
     return out
 
 
-def run_ga(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
+def make_base_genome(space: ParamSpace, base_params: Optional[dict] = None) -> Genome:
+    payload = DEFAULT_GEN.copy()
+    if base_params:
+        payload.update(base_params)
+    ge = Genome(**payload)
+    return space.clamp_genome(ge)
+
+
+def make_freeze_fn(space: ParamSpace, base_genome: Genome, optimize_genes: list[str]):
+    optimize_set = set(optimize_genes)
+    frozen_genes = [k for k in asdict(base_genome).keys() if k not in optimize_set]
+
+    def _freeze(ge: Genome) -> Genome:
+        d = asdict(ge)
+        for k in frozen_genes:
+            d[k] = getattr(base_genome, k)
+        return space.clamp_genome(Genome(**d))
+
+    return _freeze
+
+
+def run_ga(
+    candles,
+    space: ParamSpace,
+    cfg: GAConfig,
+    stop_flag,
+    log_fn,
+    sample_fn=None,
+    postprocess_fn=None,
+    allowed_blocks: Optional[list[str]] = None,
+    initial_population=None,
+    gen_offset: int = 0,
+    return_population: bool = False,
+):
     fee_per_side = cfg.fee_side * cfg.fee_mult
     slip_per_side = cfg.slip_side
 
     log_fn(f"[COSTOS] SPOT | fee_lado={fee_per_side:.6f} (incluye mult) | slip_lado={slip_per_side:.6f}")
 
-    pop = [space.sample() for _ in range(cfg.population)]
+    if sample_fn is None:
+        sample_fn = space.sample
+    if postprocess_fn is None:
+        postprocess_fn = lambda ge: ge
+
+    pop = []
+    if initial_population:
+        pop = [postprocess_fn(ge) for ge in initial_population]
+    if len(pop) < cfg.population:
+        pop.extend(postprocess_fn(sample_fn()) for _ in range(cfg.population - len(pop)))
+    if len(pop) > cfg.population:
+        pop = pop[:cfg.population]
+
     cov = force_coverage(space, max(12, cfg.population // 6))
-    pop[:len(cov)] = cov
+    pop[:len(cov)] = [postprocess_fn(ge) for ge in cov]
     log_fn(f"[COBERTURA] forcé {len(cov)} individuos para cubrir rangos completos (inicio)")
 
     best_global = None
     best_metrics = None
+    prev_best_hash = None
     stuck = 0
 
     for gen in range(1, cfg.generations + 1):
@@ -1354,27 +1552,31 @@ def run_ga(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
         scored = []
         for ge in pop:
             m = simulate_spot(candles, ge, fee_per_side, slip_per_side)
-
-            missing = max(0, cfg.trade_floor - m.trades)
-            penalty_trades = missing * cfg.pen_per_missing_trade
-            score = (math.log1p(max(0.0, m.pf)) + m.net) - (cfg.dd_weight * m.max_dd) - penalty_trades
+            score = fitness_from_metrics(m, cfg)
 
             scored.append((score, ge, m))
 
         scored.sort(key=lambda x: x[0], reverse=True)
         best_score, best_ge, best_m = scored[0]
+        best_hash = hash(tuple(asdict(best_ge).items()))
+        unique_hashes = {hash(tuple(asdict(ge).items())) for _, ge, _ in scored}
+        elite_hashes = [hash(tuple(asdict(ge).items())) for ge in [x[1] for x in scored[:cfg.elite]]]
+        elite_unique = len(set(elite_hashes))
 
         if best_global is None or best_score > best_global[0] + 1e-9:
-            best_global = (best_score, best_ge)
+            best_global = (best_score, copy.deepcopy(best_ge))
             best_metrics = best_m
             stuck = 0
         else:
             stuck += 1
 
+        gen_display = gen + gen_offset
         log_fn(
-            f"[GEN {gen}] score={best_score:.4f} | net={best_m.net:.4f} | "
-            f"DD={best_m.max_dd:.4f} ({best_m.dd_pct:.2f}%) | trades={best_m.trades} "
-            f"wr={best_m.winrate:.1f}% PF={best_m.pf:.2f} | "
+            f"[GEN {gen_display}] score={best_score:.4f} PF={best_m.pf:.2f} "
+            f"trades={best_m.trades} tpy={best_m.trades_per_year:.1f} "
+            f"DD={best_m.dd_pct:.2f}% net={best_m.net:.4f} | "
+            f"ganancia={best_m.profit:.2f} balance={best_m.balance:.2f} | "
+            f"wr={best_m.winrate:.1f}% | "
             f"HA={best_ge.use_ha} RSI(p={best_ge.rsi_period},os={best_ge.rsi_oversold:.0f},ob={best_ge.rsi_overbought:.0f}) | "
             f"MACD({best_ge.macd_fast},{best_ge.macd_slow},{best_ge.macd_signal}) | "
             f"consec(R={best_ge.consec_red},G={best_ge.consec_green}) | "
@@ -1383,6 +1585,11 @@ def run_ga(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
             f"Wbuy({best_ge.w_buy_rsi:.2f},{best_ge.w_buy_macd:.2f},{best_ge.w_buy_consec:.2f}) "
             f"Wsell({best_ge.w_sell_rsi:.2f},{best_ge.w_sell_macd:.2f},{best_ge.w_sell_consec:.2f})"
         )
+        log_fn(
+            f"[DBG] uniq={len(unique_hashes)} elite_unique={elite_unique} "
+            f"best_hash={best_hash} repeated={best_hash == prev_best_hash}"
+        )
+        prev_best_hash = best_hash
 
         if stuck >= 15:
             stuck = 0
@@ -1397,7 +1604,7 @@ def run_ga(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
 
         children = []
 
-        block_cycle = ["RSI", "MACD", "CONSEC", "RISK", "CONF"]
+        block_cycle = allowed_blocks or ["RSI", "MACD", "CONSEC", "RISK", "CONF"]
         bc_i = 0
 
         for _ in range(cfg.n_cons):
@@ -1405,27 +1612,54 @@ def run_ga(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
             p2 = random.choice(pool)
             forced = block_cycle[bc_i % len(block_cycle)]
             bc_i += 1
-            children.append(make_child_blocky(space, p1, p2, mut_rate=0.28, max_blocks_per_child=1,
-                                              forced_block=forced, strength=0.55))
+            child = make_child_blocky(
+                space,
+                p1,
+                p2,
+                mut_rate=0.28,
+                max_blocks_per_child=1,
+                forced_block=forced,
+                strength=0.55,
+                allowed_blocks=allowed_blocks,
+            )
+            children.append(postprocess_fn(child))
 
         for _ in range(cfg.n_exp):
             p1 = random.choice(pool)
             p2 = random.choice(pool)
             forced = block_cycle[bc_i % len(block_cycle)]
             bc_i += 1
-            children.append(make_child_blocky(space, p1, p2, mut_rate=0.60, max_blocks_per_child=2,
-                                              forced_block=forced, strength=0.80))
+            child = make_child_blocky(
+                space,
+                p1,
+                p2,
+                mut_rate=0.60,
+                max_blocks_per_child=2,
+                forced_block=forced,
+                strength=0.80,
+                allowed_blocks=allowed_blocks,
+            )
+            children.append(postprocess_fn(child))
 
         for _ in range(cfg.n_wild):
             if random.random() < 0.35:
-                children.append(space.sample())
+                children.append(postprocess_fn(sample_fn()))
             else:
                 p1 = random.choice(pool)
                 p2 = random.choice(pool)
                 forced = block_cycle[bc_i % len(block_cycle)]
                 bc_i += 1
-                children.append(make_child_blocky(space, p1, p2, mut_rate=0.90, max_blocks_per_child=3,
-                                                  forced_block=forced, strength=1.00))
+                child = make_child_blocky(
+                    space,
+                    p1,
+                    p2,
+                    mut_rate=0.90,
+                    max_blocks_per_child=3,
+                    forced_block=forced,
+                    strength=1.00,
+                    allowed_blocks=allowed_blocks,
+                )
+                children.append(postprocess_fn(child))
 
         new_pop = elite + children
         if extra_cov:
@@ -1435,11 +1669,67 @@ def run_ga(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
         if len(new_pop) > cfg.population:
             new_pop = new_pop[:cfg.population]
         while len(new_pop) < cfg.population:
-            new_pop.append(space.sample())
+            new_pop.append(postprocess_fn(sample_fn()))
 
         pop = new_pop
 
+    if return_population:
+        return best_global, best_metrics, pop
     return best_global, best_metrics
+
+
+def run_ga_weights_only(
+    candles,
+    space: ParamSpace,
+    cfg: GAConfig,
+    stop_flag,
+    log_fn,
+    base_params=None,
+    initial_population=None,
+    gen_offset: int = 0,
+    return_population: bool = False,
+):
+    base = make_base_genome(space, base_params)
+    freeze_fn = make_freeze_fn(space, base, WEIGHT_GENES)
+    return run_ga(
+        candles=candles,
+        space=space,
+        cfg=cfg,
+        stop_flag=stop_flag,
+        log_fn=log_fn,
+        postprocess_fn=freeze_fn,
+        allowed_blocks=["CONF"],
+        initial_population=initial_population,
+        gen_offset=gen_offset,
+        return_population=return_population,
+    )
+
+
+def run_ga_params_only(
+    candles,
+    space: ParamSpace,
+    cfg: GAConfig,
+    stop_flag,
+    log_fn,
+    base_params=None,
+    initial_population=None,
+    gen_offset: int = 0,
+    return_population: bool = False,
+):
+    base = make_base_genome(space, base_params)
+    freeze_fn = make_freeze_fn(space, base, PARAM_GENES)
+    return run_ga(
+        candles=candles,
+        space=space,
+        cfg=cfg,
+        stop_flag=stop_flag,
+        log_fn=log_fn,
+        postprocess_fn=freeze_fn,
+        allowed_blocks=["RSI", "MACD", "CONSEC", "RISK"],
+        initial_population=initial_population,
+        gen_offset=gen_offset,
+        return_population=return_population,
+    )
 
 
 class OptimizerGUI:
@@ -1452,6 +1742,8 @@ class OptimizerGUI:
         self.best_genome = None
         self.best_metrics = None
         self.cached_candles = None
+        self.last_trace = None
+        self.last_trace_metrics = None
 
         self.var_symbol = tk.StringVar(value=SYMBOL)
         self.var_tf = tk.StringVar(value=INTERVAL)
@@ -1472,6 +1764,8 @@ class OptimizerGUI:
         self.var_dd_w = tk.DoubleVar(value=2.5)
         self.var_trade_floor = tk.IntVar(value=120)
         self.var_pen_missing = tk.DoubleVar(value=0.35)
+
+        self.var_opt_mode = tk.StringVar(value="Ambos")
 
         self.space = self.build_space_defaults()
         self.build_ui()
@@ -1510,7 +1804,15 @@ class OptimizerGUI:
 
     def build_ui(self):
         pad = 6
-        frm = ttk.Frame(self.root, padding=10)
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill="both", expand=True)
+
+        opt_tab = ttk.Frame(nb)
+        insp_tab = ttk.Frame(nb)
+        nb.add(opt_tab, text="Optimización")
+        nb.add(insp_tab, text="Inspector")
+
+        frm = ttk.Frame(opt_tab, padding=10)
         frm.pack(fill="both", expand=True)
 
         top = ttk.Frame(frm)
@@ -1553,6 +1855,11 @@ class OptimizerGUI:
         add_labeled(fit, "DD weight:", self.var_dd_w, 6)
         add_labeled(fit, "Trade floor:", self.var_trade_floor, 8)
         add_labeled(fit, "Pen/trade falt.:", self.var_pen_missing, 8)
+
+        mode = ttk.LabelFrame(frm, text="Modo de optimización")
+        mode.pack(fill="x", padx=pad, pady=pad)
+        for text in ("Optimizar Pesos", "Optimizar Parámetros", "Ambos"):
+            ttk.Radiobutton(mode, text=text, variable=self.var_opt_mode, value=text).pack(side="left", padx=8)
 
         ranges = ttk.LabelFrame(frm, text="Rangos (min / max / step)")
         ranges.pack(fill="both", expand=False, padx=pad, pady=pad)
@@ -1597,6 +1904,7 @@ class OptimizerGUI:
         self.txt.pack(fill="both", expand=True, padx=pad, pady=pad)
 
         self.log("Listo. Defaults cargados (recomendados).")
+        self.build_inspector(insp_tab)
 
     def pretty_name(self, key: str) -> str:
         m = {
@@ -1623,6 +1931,110 @@ class OptimizerGUI:
             "edge_trigger": "EdgeTrigger (0/1)",
         }
         return m.get(key, key)
+
+    def build_inspector(self, parent: tk.Widget):
+        pad = 6
+        top = ttk.Frame(parent)
+        top.pack(fill="x", padx=pad, pady=pad)
+
+        self.inspector_warn = tk.StringVar(value="Sin datos todavía.")
+        ttk.Label(top, textvariable=self.inspector_warn, foreground="#b00020").pack(side="left")
+
+        summary = ttk.LabelFrame(parent, text="Resumen")
+        summary.pack(fill="x", padx=pad, pady=pad)
+        self.inspector_summary = tk.Text(summary, height=6, wrap="word")
+        self.inspector_summary.pack(fill="both", expand=True, padx=pad, pady=pad)
+
+        table = ttk.LabelFrame(parent, text="Trades")
+        table.pack(fill="both", expand=True, padx=pad, pady=pad)
+        cols = ("time", "reason", "ret", "equity", "dd", "buyScore", "sellScore")
+        self.inspector_tree = ttk.Treeview(table, columns=cols, show="headings", height=10)
+        for c in cols:
+            self.inspector_tree.heading(c, text=c)
+            self.inspector_tree.column(c, width=100, anchor="center")
+        self.inspector_tree.pack(fill="both", expand=True, padx=pad, pady=pad)
+
+        charts = ttk.LabelFrame(parent, text="Charts")
+        charts.pack(fill="both", expand=True, padx=pad, pady=pad)
+
+        fig = Figure(figsize=(7, 4), dpi=100)
+        self.ax_equity = fig.add_subplot(311)
+        self.ax_dd = fig.add_subplot(312)
+        self.ax_hist = fig.add_subplot(313)
+        fig.tight_layout(pad=1.0)
+        self.inspector_canvas = FigureCanvasTkAgg(fig, master=charts)
+        self.inspector_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def update_inspector(self, metrics: Metrics, trace_payload: dict, cfg: GAConfig):
+        if not metrics:
+            return
+
+        warnings = []
+        if metrics.trades < cfg.trade_floor * 0.25:
+            warnings.append("WARNING: Estrategia muerta (muy pocos trades)")
+        if metrics.gross_loss < 1e-6 and metrics.trades <= 10:
+            warnings.append("WARNING: PF inflado por ausencia de pérdidas")
+        if metrics.pf > 30 and metrics.trades < 20:
+            warnings.append("WARNING: Probable overfitting")
+        if metrics.buy_signal_rate < 0.01:
+            warnings.append("WARNING: Señales excesivamente restrictivas")
+
+        self.inspector_warn.set(" | ".join(warnings) if warnings else "Sin warnings críticos.")
+
+        returns = trace_payload.get("returns", [])
+        avg_ret = statistics.mean(returns) if returns else 0.0
+        med_ret = statistics.median(returns) if returns else 0.0
+        max_win = max(returns) if returns else 0.0
+        max_loss = min(returns) if returns else 0.0
+
+        summary_lines = [
+            f"trades={metrics.trades} | tpy={metrics.trades_per_year:.1f} | winrate={metrics.winrate:.1f}%",
+            f"gross_profit={metrics.gross_profit:.4f} gross_loss={metrics.gross_loss:.4f} PF={metrics.pf:.2f}",
+            f"net={metrics.net:.4f} balance={metrics.balance:.2f} ganancia={metrics.profit:.2f} DD%={metrics.dd_pct:.2f}",
+            f"avg_ret={avg_ret:.4f} median_ret={med_ret:.4f} max_win={max_win:.4f} max_loss={max_loss:.4f}",
+            f"buy_signal_rate={metrics.buy_signal_rate:.3f} sell_signal_rate={metrics.sell_signal_rate:.3f}",
+        ]
+        self.inspector_summary.delete("1.0", "end")
+        self.inspector_summary.insert("end", "\n".join(summary_lines))
+
+        for row in self.inspector_tree.get_children():
+            self.inspector_tree.delete(row)
+        for ev in trace_payload.get("events", []):
+            time_str = datetime.utcfromtimestamp(ev["time"] / 1000).strftime("%Y-%m-%d %H:%M")
+            self.inspector_tree.insert(
+                "",
+                "end",
+                values=(
+                    time_str,
+                    ev["reason"],
+                    f"{ev['ret']:.4f}",
+                    f"{ev['equity']:.3f}",
+                    f"{ev['dd']*100:.2f}%",
+                    f"{ev['buyScore']:.2f}",
+                    f"{ev['sellScore']:.2f}",
+                ),
+            )
+
+        equity_curve = trace_payload.get("equity_curve", [])
+        dd_curve = trace_payload.get("dd_curve", [])
+
+        self.ax_equity.clear()
+        self.ax_equity.plot(equity_curve, color="#1976d2")
+        self.ax_equity.set_title("Equity curve")
+        self.ax_equity.set_ylabel("Equity")
+
+        self.ax_dd.clear()
+        self.ax_dd.plot([d * 100 for d in dd_curve], color="#d32f2f")
+        self.ax_dd.set_title("Drawdown %")
+        self.ax_dd.set_ylabel("DD %")
+
+        self.ax_hist.clear()
+        if returns:
+            self.ax_hist.hist(returns, bins=20, color="#455a64")
+        self.ax_hist.set_title("Histograma retornos por trade")
+        self.ax_hist.set_xlabel("Retorno")
+
+        self.inspector_canvas.draw()
 
     def log(self, s: str):
         print(s, flush=True)
@@ -1772,15 +2184,147 @@ class OptimizerGUI:
                     candles = fetch_klines_public(symbol, tf, n)
                     self.cached_candles = candles
                     self.log(f"[OK] {symbol} cargado: {len(candles)} velas ({tf})")
-                    best_global, best_metrics = run_ga(
-                        candles=candles,
-                        space=self.space,
-                        cfg=cfg,
-                        stop_flag=lambda: self._stop,
-                        log_fn=lambda s: self.root.after(0, self.log, s),
-                    )
-                    self.best_genome = best_global[1] if best_global else None
-                    self.best_metrics = best_metrics
+                    mode = self.var_opt_mode.get()
+                    log_fn = lambda s: self.root.after(0, self.log, s)
+                    fee_per_side = self.var_fee.get() * self.var_fee_mult.get()
+                    slip_per_side = self.var_slip.get()
+
+                    def refresh_inspector(ge: Genome):
+                        metrics, trace_payload = simulate_spot(
+                            candles, ge, fee_per_side, slip_per_side, trace=True
+                        )
+                        self.last_trace = trace_payload
+                        self.last_trace_metrics = metrics
+                        self.root.after(
+                            0,
+                            lambda: self.update_inspector(metrics, trace_payload, cfg),
+                        )
+
+                    if mode == "Optimizar Pesos":
+                        best_global, best_metrics = run_ga_weights_only(
+                            candles=candles,
+                            space=self.space,
+                            cfg=cfg,
+                            stop_flag=lambda: self._stop,
+                            log_fn=log_fn,
+                        )
+                        self.best_genome = best_global[1] if best_global else None
+                        self.best_metrics = best_metrics
+                        if self.best_genome:
+                            refresh_inspector(self.best_genome)
+                    elif mode == "Optimizar Parámetros":
+                        best_global, best_metrics = run_ga_params_only(
+                            candles=candles,
+                            space=self.space,
+                            cfg=cfg,
+                            stop_flag=lambda: self._stop,
+                            log_fn=log_fn,
+                        )
+                        self.best_genome = best_global[1] if best_global else None
+                        self.best_metrics = best_metrics
+                        if self.best_genome:
+                            refresh_inspector(self.best_genome)
+                    else:
+                        self.log("[MODO] Ambos: optimización en serie por bloques (parámetros -> pesos).")
+                        params_chunk = 5
+                        weight_burst = 5
+                        stuck_limit = 15
+                        total_gens = cfg.generations
+                        best_genome = None
+                        best_metrics = None
+                        best_score = None
+                        pop = None
+                        gen_offset = 0
+                        stuck_gens = 0
+
+                        remaining = total_gens
+                        block_idx = 0
+                        while remaining > 0 and not self._stop:
+                            block_idx += 1
+                            current_block = min(params_chunk, remaining)
+                            remaining -= current_block
+
+                            self.log(f"[MODO] Bloque {block_idx}: optimizando parámetros ({current_block} gens)...")
+                            cfg_params = GAConfig(**{**asdict(cfg), "generations": current_block})
+                            params_best, params_metrics, pop = run_ga(
+                                candles=candles,
+                                space=self.space,
+                                cfg=cfg_params,
+                                stop_flag=lambda: self._stop,
+                                log_fn=log_fn,
+                                initial_population=pop,
+                                gen_offset=gen_offset,
+                                return_population=True,
+                            )
+                            if not params_best and best_genome is None:
+                                break
+
+                            params_ge = params_best[1] if params_best else best_genome
+                            if params_best:
+                                params_score = params_best[0]
+                                params_metrics = params_metrics or simulate_spot(
+                                    candles,
+                                    params_ge,
+                                    fee_per_side,
+                                    slip_per_side,
+                                )
+                                if best_score is None or params_score > best_score + 1e-9:
+                                    best_score = params_score
+                                    best_genome = params_ge
+                                    best_metrics = params_metrics
+                                    stuck_gens = 0
+                                elif best_genome is None:
+                                    best_genome = params_ge
+                                    best_metrics = params_metrics
+                                    stuck_gens = 0
+                                else:
+                                    stuck_gens += current_block
+                                refresh_inspector(params_ge)
+
+                            gen_offset += current_block
+
+                            if self._stop:
+                                break
+
+                            if stuck_gens >= stuck_limit and remaining > 0:
+                                self.log("[MODO] Activando optimizador de pesos (pegado)...")
+                                cfg_weights = GAConfig(**{**asdict(cfg), "generations": weight_burst})
+                                prev_pop = pop
+                                weights_best, weights_metrics, weights_pop = run_ga_weights_only(
+                                    candles=candles,
+                                    space=self.space,
+                                    cfg=cfg_weights,
+                                    stop_flag=lambda: self._stop,
+                                    log_fn=log_fn,
+                                    base_params=asdict(best_genome),
+                                    initial_population=pop,
+                                    gen_offset=gen_offset,
+                                    return_population=True,
+                                )
+                                gen_offset += weight_burst
+                                remaining = max(0, remaining - weight_burst)
+                                weights_ge = weights_best[1] if weights_best else None
+                                if weights_ge:
+                                    weights_metrics = weights_metrics or simulate_spot(
+                                        candles,
+                                        weights_ge,
+                                        fee_per_side,
+                                        slip_per_side,
+                                    )
+                                    if fitness_from_metrics(weights_metrics, cfg) > fitness_from_metrics(best_metrics, cfg):
+                                        self.log("[MODO] Pesos mejoraron fitness. Manteniendo nuevos pesos.")
+                                        best_genome = weights_ge
+                                        best_metrics = weights_metrics
+                                        pop = weights_pop
+                                    else:
+                                        self.log("[MODO] Pesos no mejoraron fitness. Manteniendo parámetros actuales.")
+                                        pop = prev_pop
+                                    refresh_inspector(weights_ge)
+                                stuck_gens = 0
+
+                        self.best_genome = best_genome
+                        self.best_metrics = best_metrics
+
                     if self.best_genome:
                         self.root.after(0, self.log, "[FIN] Mejor encontrado:")
                         self.root.after(0, self.log, json.dumps(asdict(self.best_genome), indent=2, ensure_ascii=False))
@@ -1809,8 +2353,11 @@ class OptimizerGUI:
             ge = self.space.sample()
             metrics = simulate_spot(self.cached_candles, ge, self.var_fee.get() * self.var_fee_mult.get(), self.var_slip.get())
             self.log(
-                f"[BACKTEST] net={metrics.net:.4f} DD={metrics.max_dd:.4f} ({metrics.dd_pct:.2f}%) "
-                f"trades={metrics.trades} wr={metrics.winrate:.1f}% PF={metrics.pf:.2f}"
+                f"[BACKTEST] score={fitness_from_metrics(metrics, self.build_cfg()):.4f} "
+                f"PF={metrics.pf:.2f} trades={metrics.trades} tpy={metrics.trades_per_year:.1f} "
+                f"DD={metrics.dd_pct:.2f}% net={metrics.net:.4f} "
+                f"ganancia={metrics.profit:.2f} balance={metrics.balance:.2f} "
+                f"wr={metrics.winrate:.1f}%"
             )
         except Exception as e:
             messagebox.showerror("Error", str(e))
