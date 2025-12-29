@@ -67,6 +67,9 @@ DRY_RUN = True
 # Logs / journal
 JOURNAL_CSV = "bot_journal.csv"
 
+# Capital inicial para reportes de optimización
+START_CAPITAL = 100000.0
+
 
 # =========================
 # GEN 235 (defaults)
@@ -1078,6 +1081,8 @@ class ParamSpace:
 class Metrics:
     score: float
     net: float
+    balance: float
+    profit: float
     max_dd: float
     dd_pct: float
     trades: int
@@ -1089,7 +1094,7 @@ class Metrics:
 
 def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float):
     if len(candles) < 200:
-        return Metrics(score=-1e9, net=-1.0, max_dd=1.0, dd_pct=100.0,
+        return Metrics(score=-1e9, net=-1.0, balance=0.0, profit=0.0, max_dd=1.0, dd_pct=100.0,
                        trades=0, wins=0, losses=0, winrate=0.0, pf=0.0)
 
     data = heikin_ashi(candles) if ge.use_ha == 1 else candles
@@ -1194,15 +1199,17 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
                 last_trade_i = i
 
     net = equity - 1.0
+    balance = START_CAPITAL * equity
+    profit = balance - START_CAPITAL
     dd_pct = (max_dd / (peak + 1e-12)) * 100.0
 
-    pf_raw = gross_profit / (gross_loss + 1e-6)
-    pf = max(0.0, min(pf_raw, 10.0))
+    pf_raw = gross_profit / max(gross_loss, 1e-3)
+    pf = max(0.0, pf_raw)
     winrate = (wins / trades * 100.0) if trades > 0 else 0.0
 
-    score = math.log1p(max(0.0, pf)) + net - (max_dd * 1.0)
+    score = pf
 
-    return Metrics(score=score, net=net, max_dd=max_dd, dd_pct=dd_pct,
+    return Metrics(score=score, net=net, balance=balance, profit=profit, max_dd=max_dd, dd_pct=dd_pct,
                    trades=trades, wins=wins, losses=losses, winrate=winrate, pf=pf)
 
 
@@ -1444,9 +1451,10 @@ def run_ga(
 
         gen_display = gen + gen_offset
         log_fn(
-            f"[GEN {gen_display}] score={best_score:.4f} | net={best_m.net:.4f} | "
+            f"[GEN {gen_display}] PF={best_m.pf:.4f} | ganancia={best_m.profit:.2f} "
+            f"balance={best_m.balance:.2f} | net={best_m.net:.4f} | "
             f"DD={best_m.max_dd:.4f} ({best_m.dd_pct:.2f}%) | trades={best_m.trades} "
-            f"wr={best_m.winrate:.1f}% PF={best_m.pf:.2f} | "
+            f"wr={best_m.winrate:.1f}% | "
             f"HA={best_ge.use_ha} RSI(p={best_ge.rsi_period},os={best_ge.rsi_oversold:.0f},ob={best_ge.rsi_overbought:.0f}) | "
             f"MACD({best_ge.macd_fast},{best_ge.macd_slow},{best_ge.macd_signal}) | "
             f"consec(R={best_ge.consec_red},G={best_ge.consec_green}) | "
@@ -2084,8 +2092,10 @@ class OptimizerGUI:
             ge = self.space.sample()
             metrics = simulate_spot(self.cached_candles, ge, self.var_fee.get() * self.var_fee_mult.get(), self.var_slip.get())
             self.log(
-                f"[BACKTEST] net={metrics.net:.4f} DD={metrics.max_dd:.4f} ({metrics.dd_pct:.2f}%) "
-                f"trades={metrics.trades} wr={metrics.winrate:.1f}% PF={metrics.pf:.2f}"
+                f"[BACKTEST] PF={metrics.pf:.4f} ganancia={metrics.profit:.2f} "
+                f"balance={metrics.balance:.2f} net={metrics.net:.4f} "
+                f"DD={metrics.max_dd:.4f} ({metrics.dd_pct:.2f}%) "
+                f"trades={metrics.trades} wr={metrics.winrate:.1f}%"
             )
         except Exception as e:
             messagebox.showerror("Error", str(e))
