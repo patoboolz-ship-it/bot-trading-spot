@@ -1232,9 +1232,10 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
 
                 equity *= trade_ratio
                 if trace:
+                    candle_time = candles[i].get("close_time", candles[i].get("t"))
                     events.append({
                         "i": i,
-                        "time": candles[i]["close_time"],
+                        "time": candle_time,
                         "side": "SELL",
                         "reason": exit_reason,
                         "entry": entry,
@@ -1276,7 +1277,9 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
     pf = max(0.0, min(pf_raw, 50.0))
     winrate = (wins / trades * 100.0) if trades > 0 else 0.0
 
-    years = max((candles[-1]["close_time"] - candles[0]["open_time"]) / (1000 * 60 * 60 * 24 * 365), 1e-9)
+    first_ts = candles[0].get("open_time", candles[0].get("t"))
+    last_ts = candles[-1].get("close_time", candles[-1].get("t"))
+    years = max((last_ts - first_ts) / (1000 * 60 * 60 * 24 * 365), 1e-9)
     trades_per_year = trades / years
     buy_signal_rate = buy_signal_hits / len(close)
     sell_signal_rate = sell_signal_hits / len(close)
