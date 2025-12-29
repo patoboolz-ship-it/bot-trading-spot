@@ -1532,8 +1532,8 @@ def run_ga(
     return best_global, best_metrics
 
 
-def run_ga_weights_only(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn, base_params=None):
-    base = make_base_genome(space, base_params)
+def run_ga_weights_only(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
+    base = make_base_genome(space)
     freeze_fn = make_freeze_fn(space, base, WEIGHT_GENES)
     return run_ga(
         candles=candles,
@@ -1546,8 +1546,8 @@ def run_ga_weights_only(candles, space: ParamSpace, cfg: GAConfig, stop_flag, lo
     )
 
 
-def run_ga_params_only(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn, base_params=None):
-    base = make_base_genome(space, base_params)
+def run_ga_params_only(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
+    base = make_base_genome(space)
     freeze_fn = make_freeze_fn(space, base, PARAM_GENES)
     return run_ga(
         candles=candles,
@@ -1921,31 +1921,52 @@ class OptimizerGUI:
                         self.best_genome = best_global[1] if best_global else None
                         self.best_metrics = best_metrics
                     else:
-                        self.log("[MODO] Ambos: optimización en serie (parámetros -> pesos).")
-                        params_best, params_metrics = run_ga_params_only(
-                            candles=candles,
-                            space=self.space,
-                            cfg=cfg,
-                            stop_flag=lambda: self._stop,
-                            log_fn=log_fn,
-                        )
+                        self.log("[MODO] Ambos: corriendo GA de pesos y GA de parámetros en paralelo.")
+                        results = {}
+
+                        def run_and_store(key, fn):
+                            results[key] = fn(
+                                candles=candles,
+                                space=self.space,
+                                cfg=cfg,
+                                stop_flag=lambda: self._stop,
+                                log_fn=log_fn,
+                            )
+
+                        t_weights = threading.Thread(target=run_and_store, args=("weights", run_ga_weights_only), daemon=True)
+                        t_params = threading.Thread(target=run_and_store, args=("params", run_ga_params_only), daemon=True)
+                        t_weights.start()
+                        t_params.start()
+                        t_weights.join()
+                        t_params.join()
+
+                        weights_best = results.get("weights", (None, None))[0]
+                        params_best = results.get("params", (None, None))[0]
+                        weights_ge = weights_best[1] if weights_best else None
                         params_ge = params_best[1] if params_best else None
-                        if params_ge is None:
+
+                        if weights_ge or params_ge:
+                            base = make_base_genome(self.space)
+                            merged = asdict(base)
+                            if weights_ge:
+                                for key in WEIGHT_GENES:
+                                    merged[key] = getattr(weights_ge, key)
+                            if params_ge:
+                                for key in PARAM_GENES:
+                                    merged[key] = getattr(params_ge, key)
+                            merged_ge = self.space.clamp_genome(Genome(**merged))
+                            merged_metrics = simulate_spot(
+                                candles,
+                                merged_ge,
+                                self.var_fee.get() * self.var_fee_mult.get(),
+                                self.var_slip.get(),
+                            )
+                            self.best_genome = merged_ge
+                            self.best_metrics = merged_metrics
+                            self.log("[MODO] Ambos: combiné pesos y parámetros en un solo genoma.")
+                        else:
                             self.best_genome = None
                             self.best_metrics = None
-                            return
-
-                        self.log("[MODO] Ambos: parámetros listos, optimizando pesos...")
-                        weights_best, weights_metrics = run_ga_weights_only(
-                            candles=candles,
-                            space=self.space,
-                            cfg=cfg,
-                            stop_flag=lambda: self._stop,
-                            log_fn=log_fn,
-                            base_params=asdict(params_ge),
-                        )
-                        self.best_genome = weights_best[1] if weights_best else params_ge
-                        self.best_metrics = weights_metrics if weights_best else params_metrics
 
                     if self.best_genome:
                         self.root.after(0, self.log, "[FIN] Mejor encontrado:")
