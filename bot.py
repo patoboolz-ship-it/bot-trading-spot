@@ -22,6 +22,7 @@ import time
 import math
 import json
 import random
+import statistics
 import threading
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -33,6 +34,9 @@ from binance.exceptions import BinanceAPIException
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from typing import Optional
+
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 import requests
 
 
@@ -1083,6 +1087,8 @@ class Metrics:
     net: float
     balance: float
     profit: float
+    gross_profit: float
+    gross_loss: float
     max_dd: float
     dd_pct: float
     trades: int
@@ -1090,12 +1096,34 @@ class Metrics:
     losses: int
     winrate: float
     pf: float
+    years: float
+    trades_per_year: float
+    buy_signal_rate: float
+    sell_signal_rate: float
 
 
-def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float):
+def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float, trace: bool = False):
     if len(candles) < 200:
-        return Metrics(score=-1e9, net=-1.0, balance=0.0, profit=0.0, max_dd=1.0, dd_pct=100.0,
-                       trades=0, wins=0, losses=0, winrate=0.0, pf=0.0)
+        metrics = Metrics(
+            score=-1e9,
+            net=-1.0,
+            balance=0.0,
+            profit=0.0,
+            gross_profit=0.0,
+            gross_loss=0.0,
+            max_dd=1.0,
+            dd_pct=100.0,
+            trades=0,
+            wins=0,
+            losses=0,
+            winrate=0.0,
+            pf=0.0,
+            years=0.0,
+            trades_per_year=0.0,
+            buy_signal_rate=0.0,
+            sell_signal_rate=0.0,
+        )
+        return (metrics, {"events": [], "equity_curve": [], "dd_curve": [], "returns": []}) if trace else metrics
 
     data = heikin_ashi(candles) if ge.use_ha == 1 else candles
     close = [c["close"] for c in data]
@@ -1131,12 +1159,23 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
     entry = 0.0
     entry_i = -10_000
     last_trade_i = -10_000
+    entry_buy_score = 0.0
+    entry_rsi = 0.0
+    entry_macd = 0.0
+    entry_close = 0.0
 
     gross_profit = 0.0
     gross_loss = 0.0
     wins = 0
     losses = 0
     trades = 0
+
+    events = []
+    equity_curve = []
+    dd_curve = []
+    returns = []
+    buy_signal_hits = 0
+    sell_signal_hits = 0
 
     for i in range(2, len(close)):
         peak = max(peak, equity)
@@ -1149,6 +1188,10 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
 
         bs = buy_score(sig_i)
         ss = sell_score(sig_i)
+        if bs >= ge.buy_th:
+            buy_signal_hits += 1
+        if ss >= ge.sell_th:
+            sell_signal_hits += 1
 
         if i - last_trade_i < int(ge.cooldown):
             continue
@@ -1161,6 +1204,10 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
                 in_pos = True
                 entry_i = i
                 last_trade_i = i
+                entry_buy_score = bs
+                entry_rsi = rsi_arr[sig_i]
+                entry_macd = mh_arr[sig_i]
+                entry_close = close[sig_i]
         else:
             if i <= entry_i:
                 continue
@@ -1184,6 +1231,24 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
                 trade_ret = trade_ratio - 1.0
 
                 equity *= trade_ratio
+                if trace:
+                    events.append({
+                        "i": i,
+                        "time": candles[i]["close_time"],
+                        "side": "SELL",
+                        "reason": exit_reason,
+                        "entry": entry,
+                        "exit": px,
+                        "ret": trade_ret,
+                        "equity": equity,
+                        "dd": (peak - equity) / peak if peak > 0 else 0.0,
+                        "buyScore": entry_buy_score,
+                        "sellScore": ss,
+                        "RSI": entry_rsi,
+                        "MACD_hist": entry_macd,
+                        "close": entry_close,
+                    })
+                    returns.append(trade_ret)
 
                 trades += 1
                 if trade_ret >= 0:
@@ -1198,19 +1263,54 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
                 entry_i = -10_000
                 last_trade_i = i
 
+        if trace:
+            equity_curve.append(equity)
+            dd_curve.append((peak - equity) / peak if peak > 0 else 0.0)
+
     net = equity - 1.0
     balance = START_CAPITAL * equity
     profit = balance - START_CAPITAL
     dd_pct = (max_dd / (peak + 1e-12)) * 100.0
 
-    pf_raw = gross_profit / max(gross_loss, 1e-3)
-    pf = max(0.0, pf_raw)
+    pf_raw = gross_profit / (gross_loss + 1e-6)
+    pf = max(0.0, min(pf_raw, 50.0))
     winrate = (wins / trades * 100.0) if trades > 0 else 0.0
+
+    years = max((candles[-1]["close_time"] - candles[0]["open_time"]) / (1000 * 60 * 60 * 24 * 365), 1e-9)
+    trades_per_year = trades / years
+    buy_signal_rate = buy_signal_hits / len(close)
+    sell_signal_rate = sell_signal_hits / len(close)
 
     score = pf
 
-    return Metrics(score=score, net=net, balance=balance, profit=profit, max_dd=max_dd, dd_pct=dd_pct,
-                   trades=trades, wins=wins, losses=losses, winrate=winrate, pf=pf)
+    metrics = Metrics(
+        score=score,
+        net=net,
+        balance=balance,
+        profit=profit,
+        gross_profit=gross_profit,
+        gross_loss=gross_loss,
+        max_dd=max_dd,
+        dd_pct=dd_pct,
+        trades=trades,
+        wins=wins,
+        losses=losses,
+        winrate=winrate,
+        pf=pf,
+        years=years,
+        trades_per_year=trades_per_year,
+        buy_signal_rate=buy_signal_rate,
+        sell_signal_rate=sell_signal_rate,
+    )
+
+    if trace:
+        return metrics, {
+            "events": events,
+            "equity_curve": equity_curve,
+            "dd_curve": dd_curve,
+            "returns": returns,
+        }
+    return metrics
 
 
 @dataclass
@@ -1229,6 +1329,19 @@ class GAConfig:
     dd_weight: float
     trade_floor: int
     pen_per_missing_trade: float
+
+
+def fitness_from_metrics(m: Metrics, cfg: GAConfig) -> float:
+    if m.trades == 0:
+        return -1e9
+
+    pf_cap = min(m.pf, 50.0)
+    pf_term = math.log1p(pf_cap)
+    dd_pen = cfg.dd_weight * (m.dd_pct / 100.0)
+    missing = max(0, cfg.trade_floor - m.trades)
+    trade_pen = missing * cfg.pen_per_missing_trade
+    bonus = max(0.0, m.net) * 0.2
+    return pf_term - dd_pen - trade_pen + bonus
 
 
 WEIGHT_GENES = [
@@ -1434,8 +1547,7 @@ def run_ga(
         scored = []
         for ge in pop:
             m = simulate_spot(candles, ge, fee_per_side, slip_per_side)
-
-            score = m.pf
+            score = fitness_from_metrics(m, cfg)
 
             scored.append((score, ge, m))
 
@@ -1451,9 +1563,10 @@ def run_ga(
 
         gen_display = gen + gen_offset
         log_fn(
-            f"[GEN {gen_display}] PF={best_m.pf:.4f} | ganancia={best_m.profit:.2f} "
-            f"balance={best_m.balance:.2f} | net={best_m.net:.4f} | "
-            f"DD={best_m.max_dd:.4f} ({best_m.dd_pct:.2f}%) | trades={best_m.trades} "
+            f"[GEN {gen_display}] score={best_score:.4f} PF={best_m.pf:.2f} "
+            f"trades={best_m.trades} tpy={best_m.trades_per_year:.1f} "
+            f"DD={best_m.dd_pct:.2f}% net={best_m.net:.4f} | "
+            f"ganancia={best_m.profit:.2f} balance={best_m.balance:.2f} | "
             f"wr={best_m.winrate:.1f}% | "
             f"HA={best_ge.use_ha} RSI(p={best_ge.rsi_period},os={best_ge.rsi_oversold:.0f},ob={best_ge.rsi_overbought:.0f}) | "
             f"MACD({best_ge.macd_fast},{best_ge.macd_slow},{best_ge.macd_signal}) | "
@@ -1615,6 +1728,8 @@ class OptimizerGUI:
         self.best_genome = None
         self.best_metrics = None
         self.cached_candles = None
+        self.last_trace = None
+        self.last_trace_metrics = None
 
         self.var_symbol = tk.StringVar(value=SYMBOL)
         self.var_tf = tk.StringVar(value=INTERVAL)
@@ -1675,7 +1790,15 @@ class OptimizerGUI:
 
     def build_ui(self):
         pad = 6
-        frm = ttk.Frame(self.root, padding=10)
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill="both", expand=True)
+
+        opt_tab = ttk.Frame(nb)
+        insp_tab = ttk.Frame(nb)
+        nb.add(opt_tab, text="Optimización")
+        nb.add(insp_tab, text="Inspector")
+
+        frm = ttk.Frame(opt_tab, padding=10)
         frm.pack(fill="both", expand=True)
 
         top = ttk.Frame(frm)
@@ -1767,6 +1890,7 @@ class OptimizerGUI:
         self.txt.pack(fill="both", expand=True, padx=pad, pady=pad)
 
         self.log("Listo. Defaults cargados (recomendados).")
+        self.build_inspector(insp_tab)
 
     def pretty_name(self, key: str) -> str:
         m = {
@@ -1793,6 +1917,110 @@ class OptimizerGUI:
             "edge_trigger": "EdgeTrigger (0/1)",
         }
         return m.get(key, key)
+
+    def build_inspector(self, parent: tk.Widget):
+        pad = 6
+        top = ttk.Frame(parent)
+        top.pack(fill="x", padx=pad, pady=pad)
+
+        self.inspector_warn = tk.StringVar(value="Sin datos todavía.")
+        ttk.Label(top, textvariable=self.inspector_warn, foreground="#b00020").pack(side="left")
+
+        summary = ttk.LabelFrame(parent, text="Resumen")
+        summary.pack(fill="x", padx=pad, pady=pad)
+        self.inspector_summary = tk.Text(summary, height=6, wrap="word")
+        self.inspector_summary.pack(fill="both", expand=True, padx=pad, pady=pad)
+
+        table = ttk.LabelFrame(parent, text="Trades")
+        table.pack(fill="both", expand=True, padx=pad, pady=pad)
+        cols = ("time", "reason", "ret", "equity", "dd", "buyScore", "sellScore")
+        self.inspector_tree = ttk.Treeview(table, columns=cols, show="headings", height=10)
+        for c in cols:
+            self.inspector_tree.heading(c, text=c)
+            self.inspector_tree.column(c, width=100, anchor="center")
+        self.inspector_tree.pack(fill="both", expand=True, padx=pad, pady=pad)
+
+        charts = ttk.LabelFrame(parent, text="Charts")
+        charts.pack(fill="both", expand=True, padx=pad, pady=pad)
+
+        fig = Figure(figsize=(7, 4), dpi=100)
+        self.ax_equity = fig.add_subplot(311)
+        self.ax_dd = fig.add_subplot(312)
+        self.ax_hist = fig.add_subplot(313)
+        fig.tight_layout(pad=1.0)
+        self.inspector_canvas = FigureCanvasTkAgg(fig, master=charts)
+        self.inspector_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def update_inspector(self, metrics: Metrics, trace_payload: dict, cfg: GAConfig):
+        if not metrics:
+            return
+
+        warnings = []
+        if metrics.trades < cfg.trade_floor * 0.25:
+            warnings.append("WARNING: Estrategia muerta (muy pocos trades)")
+        if metrics.gross_loss < 1e-6 and metrics.trades <= 10:
+            warnings.append("WARNING: PF inflado por ausencia de pérdidas")
+        if metrics.pf > 30 and metrics.trades < 20:
+            warnings.append("WARNING: Probable overfitting")
+        if metrics.buy_signal_rate < 0.01:
+            warnings.append("WARNING: Señales excesivamente restrictivas")
+
+        self.inspector_warn.set(" | ".join(warnings) if warnings else "Sin warnings críticos.")
+
+        returns = trace_payload.get("returns", [])
+        avg_ret = statistics.mean(returns) if returns else 0.0
+        med_ret = statistics.median(returns) if returns else 0.0
+        max_win = max(returns) if returns else 0.0
+        max_loss = min(returns) if returns else 0.0
+
+        summary_lines = [
+            f"trades={metrics.trades} | tpy={metrics.trades_per_year:.1f} | winrate={metrics.winrate:.1f}%",
+            f"gross_profit={metrics.gross_profit:.4f} gross_loss={metrics.gross_loss:.4f} PF={metrics.pf:.2f}",
+            f"net={metrics.net:.4f} balance={metrics.balance:.2f} ganancia={metrics.profit:.2f} DD%={metrics.dd_pct:.2f}",
+            f"avg_ret={avg_ret:.4f} median_ret={med_ret:.4f} max_win={max_win:.4f} max_loss={max_loss:.4f}",
+            f"buy_signal_rate={metrics.buy_signal_rate:.3f} sell_signal_rate={metrics.sell_signal_rate:.3f}",
+        ]
+        self.inspector_summary.delete("1.0", "end")
+        self.inspector_summary.insert("end", "\n".join(summary_lines))
+
+        for row in self.inspector_tree.get_children():
+            self.inspector_tree.delete(row)
+        for ev in trace_payload.get("events", []):
+            time_str = datetime.utcfromtimestamp(ev["time"] / 1000).strftime("%Y-%m-%d %H:%M")
+            self.inspector_tree.insert(
+                "",
+                "end",
+                values=(
+                    time_str,
+                    ev["reason"],
+                    f"{ev['ret']:.4f}",
+                    f"{ev['equity']:.3f}",
+                    f"{ev['dd']*100:.2f}%",
+                    f"{ev['buyScore']:.2f}",
+                    f"{ev['sellScore']:.2f}",
+                ),
+            )
+
+        equity_curve = trace_payload.get("equity_curve", [])
+        dd_curve = trace_payload.get("dd_curve", [])
+
+        self.ax_equity.clear()
+        self.ax_equity.plot(equity_curve, color="#1976d2")
+        self.ax_equity.set_title("Equity curve")
+        self.ax_equity.set_ylabel("Equity")
+
+        self.ax_dd.clear()
+        self.ax_dd.plot([d * 100 for d in dd_curve], color="#d32f2f")
+        self.ax_dd.set_title("Drawdown %")
+        self.ax_dd.set_ylabel("DD %")
+
+        self.ax_hist.clear()
+        if returns:
+            self.ax_hist.hist(returns, bins=20, color="#455a64")
+        self.ax_hist.set_title("Histograma retornos por trade")
+        self.ax_hist.set_xlabel("Retorno")
+
+        self.inspector_canvas.draw()
 
     def log(self, s: str):
         print(s, flush=True)
@@ -1944,6 +2172,19 @@ class OptimizerGUI:
                     self.log(f"[OK] {symbol} cargado: {len(candles)} velas ({tf})")
                     mode = self.var_opt_mode.get()
                     log_fn = lambda s: self.root.after(0, self.log, s)
+                    fee_per_side = self.var_fee.get() * self.var_fee_mult.get()
+                    slip_per_side = self.var_slip.get()
+
+                    def refresh_inspector(ge: Genome):
+                        metrics, trace_payload = simulate_spot(
+                            candles, ge, fee_per_side, slip_per_side, trace=True
+                        )
+                        self.last_trace = trace_payload
+                        self.last_trace_metrics = metrics
+                        self.root.after(
+                            0,
+                            lambda: self.update_inspector(metrics, trace_payload, cfg),
+                        )
 
                     if mode == "Optimizar Pesos":
                         best_global, best_metrics = run_ga_weights_only(
@@ -1955,6 +2196,8 @@ class OptimizerGUI:
                         )
                         self.best_genome = best_global[1] if best_global else None
                         self.best_metrics = best_metrics
+                        if self.best_genome:
+                            refresh_inspector(self.best_genome)
                     elif mode == "Optimizar Parámetros":
                         best_global, best_metrics = run_ga_params_only(
                             candles=candles,
@@ -1965,6 +2208,8 @@ class OptimizerGUI:
                         )
                         self.best_genome = best_global[1] if best_global else None
                         self.best_metrics = best_metrics
+                        if self.best_genome:
+                            refresh_inspector(self.best_genome)
                     else:
                         self.log("[MODO] Ambos: optimización en serie por bloques (parámetros -> pesos).")
                         params_chunk = 5
@@ -2006,8 +2251,8 @@ class OptimizerGUI:
                                 params_metrics = params_metrics or simulate_spot(
                                     candles,
                                     params_ge,
-                                    self.var_fee.get() * self.var_fee_mult.get(),
-                                    self.var_slip.get(),
+                                    fee_per_side,
+                                    slip_per_side,
                                 )
                                 if best_score is None or params_score > best_score + 1e-9:
                                     best_score = params_score
@@ -2020,6 +2265,7 @@ class OptimizerGUI:
                                     stuck_gens = 0
                                 else:
                                     stuck_gens += current_block
+                                refresh_inspector(params_ge)
 
                             gen_offset += current_block
 
@@ -2048,17 +2294,18 @@ class OptimizerGUI:
                                     weights_metrics = weights_metrics or simulate_spot(
                                         candles,
                                         weights_ge,
-                                        self.var_fee.get() * self.var_fee_mult.get(),
-                                        self.var_slip.get(),
+                                        fee_per_side,
+                                        slip_per_side,
                                     )
-                                    if weights_metrics.pf > best_metrics.pf:
-                                        self.log("[MODO] Pesos mejoraron PF. Manteniendo nuevos pesos.")
+                                    if fitness_from_metrics(weights_metrics, cfg) > fitness_from_metrics(best_metrics, cfg):
+                                        self.log("[MODO] Pesos mejoraron fitness. Manteniendo nuevos pesos.")
                                         best_genome = weights_ge
                                         best_metrics = weights_metrics
                                         pop = weights_pop
                                     else:
-                                        self.log("[MODO] Pesos no mejoraron PF. Manteniendo parámetros actuales.")
+                                        self.log("[MODO] Pesos no mejoraron fitness. Manteniendo parámetros actuales.")
                                         pop = prev_pop
+                                    refresh_inspector(weights_ge)
                                 stuck_gens = 0
 
                         self.best_genome = best_genome
@@ -2092,10 +2339,11 @@ class OptimizerGUI:
             ge = self.space.sample()
             metrics = simulate_spot(self.cached_candles, ge, self.var_fee.get() * self.var_fee_mult.get(), self.var_slip.get())
             self.log(
-                f"[BACKTEST] PF={metrics.pf:.4f} ganancia={metrics.profit:.2f} "
-                f"balance={metrics.balance:.2f} net={metrics.net:.4f} "
-                f"DD={metrics.max_dd:.4f} ({metrics.dd_pct:.2f}%) "
-                f"trades={metrics.trades} wr={metrics.winrate:.1f}%"
+                f"[BACKTEST] score={fitness_from_metrics(metrics, self.build_cfg()):.4f} "
+                f"PF={metrics.pf:.2f} trades={metrics.trades} tpy={metrics.trades_per_year:.1f} "
+                f"DD={metrics.dd_pct:.2f}% net={metrics.net:.4f} "
+                f"ganancia={metrics.profit:.2f} balance={metrics.balance:.2f} "
+                f"wr={metrics.winrate:.1f}%"
             )
         except Exception as e:
             messagebox.showerror("Error", str(e))
