@@ -1532,8 +1532,8 @@ def run_ga(
     return best_global, best_metrics
 
 
-def run_ga_weights_only(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
-    base = make_base_genome(space)
+def run_ga_weights_only(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn, base_params=None):
+    base = make_base_genome(space, base_params)
     freeze_fn = make_freeze_fn(space, base, WEIGHT_GENES)
     return run_ga(
         candles=candles,
@@ -1546,8 +1546,8 @@ def run_ga_weights_only(candles, space: ParamSpace, cfg: GAConfig, stop_flag, lo
     )
 
 
-def run_ga_params_only(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
-    base = make_base_genome(space)
+def run_ga_params_only(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn, base_params=None):
+    base = make_base_genome(space, base_params)
     freeze_fn = make_freeze_fn(space, base, PARAM_GENES)
     return run_ga(
         candles=candles,
@@ -1921,52 +1921,73 @@ class OptimizerGUI:
                         self.best_genome = best_global[1] if best_global else None
                         self.best_metrics = best_metrics
                     else:
-                        self.log("[MODO] Ambos: corriendo GA de pesos y GA de parámetros en paralelo.")
-                        results = {}
+                        self.log("[MODO] Ambos: optimización en serie por bloques (parámetros -> pesos).")
+                        block_gens = 10
+                        weight_burst = 5
+                        total_gens = cfg.generations
+                        best_genome = None
+                        best_metrics = None
 
-                        def run_and_store(key, fn):
-                            results[key] = fn(
+                        remaining = total_gens
+                        block_idx = 0
+                        while remaining > 0 and not self._stop:
+                            block_idx += 1
+                            current_block = min(block_gens, remaining)
+                            remaining -= current_block
+
+                            self.log(f"[MODO] Bloque {block_idx}: optimizando parámetros ({current_block} gens)...")
+                            cfg_params = GAConfig(**{**asdict(cfg), "generations": current_block})
+                            params_best, params_metrics = run_ga(
                                 candles=candles,
                                 space=self.space,
-                                cfg=cfg,
+                                cfg=cfg_params,
                                 stop_flag=lambda: self._stop,
                                 log_fn=log_fn,
                             )
+                            params_ge = params_best[1] if params_best else best_genome
+                            if params_ge is None:
+                                break
 
-                        t_weights = threading.Thread(target=run_and_store, args=("weights", run_ga_weights_only), daemon=True)
-                        t_params = threading.Thread(target=run_and_store, args=("params", run_ga_params_only), daemon=True)
-                        t_weights.start()
-                        t_params.start()
-                        t_weights.join()
-                        t_params.join()
-
-                        weights_best = results.get("weights", (None, None))[0]
-                        params_best = results.get("params", (None, None))[0]
-                        weights_ge = weights_best[1] if weights_best else None
-                        params_ge = params_best[1] if params_best else None
-
-                        if weights_ge or params_ge:
-                            base = make_base_genome(self.space)
-                            merged = asdict(base)
-                            if weights_ge:
-                                for key in WEIGHT_GENES:
-                                    merged[key] = getattr(weights_ge, key)
-                            if params_ge:
-                                for key in PARAM_GENES:
-                                    merged[key] = getattr(params_ge, key)
-                            merged_ge = self.space.clamp_genome(Genome(**merged))
-                            merged_metrics = simulate_spot(
+                            params_metrics = params_metrics or simulate_spot(
                                 candles,
-                                merged_ge,
+                                params_ge,
                                 self.var_fee.get() * self.var_fee_mult.get(),
                                 self.var_slip.get(),
                             )
-                            self.best_genome = merged_ge
-                            self.best_metrics = merged_metrics
-                            self.log("[MODO] Ambos: combiné pesos y parámetros en un solo genoma.")
-                        else:
-                            self.best_genome = None
-                            self.best_metrics = None
+
+                            best_genome = params_ge
+                            best_metrics = params_metrics
+
+                            if self._stop:
+                                break
+
+                            self.log("[MODO] Activando optimizador de pesos...")
+                            cfg_weights = GAConfig(**{**asdict(cfg), "generations": weight_burst})
+                            weights_best, weights_metrics = run_ga_weights_only(
+                                candles=candles,
+                                space=self.space,
+                                cfg=cfg_weights,
+                                stop_flag=lambda: self._stop,
+                                log_fn=log_fn,
+                                base_params=asdict(best_genome),
+                            )
+                            weights_ge = weights_best[1] if weights_best else None
+                            if weights_ge:
+                                weights_metrics = weights_metrics or simulate_spot(
+                                    candles,
+                                    weights_ge,
+                                    self.var_fee.get() * self.var_fee_mult.get(),
+                                    self.var_slip.get(),
+                                )
+                                if (weights_metrics.pf > best_metrics.pf) and (weights_metrics.net > best_metrics.net):
+                                    self.log("[MODO] Pesos mejoraron PF y ganancia. Manteniendo nuevos pesos.")
+                                    best_genome = weights_ge
+                                    best_metrics = weights_metrics
+                                else:
+                                    self.log("[MODO] Pesos no mejoraron PF/ganancia. Manteniendo parámetros actuales.")
+
+                        self.best_genome = best_genome
+                        self.best_metrics = best_metrics
 
                     if self.best_genome:
                         self.root.after(0, self.log, "[FIN] Mejor encontrado:")
