@@ -1330,24 +1330,6 @@ def force_coverage(space: ParamSpace, n: int):
         out.append(ge)
     return out
 
-def force_block_coverage(space: ParamSpace, block_name: str, n: int):
-    keys = BLOCKS.get(block_name, [])
-    if not keys:
-        return force_coverage(space, n)
-    out = []
-    for i in range(n):
-        g = space.sample()
-        d = asdict(g)
-        key = keys[i % len(keys)]
-        spec = space.spec[key]
-        if spec["type"] == "int":
-            d[key] = int(spec["min"] if (i // len(keys)) % 2 == 0 else spec["max"])
-        else:
-            d[key] = float(spec["min"] if (i // len(keys)) % 2 == 0 else spec["max"])
-        ge = space.clamp_genome(Genome(**d))
-        out.append(ge)
-    return out
-
 
 def run_ga(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
     fee_per_side = cfg.fee_side * cfg.fee_mult
@@ -1356,11 +1338,9 @@ def run_ga(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
     log_fn(f"[COSTOS] SPOT | fee_lado={fee_per_side:.6f} (incluye mult) | slip_lado={slip_per_side:.6f}")
 
     pop = [space.sample() for _ in range(cfg.population)]
-    block_cycle = ["RSI", "MACD", "CONSEC", "RISK", "CONF"]
-    coverage_block_idx = 0
-    cov = force_block_coverage(space, block_cycle[coverage_block_idx], max(12, cfg.population // 6))
+    cov = force_coverage(space, max(12, cfg.population // 6))
     pop[:len(cov)] = cov
-    log_fn(f"[COBERTURA] forcé {len(cov)} individuos para cubrir rangos completos (inicio) | bloque={block_cycle[coverage_block_idx]}")
+    log_fn(f"[COBERTURA] forcé {len(cov)} individuos para cubrir rangos completos (inicio)")
 
     best_global = None
     best_metrics = None
@@ -1408,9 +1388,7 @@ def run_ga(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
             stuck = 0
             log_fn("[ANTI-PEGADO] se pegó -> meto más wild + más cobertura")
             cfg.n_wild = min(cfg.population - cfg.elite, cfg.n_wild + 20)
-            coverage_block_idx = (coverage_block_idx + 1) % len(block_cycle)
-            extra_cov = force_block_coverage(space, block_cycle[coverage_block_idx], max(10, cfg.population // 8))
-            log_fn(f"[COBERTURA] bloque dedicado={block_cycle[coverage_block_idx]}")
+            extra_cov = force_coverage(space, max(10, cfg.population // 8))
         else:
             extra_cov = []
 
@@ -1419,6 +1397,7 @@ def run_ga(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
 
         children = []
 
+        block_cycle = ["RSI", "MACD", "CONSEC", "RISK", "CONF"]
         bc_i = 0
 
         for _ in range(cfg.n_cons):
