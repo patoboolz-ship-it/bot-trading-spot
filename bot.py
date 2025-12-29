@@ -1535,9 +1535,10 @@ def run_ga(
     if len(pop) > cfg.population:
         pop = pop[:cfg.population]
 
-    cov = force_coverage(space, max(12, cfg.population // 6))
-    pop[:len(cov)] = [postprocess_fn(ge) for ge in cov]
-    log_fn(f"[COBERTURA] forcé {len(cov)} individuos para cubrir rangos completos (inicio)")
+    if not initial_population:
+        cov = force_coverage(space, max(12, cfg.population // 6))
+        pop[:len(cov)] = [postprocess_fn(ge) for ge in cov]
+        log_fn(f"[COBERTURA] forcé {len(cov)} individuos para cubrir rangos completos (inicio)")
 
     best_global = None
     best_metrics = None
