@@ -1961,7 +1961,7 @@ class OptimizerGUI:
                         self.best_metrics = best_metrics
                     else:
                         self.log("[MODO] Ambos: optimización en serie por bloques (parámetros -> pesos).")
-                        block_gens = 10
+                        block_gens = 20
                         weight_burst = 5
                         total_gens = cfg.generations
                         best_genome = None
