@@ -23,6 +23,7 @@ import math
 import json
 import random
 import statistics
+import copy
 import threading
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
@@ -1540,6 +1541,7 @@ def run_ga(
 
     best_global = None
     best_metrics = None
+    prev_best_hash = None
     stuck = 0
 
     for gen in range(1, cfg.generations + 1):
@@ -1556,9 +1558,13 @@ def run_ga(
 
         scored.sort(key=lambda x: x[0], reverse=True)
         best_score, best_ge, best_m = scored[0]
+        best_hash = hash(tuple(asdict(best_ge).items()))
+        unique_hashes = {hash(tuple(asdict(ge).items())) for _, ge, _ in scored}
+        elite_hashes = [hash(tuple(asdict(ge).items())) for ge in [x[1] for x in scored[:cfg.elite]]]
+        elite_unique = len(set(elite_hashes))
 
         if best_global is None or best_score > best_global[0] + 1e-9:
-            best_global = (best_score, best_ge)
+            best_global = (best_score, copy.deepcopy(best_ge))
             best_metrics = best_m
             stuck = 0
         else:
@@ -1579,6 +1585,11 @@ def run_ga(
             f"Wbuy({best_ge.w_buy_rsi:.2f},{best_ge.w_buy_macd:.2f},{best_ge.w_buy_consec:.2f}) "
             f"Wsell({best_ge.w_sell_rsi:.2f},{best_ge.w_sell_macd:.2f},{best_ge.w_sell_consec:.2f})"
         )
+        log_fn(
+            f"[DBG] uniq={len(unique_hashes)} elite_unique={elite_unique} "
+            f"best_hash={best_hash} repeated={best_hash == prev_best_hash}"
+        )
+        prev_best_hash = best_hash
 
         if stuck >= 15:
             stuck = 0
