@@ -1389,6 +1389,9 @@ def run_ga(
     sample_fn=None,
     postprocess_fn=None,
     allowed_blocks: Optional[list[str]] = None,
+    initial_population=None,
+    gen_offset: int = 0,
+    return_population: bool = False,
 ):
     fee_per_side = cfg.fee_side * cfg.fee_mult
     slip_per_side = cfg.slip_side
@@ -1400,7 +1403,14 @@ def run_ga(
     if postprocess_fn is None:
         postprocess_fn = lambda ge: ge
 
-    pop = [postprocess_fn(sample_fn()) for _ in range(cfg.population)]
+    pop = []
+    if initial_population:
+        pop = [postprocess_fn(ge) for ge in initial_population]
+    if len(pop) < cfg.population:
+        pop.extend(postprocess_fn(sample_fn()) for _ in range(cfg.population - len(pop)))
+    if len(pop) > cfg.population:
+        pop = pop[:cfg.population]
+
     cov = force_coverage(space, max(12, cfg.population // 6))
     pop[:len(cov)] = [postprocess_fn(ge) for ge in cov]
     log_fn(f"[COBERTURA] forcé {len(cov)} individuos para cubrir rangos completos (inicio)")
@@ -1434,8 +1444,9 @@ def run_ga(
         else:
             stuck += 1
 
+        gen_display = gen + gen_offset
         log_fn(
-            f"[GEN {gen}] score={best_score:.4f} | net={best_m.net:.4f} | "
+            f"[GEN {gen_display}] score={best_score:.4f} | net={best_m.net:.4f} | "
             f"DD={best_m.max_dd:.4f} ({best_m.dd_pct:.2f}%) | trades={best_m.trades} "
             f"wr={best_m.winrate:.1f}% PF={best_m.pf:.2f} | "
             f"HA={best_ge.use_ha} RSI(p={best_ge.rsi_period},os={best_ge.rsi_oversold:.0f},ob={best_ge.rsi_overbought:.0f}) | "
@@ -1529,10 +1540,22 @@ def run_ga(
 
         pop = new_pop
 
+    if return_population:
+        return best_global, best_metrics, pop
     return best_global, best_metrics
 
 
-def run_ga_weights_only(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn, base_params=None):
+def run_ga_weights_only(
+    candles,
+    space: ParamSpace,
+    cfg: GAConfig,
+    stop_flag,
+    log_fn,
+    base_params=None,
+    initial_population=None,
+    gen_offset: int = 0,
+    return_population: bool = False,
+):
     base = make_base_genome(space, base_params)
     freeze_fn = make_freeze_fn(space, base, WEIGHT_GENES)
     return run_ga(
@@ -1543,10 +1566,23 @@ def run_ga_weights_only(candles, space: ParamSpace, cfg: GAConfig, stop_flag, lo
         log_fn=log_fn,
         postprocess_fn=freeze_fn,
         allowed_blocks=["CONF"],
+        initial_population=initial_population,
+        gen_offset=gen_offset,
+        return_population=return_population,
     )
 
 
-def run_ga_params_only(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn, base_params=None):
+def run_ga_params_only(
+    candles,
+    space: ParamSpace,
+    cfg: GAConfig,
+    stop_flag,
+    log_fn,
+    base_params=None,
+    initial_population=None,
+    gen_offset: int = 0,
+    return_population: bool = False,
+):
     base = make_base_genome(space, base_params)
     freeze_fn = make_freeze_fn(space, base, PARAM_GENES)
     return run_ga(
@@ -1557,6 +1593,9 @@ def run_ga_params_only(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log
         log_fn=log_fn,
         postprocess_fn=freeze_fn,
         allowed_blocks=["RSI", "MACD", "CONSEC", "RISK"],
+        initial_population=initial_population,
+        gen_offset=gen_offset,
+        return_population=return_population,
     )
 
 
@@ -1927,6 +1966,9 @@ class OptimizerGUI:
                         total_gens = cfg.generations
                         best_genome = None
                         best_metrics = None
+                        best_score = None
+                        pop = None
+                        gen_offset = 0
 
                         remaining = total_gens
                         block_idx = 0
@@ -1937,40 +1979,56 @@ class OptimizerGUI:
 
                             self.log(f"[MODO] Bloque {block_idx}: optimizando parámetros ({current_block} gens)...")
                             cfg_params = GAConfig(**{**asdict(cfg), "generations": current_block})
-                            params_best, params_metrics = run_ga(
+                            params_best, params_metrics, pop = run_ga(
                                 candles=candles,
                                 space=self.space,
                                 cfg=cfg_params,
                                 stop_flag=lambda: self._stop,
                                 log_fn=log_fn,
+                                initial_population=pop,
+                                gen_offset=gen_offset,
+                                return_population=True,
                             )
-                            params_ge = params_best[1] if params_best else best_genome
-                            if params_ge is None:
+                            if not params_best and best_genome is None:
                                 break
 
-                            params_metrics = params_metrics or simulate_spot(
-                                candles,
-                                params_ge,
-                                self.var_fee.get() * self.var_fee_mult.get(),
-                                self.var_slip.get(),
-                            )
+                            params_ge = params_best[1] if params_best else best_genome
+                            if params_best:
+                                params_score = params_best[0]
+                                params_metrics = params_metrics or simulate_spot(
+                                    candles,
+                                    params_ge,
+                                    self.var_fee.get() * self.var_fee_mult.get(),
+                                    self.var_slip.get(),
+                                )
+                                if best_score is None or params_score > best_score + 1e-9:
+                                    best_score = params_score
+                                    best_genome = params_ge
+                                    best_metrics = params_metrics
+                                elif best_genome is None:
+                                    best_genome = params_ge
+                                    best_metrics = params_metrics
 
-                            best_genome = params_ge
-                            best_metrics = params_metrics
+                            gen_offset += current_block
 
                             if self._stop:
                                 break
 
                             self.log("[MODO] Activando optimizador de pesos...")
                             cfg_weights = GAConfig(**{**asdict(cfg), "generations": weight_burst})
-                            weights_best, weights_metrics = run_ga_weights_only(
+                            prev_pop = pop
+                            weights_best, weights_metrics, weights_pop = run_ga_weights_only(
                                 candles=candles,
                                 space=self.space,
                                 cfg=cfg_weights,
                                 stop_flag=lambda: self._stop,
                                 log_fn=log_fn,
                                 base_params=asdict(best_genome),
+                                initial_population=pop,
+                                gen_offset=gen_offset,
+                                return_population=True,
                             )
+                            gen_offset += weight_burst
                             weights_ge = weights_best[1] if weights_best else None
                             if weights_ge:
                                 weights_metrics = weights_metrics or simulate_spot(
@@ -1983,8 +2041,10 @@ class OptimizerGUI:
                                     self.log("[MODO] Pesos mejoraron PF y ganancia. Manteniendo nuevos pesos.")
                                     best_genome = weights_ge
                                     best_metrics = weights_metrics
+                                    pop = weights_pop
                                 else:
                                     self.log("[MODO] Pesos no mejoraron PF/ganancia. Manteniendo parámetros actuales.")
+                                    pop = prev_pop
 
                         self.best_genome = best_genome
                         self.best_metrics = best_metrics
