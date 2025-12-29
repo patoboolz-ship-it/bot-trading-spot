@@ -1224,6 +1224,33 @@ class GAConfig:
     pen_per_missing_trade: float
 
 
+WEIGHT_GENES = [
+    "w_buy_rsi",
+    "w_buy_macd",
+    "w_buy_consec",
+    "w_sell_rsi",
+    "w_sell_macd",
+    "w_sell_consec",
+]
+
+PARAM_GENES = [
+    "rsi_period",
+    "rsi_oversold",
+    "rsi_overbought",
+    "macd_fast",
+    "macd_slow",
+    "macd_signal",
+    "consec_red",
+    "consec_green",
+    "buy_th",
+    "sell_th",
+    "take_profit",
+    "stop_loss",
+    "cooldown",
+    "edge_trigger",
+    "use_ha",
+]
+
 BLOCKS = {
     "RSI": ["rsi_period", "rsi_oversold", "rsi_overbought"],
     "MACD": ["macd_fast", "macd_slow", "macd_signal"],
@@ -1284,6 +1311,7 @@ def make_child_blocky(
     max_blocks_per_child: int,
     forced_block: Optional[str] = None,
     strength: float = 0.8,
+    allowed_blocks: Optional[list[str]] = None,
 ):
     d1 = asdict(p1)
     d2 = asdict(p2)
@@ -1293,7 +1321,7 @@ def make_child_blocky(
         child[k] = d1[k] if random.random() < 0.5 else d2[k]
 
     if random.random() < mut_rate:
-        block_names = list(BLOCKS.keys())
+        block_names = allowed_blocks if allowed_blocks else list(BLOCKS.keys())
         random.shuffle(block_names)
 
         chosen = []
@@ -1331,15 +1359,50 @@ def force_coverage(space: ParamSpace, n: int):
     return out
 
 
-def run_ga(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
+def make_base_genome(space: ParamSpace, base_params: Optional[dict] = None) -> Genome:
+    payload = DEFAULT_GEN.copy()
+    if base_params:
+        payload.update(base_params)
+    ge = Genome(**payload)
+    return space.clamp_genome(ge)
+
+
+def make_freeze_fn(space: ParamSpace, base_genome: Genome, optimize_genes: list[str]):
+    optimize_set = set(optimize_genes)
+    frozen_genes = [k for k in asdict(base_genome).keys() if k not in optimize_set]
+
+    def _freeze(ge: Genome) -> Genome:
+        d = asdict(ge)
+        for k in frozen_genes:
+            d[k] = getattr(base_genome, k)
+        return space.clamp_genome(Genome(**d))
+
+    return _freeze
+
+
+def run_ga(
+    candles,
+    space: ParamSpace,
+    cfg: GAConfig,
+    stop_flag,
+    log_fn,
+    sample_fn=None,
+    postprocess_fn=None,
+    allowed_blocks: Optional[list[str]] = None,
+):
     fee_per_side = cfg.fee_side * cfg.fee_mult
     slip_per_side = cfg.slip_side
 
     log_fn(f"[COSTOS] SPOT | fee_lado={fee_per_side:.6f} (incluye mult) | slip_lado={slip_per_side:.6f}")
 
-    pop = [space.sample() for _ in range(cfg.population)]
+    if sample_fn is None:
+        sample_fn = space.sample
+    if postprocess_fn is None:
+        postprocess_fn = lambda ge: ge
+
+    pop = [postprocess_fn(sample_fn()) for _ in range(cfg.population)]
     cov = force_coverage(space, max(12, cfg.population // 6))
-    pop[:len(cov)] = cov
+    pop[:len(cov)] = [postprocess_fn(ge) for ge in cov]
     log_fn(f"[COBERTURA] forcé {len(cov)} individuos para cubrir rangos completos (inicio)")
 
     best_global = None
@@ -1397,7 +1460,7 @@ def run_ga(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
 
         children = []
 
-        block_cycle = ["RSI", "MACD", "CONSEC", "RISK", "CONF"]
+        block_cycle = allowed_blocks or ["RSI", "MACD", "CONSEC", "RISK", "CONF"]
         bc_i = 0
 
         for _ in range(cfg.n_cons):
@@ -1405,27 +1468,54 @@ def run_ga(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
             p2 = random.choice(pool)
             forced = block_cycle[bc_i % len(block_cycle)]
             bc_i += 1
-            children.append(make_child_blocky(space, p1, p2, mut_rate=0.28, max_blocks_per_child=1,
-                                              forced_block=forced, strength=0.55))
+            child = make_child_blocky(
+                space,
+                p1,
+                p2,
+                mut_rate=0.28,
+                max_blocks_per_child=1,
+                forced_block=forced,
+                strength=0.55,
+                allowed_blocks=allowed_blocks,
+            )
+            children.append(postprocess_fn(child))
 
         for _ in range(cfg.n_exp):
             p1 = random.choice(pool)
             p2 = random.choice(pool)
             forced = block_cycle[bc_i % len(block_cycle)]
             bc_i += 1
-            children.append(make_child_blocky(space, p1, p2, mut_rate=0.60, max_blocks_per_child=2,
-                                              forced_block=forced, strength=0.80))
+            child = make_child_blocky(
+                space,
+                p1,
+                p2,
+                mut_rate=0.60,
+                max_blocks_per_child=2,
+                forced_block=forced,
+                strength=0.80,
+                allowed_blocks=allowed_blocks,
+            )
+            children.append(postprocess_fn(child))
 
         for _ in range(cfg.n_wild):
             if random.random() < 0.35:
-                children.append(space.sample())
+                children.append(postprocess_fn(sample_fn()))
             else:
                 p1 = random.choice(pool)
                 p2 = random.choice(pool)
                 forced = block_cycle[bc_i % len(block_cycle)]
                 bc_i += 1
-                children.append(make_child_blocky(space, p1, p2, mut_rate=0.90, max_blocks_per_child=3,
-                                                  forced_block=forced, strength=1.00))
+                child = make_child_blocky(
+                    space,
+                    p1,
+                    p2,
+                    mut_rate=0.90,
+                    max_blocks_per_child=3,
+                    forced_block=forced,
+                    strength=1.00,
+                    allowed_blocks=allowed_blocks,
+                )
+                children.append(postprocess_fn(child))
 
         new_pop = elite + children
         if extra_cov:
@@ -1435,11 +1525,39 @@ def run_ga(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
         if len(new_pop) > cfg.population:
             new_pop = new_pop[:cfg.population]
         while len(new_pop) < cfg.population:
-            new_pop.append(space.sample())
+            new_pop.append(postprocess_fn(sample_fn()))
 
         pop = new_pop
 
     return best_global, best_metrics
+
+
+def run_ga_weights_only(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
+    base = make_base_genome(space)
+    freeze_fn = make_freeze_fn(space, base, WEIGHT_GENES)
+    return run_ga(
+        candles=candles,
+        space=space,
+        cfg=cfg,
+        stop_flag=stop_flag,
+        log_fn=log_fn,
+        postprocess_fn=freeze_fn,
+        allowed_blocks=["CONF"],
+    )
+
+
+def run_ga_params_only(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
+    base = make_base_genome(space)
+    freeze_fn = make_freeze_fn(space, base, PARAM_GENES)
+    return run_ga(
+        candles=candles,
+        space=space,
+        cfg=cfg,
+        stop_flag=stop_flag,
+        log_fn=log_fn,
+        postprocess_fn=freeze_fn,
+        allowed_blocks=["RSI", "MACD", "CONSEC", "RISK"],
+    )
 
 
 class OptimizerGUI:
@@ -1472,6 +1590,8 @@ class OptimizerGUI:
         self.var_dd_w = tk.DoubleVar(value=2.5)
         self.var_trade_floor = tk.IntVar(value=120)
         self.var_pen_missing = tk.DoubleVar(value=0.35)
+
+        self.var_opt_mode = tk.StringVar(value="Ambos")
 
         self.space = self.build_space_defaults()
         self.build_ui()
@@ -1553,6 +1673,11 @@ class OptimizerGUI:
         add_labeled(fit, "DD weight:", self.var_dd_w, 6)
         add_labeled(fit, "Trade floor:", self.var_trade_floor, 8)
         add_labeled(fit, "Pen/trade falt.:", self.var_pen_missing, 8)
+
+        mode = ttk.LabelFrame(frm, text="Modo de optimización")
+        mode.pack(fill="x", padx=pad, pady=pad)
+        for text in ("Optimizar Pesos", "Optimizar Parámetros", "Ambos"):
+            ttk.Radiobutton(mode, text=text, variable=self.var_opt_mode, value=text).pack(side="left", padx=8)
 
         ranges = ttk.LabelFrame(frm, text="Rangos (min / max / step)")
         ranges.pack(fill="both", expand=False, padx=pad, pady=pad)
@@ -1772,15 +1897,77 @@ class OptimizerGUI:
                     candles = fetch_klines_public(symbol, tf, n)
                     self.cached_candles = candles
                     self.log(f"[OK] {symbol} cargado: {len(candles)} velas ({tf})")
-                    best_global, best_metrics = run_ga(
-                        candles=candles,
-                        space=self.space,
-                        cfg=cfg,
-                        stop_flag=lambda: self._stop,
-                        log_fn=lambda s: self.root.after(0, self.log, s),
-                    )
-                    self.best_genome = best_global[1] if best_global else None
-                    self.best_metrics = best_metrics
+                    mode = self.var_opt_mode.get()
+                    log_fn = lambda s: self.root.after(0, self.log, s)
+
+                    if mode == "Optimizar Pesos":
+                        best_global, best_metrics = run_ga_weights_only(
+                            candles=candles,
+                            space=self.space,
+                            cfg=cfg,
+                            stop_flag=lambda: self._stop,
+                            log_fn=log_fn,
+                        )
+                        self.best_genome = best_global[1] if best_global else None
+                        self.best_metrics = best_metrics
+                    elif mode == "Optimizar Parámetros":
+                        best_global, best_metrics = run_ga_params_only(
+                            candles=candles,
+                            space=self.space,
+                            cfg=cfg,
+                            stop_flag=lambda: self._stop,
+                            log_fn=log_fn,
+                        )
+                        self.best_genome = best_global[1] if best_global else None
+                        self.best_metrics = best_metrics
+                    else:
+                        self.log("[MODO] Ambos: corriendo GA de pesos y GA de parámetros en paralelo.")
+                        results = {}
+
+                        def run_and_store(key, fn):
+                            results[key] = fn(
+                                candles=candles,
+                                space=self.space,
+                                cfg=cfg,
+                                stop_flag=lambda: self._stop,
+                                log_fn=log_fn,
+                            )
+
+                        t_weights = threading.Thread(target=run_and_store, args=("weights", run_ga_weights_only), daemon=True)
+                        t_params = threading.Thread(target=run_and_store, args=("params", run_ga_params_only), daemon=True)
+                        t_weights.start()
+                        t_params.start()
+                        t_weights.join()
+                        t_params.join()
+
+                        weights_best = results.get("weights", (None, None))[0]
+                        params_best = results.get("params", (None, None))[0]
+                        weights_ge = weights_best[1] if weights_best else None
+                        params_ge = params_best[1] if params_best else None
+
+                        if weights_ge or params_ge:
+                            base = make_base_genome(self.space)
+                            merged = asdict(base)
+                            if weights_ge:
+                                for key in WEIGHT_GENES:
+                                    merged[key] = getattr(weights_ge, key)
+                            if params_ge:
+                                for key in PARAM_GENES:
+                                    merged[key] = getattr(params_ge, key)
+                            merged_ge = self.space.clamp_genome(Genome(**merged))
+                            merged_metrics = simulate_spot(
+                                candles,
+                                merged_ge,
+                                self.var_fee.get() * self.var_fee_mult.get(),
+                                self.var_slip.get(),
+                            )
+                            self.best_genome = merged_ge
+                            self.best_metrics = merged_metrics
+                            self.log("[MODO] Ambos: combiné pesos y parámetros en un solo genoma.")
+                        else:
+                            self.best_genome = None
+                            self.best_metrics = None
+
                     if self.best_genome:
                         self.root.after(0, self.log, "[FIN] Mejor encontrado:")
                         self.root.after(0, self.log, json.dumps(asdict(self.best_genome), indent=2, ensure_ascii=False))
