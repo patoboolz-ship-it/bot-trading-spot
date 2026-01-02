@@ -75,6 +75,11 @@ JOURNAL_CSV = "bot_journal.csv"
 # Capital inicial para reportes de optimización
 START_CAPITAL = 100000.0
 
+# Red / Binance
+BINANCE_TIMEOUT_SEC = 30
+BINANCE_MAX_RETRIES = 3
+BINANCE_RETRY_BACKOFF_SEC = 1.5
+
 
 # =========================
 # GEN 235 (defaults)
@@ -958,7 +963,11 @@ class BotGUI:
         try:
             key = read_key(API_KEY_PATH)
             sec = read_key(API_SECRET_PATH)
-            self.client = Client(key, sec)
+            self.client = Client(
+                key,
+                sec,
+                requests_params={"timeout": BINANCE_TIMEOUT_SEC},
+            )
             self.client.ping()
             self.log("[OK] Conectado a Binance SPOT (ping ok).")
         except Exception as e:
@@ -1053,9 +1062,28 @@ def fetch_klines_public(symbol: str, interval: str, limit: int):
         if end_time is not None:
             params["endTime"] = end_time
 
-        r = requests.get(BINANCE_BASE + "/api/v3/klines", params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
+        data = None
+        last_err = None
+        for attempt in range(1, BINANCE_MAX_RETRIES + 1):
+            try:
+                r = requests.get(
+                    BINANCE_BASE + "/api/v3/klines",
+                    params=params,
+                    timeout=BINANCE_TIMEOUT_SEC,
+                )
+                r.raise_for_status()
+                data = r.json()
+                break
+            except requests.exceptions.RequestException as exc:
+                last_err = exc
+                if attempt == BINANCE_MAX_RETRIES:
+                    raise
+                time.sleep(BINANCE_RETRY_BACKOFF_SEC * attempt)
+
+        if data is None:
+            if last_err:
+                raise last_err
+            raise RuntimeError("Sin respuesta de Binance en klines.")
         if not data:
             break
 
