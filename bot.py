@@ -79,6 +79,7 @@ START_CAPITAL = 100000.0
 BINANCE_TIMEOUT_SEC = 30
 BINANCE_MAX_RETRIES = 3
 BINANCE_RETRY_BACKOFF_SEC = 1.5
+SELL_NOTIONAL_BUFFER_USDT = 1.0
 
 
 # =========================
@@ -631,6 +632,26 @@ class SpotBot:
         if qty <= 0:
             return None
 
+        est_notional = None
+        try:
+            price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
+            est_notional = price * qty
+        except Exception as e:
+            self._emit("log", {"msg": f"[WARN] No pude estimar notional para venta: {e}"})
+
+        if DRY_RUN:
+            if est_notional is not None and self.min_notional:
+                if est_notional < (self.min_notional + SELL_NOTIONAL_BUFFER_USDT):
+                    self._emit(
+                        "log",
+                        {
+                            "msg": (
+                                "[SELL] (DRY_RUN) notional bajo "
+                                f"{est_notional:.4f} < {self.min_notional + SELL_NOTIONAL_BUFFER_USDT:.4f} -> simulo igual"
+                            )
+                        },
+                    )
+
         if DRY_RUN:
             price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
             trade = Trade(
@@ -646,6 +667,20 @@ class SpotBot:
                 raw=""
             )
             return trade
+
+        if est_notional is not None and self.min_notional:
+            min_required = self.min_notional + SELL_NOTIONAL_BUFFER_USDT
+            if est_notional < min_required:
+                self._emit(
+                    "log",
+                    {
+                        "msg": (
+                            f"[SELL] notional {est_notional:.4f} < {min_required:.4f} "
+                            f"(minNotional+buffer) -> no vendo (dejo dust)"
+                        )
+                    },
+                )
+                return None
 
         try:
             order = self.client.create_order(
