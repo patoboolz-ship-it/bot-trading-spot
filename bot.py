@@ -387,6 +387,25 @@ def get_free_balance(client: Client, asset: str) -> float:
         return 0.0
     return float(bal["free"])
 
+def get_spot_balances(client: Client) -> list[dict]:
+    account = client.get_account()
+    balances = []
+    for bal in account.get("balances", []):
+        free = float(bal.get("free", 0.0))
+        locked = float(bal.get("locked", 0.0))
+        total = free + locked
+        if total > 0:
+            balances.append(
+                {
+                    "asset": bal.get("asset", ""),
+                    "free": free,
+                    "locked": locked,
+                    "total": total,
+                }
+            )
+    balances.sort(key=lambda item: item["asset"])
+    return balances
+
 def fetch_klines_closed(client: Client, symbol: str, interval: str, limit: int):
     """
     Trae velas y devuelve SOLO velas cerradas (quita la vela actual en formación).
@@ -632,6 +651,26 @@ class SpotBot:
             self._emit("log", {"msg": f"[SELL] BinanceAPIException: {e}"})
             return None
 
+    def manual_buy_by_quote_pct(self, pct: float) -> Optional[Trade]:
+        usdt_free = get_free_balance(self.client, QUOTE_ASSET)
+        if usdt_free <= 0:
+            self._emit("log", {"msg": "[MANUAL BUY] USDT libre = 0, no compro"})
+            return None
+        target = usdt_free * (pct / 100.0)
+        target = float(target)
+        if target <= 0:
+            self._emit("log", {"msg": "[MANUAL BUY] Porcentaje inválido, no compro"})
+            return None
+        return self._place_market_buy_by_quote(target, reason="MANUAL_BUY")
+
+    def manual_sell_all_base(self) -> Optional[Trade]:
+        sol_free = get_free_balance(self.client, BASE_ASSET)
+        qty = round_step(sol_free, self.step)
+        if qty <= 0:
+            self._emit("log", {"msg": "[MANUAL SELL] No hay SOL libre para vender"})
+            return None
+        return self._place_market_sell_qty(qty, reason="MANUAL_SELL")
+
     def _open_position_from_trade(self, buy_trade: Trade, last_close_time_ms: int):
         ep = buy_trade.price
         qty = buy_trade.qty
@@ -729,15 +768,39 @@ class SpotBot:
                     if self.position.sl_price is not None and last_close <= self.position.sl_price:
                         sl_hit = True
 
+                spot_price = last_close
+                try:
+                    spot_price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
+                except Exception as e:
+                    self._emit("log", {"msg": f"[WARN] No pude leer precio actual: {e}"})
+
+                wallet = None
+                try:
+                    wallet = get_spot_balances(self.client)
+                except Exception as e:
+                    self._emit("log", {"msg": f"[WARN] No pude leer billetera spot: {e}"})
+
+                recent_candles = [
+                    {
+                        "time_utc": datetime.fromtimestamp(c["close_time"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                        "close": c["close"],
+                    }
+                    for c in candles[-5:]
+                ]
+
                 self._emit("tick", {
                     "time_utc": self._now_utc(),
                     "close": last_close,
+                    "spot_price": spot_price,
                     "buyScore": bScore,
                     "sellScore": sScore,
                     "buyCond": buy_cond,
                     "sellCond": sell_cond,
                     "tp_hit": tp_hit,
-                    "sl_hit": sl_hit
+                    "sl_hit": sl_hit,
+                    "wallet": wallet,
+                    "ops_count": len(self.closed_trades) + len(self.open_trades),
+                    "recent_candles": recent_candles,
                 })
 
                 # Ejecutar
@@ -829,14 +892,28 @@ class BotGUI:
         self.var_last = tk.StringVar(value="-")
         self.var_scores = tk.StringVar(value="bScore=- sScore=-")
         self.var_price = tk.StringVar(value="close=-")
+        self.var_spot_price = tk.StringVar(value="spot=-")
         self.var_flags = tk.StringVar(value="buyCond=- sellCond=- tp=- sl=-")
         self.var_pos = tk.StringVar(value="pos: NONE")
+        self.var_wallet_summary = tk.StringVar(value="wallet: -")
+        self.var_ops = tk.StringVar(value="ops: -")
+        self.var_recent_candles = tk.StringVar(value="velas: -")
+        self.var_manual_pct = tk.DoubleVar(value=10.0)
 
         self._build()
 
     def _build(self):
-        frm = ttk.Frame(self.root, padding=10)
-        frm.pack(fill="both", expand=True)
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill="both", expand=True)
+
+        bot_tab = ttk.Frame(nb, padding=10)
+        wallet_tab = ttk.Frame(nb, padding=10)
+        manual_tab = ttk.Frame(nb, padding=10)
+        nb.add(bot_tab, text="Bot")
+        nb.add(wallet_tab, text="Billetera SPOT")
+        nb.add(manual_tab, text="Manual")
+
+        frm = bot_tab
 
         top = ttk.Frame(frm)
         top.pack(fill="x")
@@ -850,8 +927,13 @@ class BotGUI:
         ttk.Label(top, textvariable=self.var_price).grid(row=0, column=2, sticky="w", padx=10)
         ttk.Label(top, textvariable=self.var_scores).grid(row=1, column=2, sticky="w", padx=10)
         ttk.Label(top, textvariable=self.var_flags).grid(row=2, column=2, sticky="w", padx=10)
+        ttk.Label(top, textvariable=self.var_spot_price).grid(row=0, column=3, sticky="w", padx=10)
+        ttk.Label(top, textvariable=self.var_wallet_summary).grid(row=1, column=3, sticky="w", padx=10)
+        ttk.Label(top, textvariable=self.var_ops).grid(row=2, column=3, sticky="w", padx=10)
 
         ttk.Label(top, textvariable=self.var_pos).grid(row=2, column=0, columnspan=2, sticky="w", pady=5)
+
+        ttk.Label(top, textvariable=self.var_recent_candles).grid(row=3, column=0, columnspan=4, sticky="w", pady=5)
 
         # Buttons
         btns = ttk.Frame(frm)
@@ -903,6 +985,36 @@ class BotGUI:
         self.txt_log = tk.Text(lfrm, height=8, width=90)
         self.txt_log.pack(fill="both", expand=True)
 
+        wallet_controls = ttk.Frame(wallet_tab)
+        wallet_controls.pack(fill="x")
+
+        ttk.Button(wallet_controls, text="Actualizar billetera", command=self.refresh_wallet).pack(side="left")
+
+        self.wallet_tree = ttk.Treeview(wallet_tab, columns=("asset", "free", "locked", "total"), show="headings", height=16)
+        for col in ("asset", "free", "locked", "total"):
+            self.wallet_tree.heading(col, text=col)
+            self.wallet_tree.column(col, width=120, anchor="center")
+        self.wallet_tree.pack(fill="both", expand=True, pady=8)
+
+        manual_info = ttk.LabelFrame(manual_tab, text="Operaciones manuales (spot)")
+        manual_info.pack(fill="x", pady=8)
+
+        pct_row = ttk.Frame(manual_info)
+        pct_row.pack(fill="x", padx=6, pady=6)
+        ttk.Label(pct_row, text="Porcentaje USDT libre (%):").pack(side="left")
+        ttk.Entry(pct_row, textvariable=self.var_manual_pct, width=8).pack(side="left", padx=6)
+        ttk.Button(pct_row, text="Comprar % USDT (market)", command=self.manual_buy_pct).pack(side="left", padx=6)
+
+        sell_row = ttk.Frame(manual_info)
+        sell_row.pack(fill="x", padx=6, pady=6)
+        ttk.Button(sell_row, text="Vender TODO SOL (market)", command=self.manual_sell_all).pack(side="left")
+
+        manual_hint = ttk.Label(
+            manual_tab,
+            text="Nota: usa DRY_RUN=False para órdenes reales. Las operaciones manuales usan el mismo cliente SPOT.",
+        )
+        manual_hint.pack(fill="x", pady=6)
+
     def _refresh_params_box(self):
         self.txt_params.delete("1.0", "end")
         self.txt_params.insert("1.0", json.dumps(self.params, indent=2, ensure_ascii=False))
@@ -919,8 +1031,21 @@ class BotGUI:
             elif kind == "tick":
                 self.var_last.set(payload["time_utc"])
                 self.var_price.set(f"close={payload['close']:.4f}")
+                self.var_spot_price.set(f"spot={payload.get('spot_price', payload['close']):.4f}")
                 self.var_scores.set(f"bScore={payload['buyScore']:.3f} sScore={payload['sellScore']:.3f}")
                 self.var_flags.set(f"buyCond={payload['buyCond']} sellCond={payload['sellCond']} tp={payload['tp_hit']} sl={payload['sl_hit']}")
+                self.var_ops.set(f"ops={payload.get('ops_count', 0)}")
+                recent = payload.get("recent_candles", [])
+                if recent:
+                    candles_txt = " | ".join(f"{c['time_utc']}={c['close']:.4f}" for c in recent)
+                    self.var_recent_candles.set(f"velas: {candles_txt}")
+                wallet = payload.get("wallet")
+                if wallet is not None:
+                    self._update_wallet_table(wallet)
+                    summary = ", ".join(
+                        f"{item['asset']} {item['total']:.6f}" for item in wallet if item["total"] > 0
+                    )
+                    self.var_wallet_summary.set(f"wallet: {summary}" if summary else "wallet: -")
             elif kind == "position":
                 if payload["pos"] is None:
                     self.var_pos.set("pos: NONE")
@@ -959,6 +1084,70 @@ class BotGUI:
 
         self.root.after(0, _upd)
 
+    def _update_wallet_table(self, wallet: list[dict]):
+        if not hasattr(self, "wallet_tree"):
+            return
+        self.wallet_tree.delete(*self.wallet_tree.get_children())
+        for item in wallet:
+            self.wallet_tree.insert(
+                "",
+                "end",
+                values=(
+                    item["asset"],
+                    f"{item['free']:.6f}",
+                    f"{item['locked']:.6f}",
+                    f"{item['total']:.6f}",
+                ),
+            )
+
+    def refresh_wallet(self):
+        if not self.client:
+            messagebox.showwarning("Aviso", "Primero conecta.")
+            return
+        try:
+            wallet = get_spot_balances(self.client)
+            self._update_wallet_table(wallet)
+            summary = ", ".join(
+                f"{item['asset']} {item['total']:.6f}" for item in wallet if item["total"] > 0
+            )
+            self.var_wallet_summary.set(f"wallet: {summary}" if summary else "wallet: -")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def manual_buy_pct(self):
+        if not self.client:
+            messagebox.showwarning("Aviso", "Primero conecta.")
+            return
+        pct = float(self.var_manual_pct.get())
+        if pct <= 0:
+            messagebox.showwarning("Aviso", "Porcentaje inválido.")
+            return
+        if not self.bot:
+            try:
+                self.bot = SpotBot(self.client, SYMBOL, INTERVAL, self.params, ui_cb=self.ui_callback)
+            except ValueError as e:
+                messagebox.showerror("Parámetros", str(e))
+                return
+        trade = self.bot.manual_buy_by_quote_pct(pct)
+        if trade:
+            self.log(f"[MANUAL BUY] qty={trade.qty:.6f} price={trade.price:.4f} spent={trade.quote_spent:.4f}")
+            self.refresh_wallet()
+
+    def manual_sell_all(self):
+        if not self.client:
+            messagebox.showwarning("Aviso", "Primero conecta.")
+            return
+        if not self.bot:
+            try:
+                self.bot = SpotBot(self.client, SYMBOL, INTERVAL, self.params, ui_cb=self.ui_callback)
+            except ValueError as e:
+                messagebox.showerror("Parámetros", str(e))
+                return
+        trade = self.bot.manual_sell_all_base()
+        if trade:
+            self.log(f"[MANUAL SELL] qty={trade.qty:.6f} price={trade.price:.4f} got={trade.quote_spent:.4f}")
+            self.refresh_wallet()
+
     def connect(self):
         try:
             key = read_key(API_KEY_PATH)
@@ -970,6 +1159,7 @@ class BotGUI:
             )
             self.client.ping()
             self.log("[OK] Conectado a Binance SPOT (ping ok).")
+            self.refresh_wallet()
         except Exception as e:
             messagebox.showerror("Error", str(e))
 
