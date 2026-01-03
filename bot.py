@@ -1136,6 +1136,36 @@ class BotGUI:
         )
         manual_hint.pack(fill="x", pady=6)
 
+        wallet_controls = ttk.Frame(wallet_tab)
+        wallet_controls.pack(fill="x")
+
+        ttk.Button(wallet_controls, text="Actualizar billetera", command=self.refresh_wallet).pack(side="left")
+
+        self.wallet_tree = ttk.Treeview(wallet_tab, columns=("asset", "free", "locked", "total"), show="headings", height=16)
+        for col in ("asset", "free", "locked", "total"):
+            self.wallet_tree.heading(col, text=col)
+            self.wallet_tree.column(col, width=120, anchor="center")
+        self.wallet_tree.pack(fill="both", expand=True, pady=8)
+
+        manual_info = ttk.LabelFrame(manual_tab, text="Operaciones manuales (spot)")
+        manual_info.pack(fill="x", pady=8)
+
+        pct_row = ttk.Frame(manual_info)
+        pct_row.pack(fill="x", padx=6, pady=6)
+        ttk.Label(pct_row, text="Porcentaje USDT libre (%):").pack(side="left")
+        ttk.Entry(pct_row, textvariable=self.var_manual_pct, width=8).pack(side="left", padx=6)
+        ttk.Button(pct_row, text="Comprar % USDT (market)", command=self.manual_buy_pct).pack(side="left", padx=6)
+
+        sell_row = ttk.Frame(manual_info)
+        sell_row.pack(fill="x", padx=6, pady=6)
+        ttk.Button(sell_row, text="Vender TODO SOL (market)", command=self.manual_sell_all).pack(side="left")
+
+        manual_hint = ttk.Label(
+            manual_tab,
+            text="Nota: usa DRY_RUN=False para órdenes reales. Las operaciones manuales usan el mismo cliente SPOT.",
+        )
+        manual_hint.pack(fill="x", pady=6)
+
     def _refresh_params_box(self):
         self.txt_params.delete("1.0", "end")
         self.txt_params.insert("1.0", json.dumps(self.params, indent=2, ensure_ascii=False))
