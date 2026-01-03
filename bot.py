@@ -371,15 +371,17 @@ def get_filters(client: Client, symbol: str):
     tick = None
     step = None
     min_notional = None
+    min_qty = None
     for f in info["filters"]:
         if f["filterType"] == "PRICE_FILTER":
             tick = float(f["tickSize"])
         elif f["filterType"] == "LOT_SIZE":
             step = float(f["stepSize"])
+            min_qty = float(f.get("minQty", 0.0))
         elif f["filterType"] in ("MIN_NOTIONAL", "NOTIONAL"):
             # NOTIONAL aparece en algunos símbolos; usamos minNotional si existe
             min_notional = float(f.get("minNotional", f.get("notional", 0.0)))
-    return tick, step, min_notional
+    return tick, step, min_notional, min_qty
 
 def get_free_balance(client: Client, asset: str) -> float:
     bal = client.get_asset_balance(asset=asset)
@@ -447,7 +449,7 @@ class SpotBot:
         self.params["stop_loss"] = sl_pct
         self.ui_cb = ui_cb  # callback para UI
 
-        self.tick, self.step, self.min_notional = get_filters(client, symbol)
+        self.tick, self.step, self.min_notional, self.min_qty = get_filters(client, symbol)
 
         self.running = False
         self.thread = None
@@ -537,12 +539,28 @@ class SpotBot:
             self._emit("log", {"msg": f"[BUY] quote {quote_amount:.4f} < minNotional {self.min_notional:.4f} -> no compro"})
             return None
 
+        if self.min_qty:
+            try:
+                price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
+                est_qty = quote_amount / price
+                if est_qty < self.min_qty:
+                    self._emit(
+                        "log",
+                        {
+                            "msg": f"[BUY] qty estimada {est_qty:.8f} < minQty {self.min_qty:.8f} -> no compro"
+                        },
+                    )
+                    return None
+            except Exception as e:
+                self._emit("log", {"msg": f"[WARN] No pude estimar minQty: {e}"})
+
         if DRY_RUN:
             # Simulación simple: asumimos ejecución a precio actual
             price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
             qty = quote_amount / price
             qty = round_step(qty, self.step)
             if qty <= 0:
+                self._emit("log", {"msg": "[BUY] qty calculada <= 0 en simulación"})
                 return None
             trade = Trade(
                 trade_id=f"SIMBUY-{int(time.time())}",
@@ -732,7 +750,7 @@ class SpotBot:
         self._emit("position", {"pos": None})
 
     def _loop(self):
-        self._emit("log", {"msg": f"[BOT] Start {self.symbol} {self.interval} | DRY_RUN={DRY_RUN} | tick={self.tick} step={self.step} minNot={self.min_notional}"})
+        self._emit("log", {"msg": f"[BOT] Start {self.symbol} {self.interval} | DRY_RUN={DRY_RUN} | tick={self.tick} step={self.step} minNot={self.min_notional} minQty={self.min_qty}"})
 
         last_seen_close_time = None
 
@@ -1118,7 +1136,11 @@ class BotGUI:
         if not self.client:
             messagebox.showwarning("Aviso", "Primero conecta.")
             return
-        pct = float(self.var_manual_pct.get())
+        try:
+            pct = float(self.var_manual_pct.get())
+        except (TypeError, ValueError):
+            messagebox.showwarning("Aviso", "Porcentaje inválido.")
+            return
         if pct <= 0:
             messagebox.showwarning("Aviso", "Porcentaje inválido.")
             return
@@ -1132,6 +1154,8 @@ class BotGUI:
         if trade:
             self.log(f"[MANUAL BUY] qty={trade.qty:.6f} price={trade.price:.4f} spent={trade.quote_spent:.4f}")
             self.refresh_wallet()
+        else:
+            self.log("[MANUAL BUY] No se pudo ejecutar la compra. Revisa minNotional/minQty y saldo USDT.")
 
     def manual_sell_all(self):
         if not self.client:
@@ -1147,6 +1171,8 @@ class BotGUI:
         if trade:
             self.log(f"[MANUAL SELL] qty={trade.qty:.6f} price={trade.price:.4f} got={trade.quote_spent:.4f}")
             self.refresh_wallet()
+        else:
+            self.log("[MANUAL SELL] No se pudo ejecutar la venta. Revisa saldo SOL disponible.")
 
     def connect(self):
         try:
