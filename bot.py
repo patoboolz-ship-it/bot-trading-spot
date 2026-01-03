@@ -535,6 +535,42 @@ class SpotBot:
         if quote_amount <= 0:
             return None
 
+        if DRY_RUN:
+            # Simulación simple: asumimos ejecución a precio actual
+            price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
+            qty = quote_amount / price
+            qty = round_step(qty, self.step)
+            if qty <= 0:
+                self._emit("log", {"msg": "[BUY] qty calculada <= 0 en simulación"})
+                return None
+            if self.min_notional and quote_amount < self.min_notional:
+                self._emit(
+                    "log",
+                    {
+                        "msg": f"[BUY] (DRY_RUN) quote {quote_amount:.4f} < minNotional {self.min_notional:.4f} -> simulo igual"
+                    },
+                )
+            if self.min_qty and qty < self.min_qty:
+                self._emit(
+                    "log",
+                    {
+                        "msg": f"[BUY] (DRY_RUN) qty {qty:.8f} < minQty {self.min_qty:.8f} -> simulo igual"
+                    },
+                )
+            trade = Trade(
+                trade_id=f"SIMBUY-{int(time.time())}",
+                symbol=self.symbol,
+                side="BUY",
+                qty=qty,
+                price=price,
+                quote_spent=qty * price,
+                time_utc=self._now_utc(),
+                reason=reason,
+                order_id="SIM",
+                raw=""
+            )
+            return trade
+
         if self.min_notional and quote_amount < self.min_notional:
             self._emit("log", {"msg": f"[BUY] quote {quote_amount:.4f} < minNotional {self.min_notional:.4f} -> no compro"})
             return None
@@ -553,28 +589,6 @@ class SpotBot:
                     return None
             except Exception as e:
                 self._emit("log", {"msg": f"[WARN] No pude estimar minQty: {e}"})
-
-        if DRY_RUN:
-            # Simulación simple: asumimos ejecución a precio actual
-            price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
-            qty = quote_amount / price
-            qty = round_step(qty, self.step)
-            if qty <= 0:
-                self._emit("log", {"msg": "[BUY] qty calculada <= 0 en simulación"})
-                return None
-            trade = Trade(
-                trade_id=f"SIMBUY-{int(time.time())}",
-                symbol=self.symbol,
-                side="BUY",
-                qty=qty,
-                price=price,
-                quote_spent=qty * price,
-                time_utc=self._now_utc(),
-                reason=reason,
-                order_id="SIM",
-                raw=""
-            )
-            return trade
 
         try:
             order = self.client.create_order(
@@ -679,6 +693,23 @@ class SpotBot:
         if target <= 0:
             self._emit("log", {"msg": "[MANUAL BUY] Porcentaje inválido, no compro"})
             return None
+        if not DRY_RUN and self.min_notional and target < self.min_notional:
+            if usdt_free >= self.min_notional:
+                self._emit(
+                    "log",
+                    {
+                        "msg": f"[MANUAL BUY] % muy bajo para minNotional, ajusto a {self.min_notional:.4f} USDT"
+                    },
+                )
+                target = self.min_notional
+            else:
+                self._emit(
+                    "log",
+                    {
+                        "msg": f"[MANUAL BUY] USDT libre {usdt_free:.4f} < minNotional {self.min_notional:.4f}"
+                    },
+                )
+                return None
         return self._place_market_buy_by_quote(target, reason="MANUAL_BUY")
 
     def manual_sell_all_base(self) -> Optional[Trade]:
