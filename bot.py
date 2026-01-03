@@ -80,6 +80,7 @@ BINANCE_TIMEOUT_SEC = 30
 BINANCE_MAX_RETRIES = 3
 BINANCE_RETRY_BACKOFF_SEC = 1.5
 SELL_NOTIONAL_BUFFER_USDT = 1.0
+BUY_NOTIONAL_BUFFER_USDT = 1.0
 
 
 # =========================
@@ -527,6 +528,15 @@ class SpotBot:
         }
         return mapping.get(interval, 3600)
 
+    def _min_quote_for_notional(self, price: float) -> Optional[float]:
+        if not self.min_notional or not price or price <= 0:
+            return None
+        step = self.step if self.step else 0.0
+        if step <= 0:
+            return self.min_notional
+        qty_min = math.ceil((self.min_notional / price) / step) * step
+        return qty_min * price
+
     def _place_market_buy_by_quote(self, quote_amount: float, reason: str):
         """
         Compra gastando quote_amount USDT (aprox).
@@ -572,24 +582,36 @@ class SpotBot:
             )
             return trade
 
-        if self.min_notional and quote_amount < self.min_notional:
-            self._emit("log", {"msg": f"[BUY] quote {quote_amount:.4f} < minNotional {self.min_notional:.4f} -> no compro"})
-            return None
+        price = None
+        try:
+            price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
+        except Exception as e:
+            self._emit("log", {"msg": f"[WARN] No pude leer precio para validar compra: {e}"})
 
-        if self.min_qty:
-            try:
-                price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
-                est_qty = quote_amount / price
-                if est_qty < self.min_qty:
-                    self._emit(
-                        "log",
-                        {
-                            "msg": f"[BUY] qty estimada {est_qty:.8f} < minQty {self.min_qty:.8f} -> no compro"
-                        },
-                    )
-                    return None
-            except Exception as e:
-                self._emit("log", {"msg": f"[WARN] No pude estimar minQty: {e}"})
+        if self.min_notional:
+            min_quote = self._min_quote_for_notional(price) if price else self.min_notional
+            min_quote = min_quote + BUY_NOTIONAL_BUFFER_USDT if min_quote else self.min_notional
+            if quote_amount < min_quote:
+                self._emit(
+                    "log",
+                    {
+                        "msg": (
+                            f"[BUY] quote {quote_amount:.4f} < minNotional+buffer {min_quote:.4f} -> no compro"
+                        )
+                    },
+                )
+                return None
+
+        if self.min_qty and price:
+            est_qty = quote_amount / price
+            if est_qty < self.min_qty:
+                self._emit(
+                    "log",
+                    {
+                        "msg": f"[BUY] qty estimada {est_qty:.8f} < minQty {self.min_qty:.8f} -> no compro"
+                    },
+                )
+                return None
 
         try:
             order = self.client.create_order(
@@ -728,23 +750,33 @@ class SpotBot:
         if target <= 0:
             self._emit("log", {"msg": "[MANUAL BUY] Porcentaje inválido, no compro"})
             return None
-        if not DRY_RUN and self.min_notional and target < self.min_notional:
-            if usdt_free >= self.min_notional:
-                self._emit(
-                    "log",
-                    {
-                        "msg": f"[MANUAL BUY] % muy bajo para minNotional, ajusto a {self.min_notional:.4f} USDT"
-                    },
-                )
-                target = self.min_notional
+        if not DRY_RUN and self.min_notional:
+            price = None
+            try:
+                price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
+            except Exception as e:
+                self._emit("log", {"msg": f"[WARN] No pude leer precio para compra manual: {e}"})
+            min_quote = self._min_quote_for_notional(price) if price else self.min_notional
+            min_quote = min_quote + BUY_NOTIONAL_BUFFER_USDT if min_quote else self.min_notional
+            if target < min_quote:
+                if usdt_free >= min_quote:
+                    self._emit(
+                        "log",
+                        {
+                            "msg": f"[MANUAL BUY] % muy bajo para minNotional, ajusto a {min_quote:.4f} USDT"
+                        },
+                    )
+                    target = min_quote
+                else:
+                    self._emit(
+                        "log",
+                        {
+                            "msg": f"[MANUAL BUY] USDT libre {usdt_free:.4f} < minNotional {min_quote:.4f}"
+                        },
+                    )
+                    return None
             else:
-                self._emit(
-                    "log",
-                    {
-                        "msg": f"[MANUAL BUY] USDT libre {usdt_free:.4f} < minNotional {self.min_notional:.4f}"
-                    },
-                )
-                return None
+                pass
         return self._place_market_buy_by_quote(target, reason="MANUAL_BUY")
 
     def manual_sell_all_base(self) -> Optional[Trade]:
@@ -1066,8 +1098,43 @@ class BotGUI:
         lfrm = ttk.LabelFrame(frm, text="Log")
         lfrm.pack(fill="both", expand=True)
 
-        self.txt_log = tk.Text(lfrm, height=8, width=90)
-        self.txt_log.pack(fill="both", expand=True)
+        log_frame = ttk.Frame(lfrm)
+        log_frame.pack(fill="both", expand=True)
+        self.txt_log = tk.Text(log_frame, height=8, width=90, wrap="word")
+        log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.txt_log.yview)
+        self.txt_log.configure(yscrollcommand=log_scroll.set)
+        self.txt_log.pack(side="left", fill="both", expand=True)
+        log_scroll.pack(side="right", fill="y")
+
+        wallet_controls = ttk.Frame(wallet_tab)
+        wallet_controls.pack(fill="x")
+
+        ttk.Button(wallet_controls, text="Actualizar billetera", command=self.refresh_wallet).pack(side="left")
+
+        self.wallet_tree = ttk.Treeview(wallet_tab, columns=("asset", "free", "locked", "total"), show="headings", height=16)
+        for col in ("asset", "free", "locked", "total"):
+            self.wallet_tree.heading(col, text=col)
+            self.wallet_tree.column(col, width=120, anchor="center")
+        self.wallet_tree.pack(fill="both", expand=True, pady=8)
+
+        manual_info = ttk.LabelFrame(manual_tab, text="Operaciones manuales (spot)")
+        manual_info.pack(fill="x", pady=8)
+
+        pct_row = ttk.Frame(manual_info)
+        pct_row.pack(fill="x", padx=6, pady=6)
+        ttk.Label(pct_row, text="Porcentaje USDT libre (%):").pack(side="left")
+        ttk.Entry(pct_row, textvariable=self.var_manual_pct, width=8).pack(side="left", padx=6)
+        ttk.Button(pct_row, text="Comprar % USDT (market)", command=self.manual_buy_pct).pack(side="left", padx=6)
+
+        sell_row = ttk.Frame(manual_info)
+        sell_row.pack(fill="x", padx=6, pady=6)
+        ttk.Button(sell_row, text="Vender TODO SOL (market)", command=self.manual_sell_all).pack(side="left")
+
+        manual_hint = ttk.Label(
+            manual_tab,
+            text="Nota: usa DRY_RUN=False para órdenes reales. Las operaciones manuales usan el mismo cliente SPOT.",
+        )
+        manual_hint.pack(fill="x", pady=6)
 
         wallet_controls = ttk.Frame(wallet_tab)
         wallet_controls.pack(fill="x")
