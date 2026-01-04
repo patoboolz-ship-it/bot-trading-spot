@@ -626,7 +626,7 @@ class SpotBot:
         try:
             price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
         except Exception as e:
-            self._emit("log", {"msg": f"[WARN] No pude leer precio para validar compra: {e}"})
+            self._emit("log", {"msg": f"[AVISO] No pude leer precio para validar compra: {e}"})
 
         if self.min_notional:
             min_quote = self._min_quote_for_notional(price) if price else self.min_notional
@@ -686,7 +686,7 @@ class SpotBot:
             return trade
 
         except BinanceAPIException as e:
-            self._emit("log", {"msg": f"[BUY] BinanceAPIException: {e}"})
+            self._emit("log", {"msg": f"[ERROR] Error de Binance al comprar: {e}"})
             return None
 
     def _place_market_sell_qty(self, qty: float, reason: str):
@@ -699,7 +699,7 @@ class SpotBot:
             price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
             est_notional = price * qty
         except Exception as e:
-            self._emit("log", {"msg": f"[WARN] No pude estimar notional para venta: {e}"})
+            self._emit("log", {"msg": f"[AVISO] No pude estimar notional para venta: {e}"})
 
         if DRY_RUN:
             if est_notional is not None and self.min_notional:
@@ -777,7 +777,7 @@ class SpotBot:
             return trade
 
         except BinanceAPIException as e:
-            self._emit("log", {"msg": f"[SELL] BinanceAPIException: {e}"})
+            self._emit("log", {"msg": f"[ERROR] Error de Binance al vender: {e}"})
             return None
 
     def manual_buy_by_quote_pct(self, pct: float) -> Optional[Trade]:
@@ -795,7 +795,7 @@ class SpotBot:
             try:
                 price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
             except Exception as e:
-                self._emit("log", {"msg": f"[WARN] No pude leer precio para compra manual: {e}"})
+                self._emit("log", {"msg": f"[AVISO] No pude leer precio para compra manual: {e}"})
             min_quote = self._min_quote_for_notional(price) if price else self.min_notional
             min_quote = min_quote + BUY_NOTIONAL_BUFFER_USDT if min_quote else self.min_notional
             if target < min_quote:
@@ -888,7 +888,7 @@ class SpotBot:
         self._emit("position", {"pos": None})
 
     def _loop(self):
-        self._emit("log", {"msg": f"[BOT] Start {self.symbol} {self.interval} | DRY_RUN={DRY_RUN} | tick={self.tick} step={self.step} minNot={self.min_notional} minQty={self.min_qty}"})
+        self._emit("log", {"msg": f"[BOT] Inicio {self.symbol} {self.interval} | DRY_RUN={DRY_RUN} | tick={self.tick} step={self.step} minNot={self.min_notional} minQty={self.min_qty}"})
 
         last_seen_close_time = None
 
@@ -907,6 +907,8 @@ class SpotBot:
                     time.sleep(2)
                     continue
                 last_seen_close_time = close_time
+                close_time_utc = datetime.fromtimestamp(close_time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                self._emit("log", {"msg": f"[VELA] Nueva vela cerrada {close_time_utc} close={last_close:.4f}"})
 
                 bScore, sScore, last_close = compute_scores(self.params, candles)
 
@@ -928,13 +930,13 @@ class SpotBot:
                 try:
                     spot_price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
                 except Exception as e:
-                    self._emit("log", {"msg": f"[WARN] No pude leer precio actual: {e}"})
+                    self._emit("log", {"msg": f"[AVISO] No pude leer precio actual: {e}"})
 
                 wallet = None
                 try:
                     wallet = get_spot_balances(self.client)
                 except Exception as e:
-                    self._emit("log", {"msg": f"[WARN] No pude leer billetera spot: {e}"})
+                    self._emit("log", {"msg": f"[AVISO] No pude leer billetera spot: {e}"})
 
                 recent_candles = [
                     {
@@ -984,7 +986,7 @@ class SpotBot:
                         last_trade = t
 
                         fill_ratio = spent_total / target if target > 0 else 0.0
-                        self._emit("log", {"msg": f"[BUY] attempt {attempt} spent={spent_total:.4f}/{target:.4f} ({fill_ratio*100:.1f}%) qty={t.qty:.6f} avg={t.price:.4f}"})
+                        self._emit("log", {"msg": f"[BUY] intento {attempt} gastado={spent_total:.4f}/{target:.4f} ({fill_ratio*100:.1f}%) qty={t.qty:.6f} avg={t.price:.4f}"})
 
                         if fill_ratio >= MIN_FILL_RATIO:
                             break
@@ -1000,11 +1002,11 @@ class SpotBot:
 
                 # Cierre por TP/SL primero
                 if in_pos and tp_hit:
-                    self._emit("log", {"msg": "[TP] Take Profit hit -> cierro"})
+                    self._emit("log", {"msg": "[TP] Take Profit alcanzado -> cierro"})
                     self._close_position(reason="TP", last_close_time_ms=close_time)
                     continue
                 if in_pos and sl_hit:
-                    self._emit("log", {"msg": "[SL] Stop Loss hit -> cierro"})
+                    self._emit("log", {"msg": "[SL] Stop Loss alcanzado -> cierro"})
                     self._close_position(reason="SL", last_close_time_ms=close_time)
                     continue
 
@@ -1015,12 +1017,12 @@ class SpotBot:
                     continue
 
             except Exception as e:
-                self._emit("log", {"msg": f"[ERR] {e}"})
+                self._emit("log", {"msg": f"[ERROR] {e}"})
                 if self.client and self._retry_connection():
                     continue
                 time.sleep(2)
 
-        self._emit("log", {"msg": "[BOT] Stop"})
+        self._emit("log", {"msg": "[BOT] Detenido"})
 
 
 # =========================
@@ -1099,8 +1101,6 @@ class BotGUI:
         ttk.Label(top, textvariable=self.var_pos).grid(row=3, column=0, columnspan=2, sticky="w", pady=5)
 
         ttk.Label(top, textvariable=self.var_recent_candles).grid(row=4, column=0, columnspan=4, sticky="w", pady=5)
-
-        ttk.Label(top, textvariable=self.var_recent_candles).grid(row=3, column=0, columnspan=4, sticky="w", pady=5)
 
         # Buttons
         btns = ttk.Frame(frm)
