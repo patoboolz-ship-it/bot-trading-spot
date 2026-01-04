@@ -1100,6 +1100,8 @@ class BotGUI:
 
         ttk.Label(top, textvariable=self.var_recent_candles).grid(row=4, column=0, columnspan=4, sticky="w", pady=5)
 
+        ttk.Label(top, textvariable=self.var_recent_candles).grid(row=3, column=0, columnspan=4, sticky="w", pady=5)
+
         # Buttons
         btns = ttk.Frame(frm)
         btns.pack(fill="x", pady=8)
