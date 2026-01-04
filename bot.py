@@ -511,13 +511,16 @@ class SpotBot:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
     def _retry_connection(self) -> bool:
+        self._emit("net", {"status": "reconnecting"})
         cycle = 1
         while self.running:
             for attempt in range(1, RECONNECT_MAX_RETRIES + 1):
                 if not self.running:
+                    self._emit("net", {"status": "offline"})
                     return False
                 try:
                     self.client.ping()
+                    self._emit("net", {"status": "online"})
                     self._emit(
                         "log",
                         {
@@ -541,6 +544,7 @@ class SpotBot:
                     )
                     time.sleep(wait_s)
             cycle += 1
+        self._emit("net", {"status": "offline"})
         return False
 
     def _cooldown_ok(self, last_closed_close_time: int) -> bool:
@@ -1053,6 +1057,7 @@ class BotGUI:
         self.var_ops = tk.StringVar(value="ops: -")
         self.var_recent_candles = tk.StringVar(value="velas: -")
         self.var_manual_pct = tk.DoubleVar(value=10.0)
+        self.var_connection = tk.StringVar(value="offline")
         self._connect_stop = threading.Event()
         self._connect_thread: Optional[threading.Thread] = None
 
@@ -1078,8 +1083,11 @@ class BotGUI:
         ttk.Label(top, text="Estado:").grid(row=0, column=0, sticky="w")
         ttk.Label(top, textvariable=self.var_status).grid(row=0, column=1, sticky="w", padx=5)
 
-        ttk.Label(top, text="Último:").grid(row=1, column=0, sticky="w")
-        ttk.Label(top, textvariable=self.var_last).grid(row=1, column=1, sticky="w", padx=5)
+        ttk.Label(top, text="Conexión:").grid(row=1, column=0, sticky="w")
+        ttk.Label(top, textvariable=self.var_connection).grid(row=1, column=1, sticky="w", padx=5)
+
+        ttk.Label(top, text="Último:").grid(row=2, column=0, sticky="w")
+        ttk.Label(top, textvariable=self.var_last).grid(row=2, column=1, sticky="w", padx=5)
 
         ttk.Label(top, textvariable=self.var_price).grid(row=0, column=2, sticky="w", padx=10)
         ttk.Label(top, textvariable=self.var_scores).grid(row=1, column=2, sticky="w", padx=10)
@@ -1088,7 +1096,9 @@ class BotGUI:
         ttk.Label(top, textvariable=self.var_wallet_summary).grid(row=1, column=3, sticky="w", padx=10)
         ttk.Label(top, textvariable=self.var_ops).grid(row=2, column=3, sticky="w", padx=10)
 
-        ttk.Label(top, textvariable=self.var_pos).grid(row=2, column=0, columnspan=2, sticky="w", pady=5)
+        ttk.Label(top, textvariable=self.var_pos).grid(row=3, column=0, columnspan=2, sticky="w", pady=5)
+
+        ttk.Label(top, textvariable=self.var_recent_candles).grid(row=4, column=0, columnspan=4, sticky="w", pady=5)
 
         ttk.Label(top, textvariable=self.var_recent_candles).grid(row=3, column=0, columnspan=4, sticky="w", pady=5)
 
@@ -1219,6 +1229,8 @@ class BotGUI:
                         f"pos: qty={pos['qty']:.6f} entry={pos['entry_price']:.4f} "
                         f"TP={pos['tp_pct']*100:.2f}%({tp_disp}) SL={pos['sl_pct']*100:.2f}%({sl_disp})"
                     )
+            elif kind == "net":
+                self.var_connection.set(payload["status"])
             # refresh table
             if self.bot:
                 # render last 200 closed trades
@@ -1344,10 +1356,12 @@ class BotGUI:
             )
             self.client.ping()
             self.log("[OK] Conectado a Binance SPOT (ping ok).")
+            self.var_connection.set("online")
             self.refresh_wallet()
             return True
         except Exception as e:
             self.client = None
+            self.var_connection.set("offline")
             if show_errors:
                 messagebox.showerror("Error", str(e))
             else:
@@ -1368,6 +1382,10 @@ class BotGUI:
     def start(self):
         if not self.client:
             messagebox.showwarning("Aviso", "Primero conecta.")
+            return
+        if self.bot and self.bot.running:
+            self.var_status.set("RUN")
+            self.log("[BOT] Ya estaba iniciado.")
             return
 
         # leer params desde caja (por si editaste)
