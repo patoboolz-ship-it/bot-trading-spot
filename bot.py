@@ -81,6 +81,9 @@ BINANCE_MAX_RETRIES = 3
 BINANCE_RETRY_BACKOFF_SEC = 1.5
 SELL_NOTIONAL_BUFFER_USDT = 1.0
 BUY_NOTIONAL_BUFFER_USDT = 1.0
+RECONNECT_MAX_RETRIES = 5
+RECONNECT_BACKOFF_SEC = 2.0
+GUI_CONNECT_RETRY_SEC = 5.0
 
 
 # =========================
@@ -506,6 +509,39 @@ class SpotBot:
 
     def _now_utc(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _retry_connection(self) -> bool:
+        cycle = 1
+        while self.running:
+            for attempt in range(1, RECONNECT_MAX_RETRIES + 1):
+                if not self.running:
+                    return False
+                try:
+                    self.client.ping()
+                    self._emit(
+                        "log",
+                        {
+                            "msg": (
+                                f"[NET] Reconexion OK (ciclo {cycle}, intento "
+                                f"{attempt}/{RECONNECT_MAX_RETRIES})"
+                            )
+                        },
+                    )
+                    return True
+                except Exception as e:
+                    wait_s = RECONNECT_BACKOFF_SEC * attempt
+                    self._emit(
+                        "log",
+                        {
+                            "msg": (
+                                f"[NET] Reintentando conexion (ciclo {cycle}) "
+                                f"{attempt}/{RECONNECT_MAX_RETRIES} en {wait_s:.1f}s: {e}"
+                            )
+                        },
+                    )
+                    time.sleep(wait_s)
+            cycle += 1
+        return False
 
     def _cooldown_ok(self, last_closed_close_time: int) -> bool:
         cd = int(self.params["cooldown"])
@@ -976,6 +1012,8 @@ class SpotBot:
 
             except Exception as e:
                 self._emit("log", {"msg": f"[ERR] {e}"})
+                if self.client and self._retry_connection():
+                    continue
                 time.sleep(2)
 
         self._emit("log", {"msg": "[BOT] Stop"})
@@ -1015,8 +1053,11 @@ class BotGUI:
         self.var_ops = tk.StringVar(value="ops: -")
         self.var_recent_candles = tk.StringVar(value="velas: -")
         self.var_manual_pct = tk.DoubleVar(value=10.0)
+        self._connect_stop = threading.Event()
+        self._connect_thread: Optional[threading.Thread] = None
 
         self._build()
+        self._start_auto_connect()
 
     def _build(self):
         nb = ttk.Notebook(self.root)
@@ -1105,36 +1146,6 @@ class BotGUI:
         self.txt_log.configure(yscrollcommand=log_scroll.set)
         self.txt_log.pack(side="left", fill="both", expand=True)
         log_scroll.pack(side="right", fill="y")
-
-        wallet_controls = ttk.Frame(wallet_tab)
-        wallet_controls.pack(fill="x")
-
-        ttk.Button(wallet_controls, text="Actualizar billetera", command=self.refresh_wallet).pack(side="left")
-
-        self.wallet_tree = ttk.Treeview(wallet_tab, columns=("asset", "free", "locked", "total"), show="headings", height=16)
-        for col in ("asset", "free", "locked", "total"):
-            self.wallet_tree.heading(col, text=col)
-            self.wallet_tree.column(col, width=120, anchor="center")
-        self.wallet_tree.pack(fill="both", expand=True, pady=8)
-
-        manual_info = ttk.LabelFrame(manual_tab, text="Operaciones manuales (spot)")
-        manual_info.pack(fill="x", pady=8)
-
-        pct_row = ttk.Frame(manual_info)
-        pct_row.pack(fill="x", padx=6, pady=6)
-        ttk.Label(pct_row, text="Porcentaje USDT libre (%):").pack(side="left")
-        ttk.Entry(pct_row, textvariable=self.var_manual_pct, width=8).pack(side="left", padx=6)
-        ttk.Button(pct_row, text="Comprar % USDT (market)", command=self.manual_buy_pct).pack(side="left", padx=6)
-
-        sell_row = ttk.Frame(manual_info)
-        sell_row.pack(fill="x", padx=6, pady=6)
-        ttk.Button(sell_row, text="Vender TODO SOL (market)", command=self.manual_sell_all).pack(side="left")
-
-        manual_hint = ttk.Label(
-            manual_tab,
-            text="Nota: usa DRY_RUN=False para órdenes reales. Las operaciones manuales usan el mismo cliente SPOT.",
-        )
-        manual_hint.pack(fill="x", pady=6)
 
         wallet_controls = ttk.Frame(wallet_tab)
         wallet_controls.pack(fill="x")
@@ -1307,7 +1318,22 @@ class BotGUI:
         else:
             self.log("[MANUAL SELL] No se pudo ejecutar la venta. Revisa saldo SOL disponible.")
 
-    def connect(self):
+    def _start_auto_connect(self):
+        if self._connect_thread and self._connect_thread.is_alive():
+            return
+        self._connect_stop.clear()
+        self._connect_thread = threading.Thread(target=self._connect_loop, daemon=True)
+        self._connect_thread.start()
+
+    def _connect_loop(self):
+        while not self._connect_stop.is_set():
+            if self.client is None:
+                if self.connect(show_errors=False):
+                    if not self.bot or not self.bot.running:
+                        self.start()
+            time.sleep(GUI_CONNECT_RETRY_SEC)
+
+    def connect(self, *, show_errors: bool = True) -> bool:
         try:
             key = read_key(API_KEY_PATH)
             sec = read_key(API_SECRET_PATH)
@@ -1319,8 +1345,14 @@ class BotGUI:
             self.client.ping()
             self.log("[OK] Conectado a Binance SPOT (ping ok).")
             self.refresh_wallet()
+            return True
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            self.client = None
+            if show_errors:
+                messagebox.showerror("Error", str(e))
+            else:
+                self.log(f"[NET] Error de conexion: {e}")
+            return False
 
     def load_gen235(self):
         self.params = DEFAULT_GEN.copy()
