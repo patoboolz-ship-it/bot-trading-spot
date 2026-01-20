@@ -911,6 +911,8 @@ class SpotBot:
                 self._emit("log", {"msg": f"[VELA] Nueva vela cerrada {close_time_utc} close={last_close:.4f}"})
 
                 bScore, sScore, last_close = compute_scores(self.params, candles)
+                close_time_utc = datetime.fromtimestamp(close_time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                self._emit("log", {"msg": f"[VELA] Nueva vela cerrada {close_time_utc} close={last_close:.4f}"})
 
                 in_pos = self.position is not None
                 cool_ok = self._cooldown_ok(close_time)
