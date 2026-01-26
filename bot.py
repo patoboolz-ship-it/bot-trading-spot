@@ -75,6 +75,7 @@ JOURNAL_CSV = "bot_journal.csv"
 
 # Debug de mutaciones (GA)
 DEBUG_MUTATION = True
+DEBUG_FULL_POPULATION = True
 
 # Capital inicial para reportes de optimización
 START_CAPITAL = 100000.0
@@ -783,7 +784,6 @@ class SpotBot:
         except BinanceAPIException as e:
             self._emit("log", {"msg": f"[ERROR] Error de Binance al vender: {e}"})
             return None
-        return self._place_market_sell_qty(qty, reason="MANUAL_SELL")
 
     def manual_buy_by_quote_pct(self, pct: float) -> Optional[Trade]:
         usdt_free = get_free_balance(self.client, QUOTE_ASSET)
@@ -2221,6 +2221,43 @@ def run_ga(
                 recent_masks.append(mask_key)
                 return list(mask_key)
 
+    def format_value(gene: str, value, mutated: bool) -> str:
+        spec = space.spec[gene]
+        if spec["type"] == "int":
+            out = f"{int(value)}"
+        else:
+            out = f"{float(value):.4f}"
+        return f"{out}*" if mutated else out
+
+    def format_full_genes(ge: Genome, mutated_genes: set) -> str:
+        ordered = [
+            "rsi_period",
+            "rsi_overbought",
+            "rsi_oversold",
+            "macd_fast",
+            "macd_slow",
+            "macd_signal",
+            "consec_green",
+            "consec_red",
+            "buy_th",
+            "sell_th",
+            "cooldown",
+            "edge_trigger",
+            "take_profit",
+            "stop_loss",
+            "use_ha",
+            "w_buy_rsi",
+            "w_buy_macd",
+            "w_buy_consec",
+            "w_sell_rsi",
+            "w_sell_macd",
+            "w_sell_consec",
+        ]
+        lines = []
+        for gene in ordered:
+            lines.append(f"  {gene}={format_value(gene, getattr(ge, gene), gene in mutated_genes)}")
+        return "genes={\n" + ",\n".join(lines) + "\n}"
+
     for gen in range(1, cfg.generations + 1):
         if stop_flag():
             log_fn("[STOP] detenido por el usuario.")
@@ -2286,6 +2323,12 @@ def run_ga(
             print(f"[MASK SATURATED] {prev_mask} -> {active_mask_blocks}")
             if DEBUG_MUTATION:
                 print_mutation_counter("cambio_bloque")
+
+        if DEBUG_FULL_POPULATION:
+            print(
+                f"===== GENERACION {gen_display} | POP_SIZE={len(pop)} | "
+                f"BLOQUE(S) ACTIVOS: {active_mask_blocks} ====="
+            )
 
         if stuck >= 15:
             stuck = 0
@@ -2455,16 +2498,131 @@ def run_ga(
                 weights_counter_printed = True
 
         new_pop = elite + children
+        population_entries = []
+        population_entries.append(
+            {"genome": elite[0], "meta": None, "type": "elite", "blocks": []}
+        )
+        for idx, child in enumerate(children):
+            meta = child_meta[idx] if child_meta else None
+            if meta and meta.get("mutation_type") == "aleatorio":
+                tipo = "aleatorio"
+            elif meta and meta.get("mutated"):
+                tipo = "mutado"
+            else:
+                tipo = "clonado"
+            blocks = meta.get("mutated_blocks", []) if meta else []
+            population_entries.append(
+                {"genome": child, "meta": meta, "type": tipo, "blocks": blocks}
+            )
+
         if extra_cov:
             k = min(len(extra_cov), max(5, cfg.population // 10))
-            new_pop[-k:] = extra_cov[:k]
+            mutated_extra = []
+            for ge in extra_cov[:k]:
+                child_result = make_child_blocky(
+                    space,
+                    ge,
+                    ge,
+                    mut_rate=1.0,
+                    max_blocks_per_child=1,
+                    forced_blocks=active_mask_blocks,
+                    strength=forced_strength if active_mask_blocks else 0.80,
+                    allowed_blocks=allowed_blocks,
+                    return_meta=DEBUG_MUTATION,
+                )
+                if DEBUG_MUTATION:
+                    child, meta = child_result
+                else:
+                    child = child_result
+                    meta = None
+                mutated_extra.append((child, meta))
+            new_pop[-k:] = [entry[0] for entry in mutated_extra]
+            for idx, (child, meta) in enumerate(mutated_extra):
+                pop_idx = len(new_pop) - k + idx
+                tipo = "mutado" if meta and meta.get("mutated") else "clonado"
+                blocks = meta.get("mutated_blocks", []) if meta else []
+                population_entries[pop_idx] = {
+                    "genome": child,
+                    "meta": meta,
+                    "type": tipo,
+                    "blocks": blocks,
+                }
 
         if len(new_pop) > cfg.population:
             new_pop = new_pop[:cfg.population]
+            population_entries = population_entries[:cfg.population]
         while len(new_pop) < cfg.population:
-            new_pop.append(postprocess_fn(sample_fn()))
+            seed = postprocess_fn(sample_fn())
+            child_result = make_child_blocky(
+                space,
+                seed,
+                seed,
+                mut_rate=1.0,
+                max_blocks_per_child=1,
+                forced_blocks=active_mask_blocks,
+                strength=forced_strength if active_mask_blocks else 0.80,
+                allowed_blocks=allowed_blocks,
+                return_meta=DEBUG_MUTATION,
+            )
+            if DEBUG_MUTATION:
+                child, meta = child_result
+            else:
+                child = child_result
+                meta = None
+            new_pop.append(child)
+            population_entries.append(
+                {
+                    "genome": child,
+                    "meta": meta,
+                    "type": "mutado" if meta and meta.get("mutated") else "clonado",
+                    "blocks": meta.get("mutated_blocks", []) if meta else [],
+                }
+            )
 
         pop = new_pop
+
+        if DEBUG_FULL_POPULATION:
+            count_mutados = 0
+            count_clonados = 0
+            count_elite = 0
+            count_aleatorios = 0
+            count_sin_mutacion = 0
+            blocks_used = set()
+            for idx, entry in enumerate(population_entries):
+                meta = entry["meta"] or {}
+                mutated_genes = set(meta.get("mutated_genes", []))
+                if entry["type"] == "elite":
+                    count_elite += 1
+                elif entry["type"] == "mutado":
+                    count_mutados += 1
+                elif entry["type"] == "aleatorio":
+                    count_aleatorios += 1
+                else:
+                    count_clonados += 1
+
+                if entry["type"] != "elite" and not meta.get("mutated", False):
+                    count_sin_mutacion += 1
+                    if gen_display > 1:
+                        print(f"[WARNING] Individuo sin mutación detectado (IND {idx + 1})")
+
+                for bn in entry["blocks"]:
+                    blocks_used.add(bn)
+
+                print(
+                    f"[GEN {gen_display}][IND {idx + 1}/{len(population_entries)}]"
+                    f"[TIPO={entry['type']}]"
+                )
+                print(f"bloques_mutados={entry['blocks']}")
+                print(format_full_genes(entry["genome"], mutated_genes))
+
+            print(f"--- RESUMEN GEN {gen_display} ---")
+            print(f"pop_size={len(population_entries)}")
+            print(f"mutados={count_mutados}")
+            print(f"clonados={count_clonados}")
+            print(f"elite={count_elite}")
+            print(f"aleatorios={count_aleatorios}")
+            print(f"sin_mutacion={count_sin_mutacion}")
+            print(f"bloques_usados={sorted(blocks_used)}")
 
     if return_population:
         return best_global, best_metrics, pop
