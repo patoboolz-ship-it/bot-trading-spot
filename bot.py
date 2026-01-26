@@ -17,6 +17,7 @@ Seguridad:
 """
 
 import os
+import sys
 import time
 import math
 import json
@@ -924,6 +925,8 @@ class SpotBot:
                     time.sleep(2)
                     continue
                 last_seen_close_time = close_time
+                close_time_utc = datetime.fromtimestamp(close_time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                self._emit("log", {"msg": f"[VELA] Nueva vela cerrada {close_time_utc} close={last_close:.4f}"})
 
                 bScore, sScore, score_close = compute_scores(self.params, candles)
                 last_close = score_close
@@ -2148,6 +2151,7 @@ def run_ga(
 
     best_global = None
     best_metrics = None
+    prev_best_hash = None
     stuck = 0
     active_mask_blocks = None
     recent_masks = deque(maxlen=7)
@@ -2216,12 +2220,123 @@ def run_ga(
                 recent_masks.append(mask_key)
                 return list(mask_key)
 
-    for gen in range(1, cfg.generations + 1):
+    mutation_counter = {gene: 0 for gene in space.spec.keys()}
+    mode_label = "ambos"
+    if allowed_blocks == ["CONF"]:
+        mode_label = "pesos"
+    elif allowed_blocks and "CONF" not in allowed_blocks:
+        mode_label = "parametros"
+    weights_counter_printed = False
+    dashboard_header_printed = False
+
+    def print_mutation_counter(reason: str):
+        print(f"[MUTATION COUNTER] {reason}")
+        for gene in sorted(mutation_counter.keys()):
+            print(f"{gene}={mutation_counter[gene]}")
+
+    def pick_random_mask() -> list[str]:
+        if not schedule_blocks:
+            return []
+        while True:
+            count = random.randint(1, min(2, len(schedule_blocks)))
+            blocks = random.sample(schedule_blocks, count)
+            mask_key = tuple(sorted(blocks))
+            if mask_key not in recent_masks:
+                recent_masks.append(mask_key)
+                return list(mask_key)
+
+    def format_value(gene: str, value, mutated: bool) -> str:
+        spec = space.spec[gene]
+        if spec["type"] == "int":
+            out = f"{int(value)}"
+        else:
+            out = f"{float(value):.4f}"
+        return f"{out}*" if mutated else out
+
+    def format_full_genes(ge: Genome, mutated_genes: set) -> str:
+        ordered = [
+            "rsi_period",
+            "rsi_overbought",
+            "rsi_oversold",
+            "macd_fast",
+            "macd_slow",
+            "macd_signal",
+            "consec_green",
+            "consec_red",
+            "buy_th",
+            "sell_th",
+            "cooldown",
+            "edge_trigger",
+            "take_profit",
+            "stop_loss",
+            "use_ha",
+            "w_buy_rsi",
+            "w_buy_macd",
+            "w_buy_consec",
+            "w_sell_rsi",
+            "w_sell_macd",
+            "w_sell_consec",
+        ]
+        lines = []
+        for gene in ordered:
+            lines.append(f"  {gene}={format_value(gene, getattr(ge, gene), gene in mutated_genes)}")
+        return "genes={\n" + ",\n".join(lines) + "\n}"
+
+    total_gens = cfg.generations
+    if is_weight_opt:
+        total_gens = min(total_gens, MAX_WEIGHT_GENS)
+
+    def _empty_metrics() -> Metrics:
+        return Metrics(
+            score=-1e9,
+            net=-1.0,
+            balance=0.0,
+            profit=0.0,
+            gross_profit=0.0,
+            gross_loss=0.0,
+            max_dd=1.0,
+            dd_pct=100.0,
+            trades=0,
+            wins=0,
+            losses=0,
+            winrate=0.0,
+            pf=0.0,
+            years=0.0,
+            trades_per_year=0.0,
+            buy_signal_rate=0.0,
+            sell_signal_rate=0.0,
+        )
+
+    def _refresh_weight_genome(ge: Genome, strength: float = 0.9) -> Genome:
+        payload = asdict(ge)
+        mutate_block(payload, space, "CONF", strength=strength)
+        return space.clamp_genome(Genome(**payload))
+
+    for gen in range(1, total_gens + 1):
         if stop_flag():
             return best_global, best_metrics
 
+        if is_weight_opt:
+            weight_attempts = 0
+            weight_unique = 0
+
         scored = []
-        for ge in pop:
+        for idx, ge in enumerate(pop):
+            if is_weight_opt:
+                attempts = 0
+                while attempts < MAX_WEIGHT_ATTEMPTS:
+                    weight_attempts += 1
+                    weight_key = tuple(getattr(ge, g) for g in BLOCKS["CONF"])
+                    if weight_key not in weight_hashes:
+                        weight_hashes.add(weight_key)
+                        weight_unique += 1
+                        pop[idx] = ge
+                        break
+                    attempts += 1
+                    ge = _refresh_weight_genome(ge)
+                if attempts >= MAX_WEIGHT_ATTEMPTS:
+                    scored.append((-1e12, ge, _empty_metrics()))
+                    continue
             m = simulate_spot(candles, ge, fee_per_side, slip_per_side)
             score = fitness_from_metrics(m, cfg)
             scored.append((score, ge, m))
@@ -2240,6 +2355,39 @@ def run_ga(
             active_mask_blocks = None
         else:
             stuck += 1
+            if is_weight_opt:
+                weight_no_improve += 1
+
+        gen_display = gen + gen_offset
+        if not GA_DASHBOARD_MODE:
+            log_fn(
+                f"[GEN {gen_display}] score={best_score:.4f} PF={best_m.pf:.2f} "
+                f"trades={best_m.trades} tpy={best_m.trades_per_year:.1f} "
+                f"DD={best_m.dd_pct:.2f}% net={best_m.net:.4f} | "
+                f"ganancia={best_m.profit:.2f} balance={best_m.balance:.2f} | "
+                f"wr={best_m.winrate:.1f}% | "
+                f"HA={best_ge.use_ha} RSI(p={best_ge.rsi_period},os={best_ge.rsi_oversold:.0f},ob={best_ge.rsi_overbought:.0f}) | "
+                f"MACD({best_ge.macd_fast},{best_ge.macd_slow},{best_ge.macd_signal}) | "
+                f"consec(R={best_ge.consec_red},G={best_ge.consec_green}) | "
+                f"TP={best_ge.take_profit:.3f} SL={best_ge.stop_loss:.3f} cd={best_ge.cooldown} edge={best_ge.edge_trigger} | "
+                f"buy_th={best_ge.buy_th:.2f} sell_th={best_ge.sell_th:.2f} | "
+                f"Wbuy({best_ge.w_buy_rsi:.2f},{best_ge.w_buy_macd:.2f},{best_ge.w_buy_consec:.2f}) "
+                f"Wsell({best_ge.w_sell_rsi:.2f},{best_ge.w_sell_macd:.2f},{best_ge.w_sell_consec:.2f})"
+            )
+            log_fn(
+                f"[DBG] uniq={len(unique_hashes)} elite_unique={elite_unique} "
+                f"best_hash={best_hash} repeated={best_hash == prev_best_hash}"
+            )
+        prev_best_hash = best_hash
+        if is_weight_opt:
+            print(
+                f"[WEIGHT-OPT] gen={gen_display} | attempts={weight_attempts} | "
+                f"unique={weight_unique} | best_score={best_score}",
+                flush=True,
+            )
+            if weight_no_improve >= WEIGHT_NO_IMPROVE_LIMIT:
+                print("[INFO] Weight optimizer: no improvement → exit", flush=True)
+                break
 
         gen_display = gen + gen_offset
         print(
