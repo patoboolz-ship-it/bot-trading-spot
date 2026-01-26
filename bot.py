@@ -74,7 +74,7 @@ DRY_RUN = True
 JOURNAL_CSV = "bot_journal.csv"
 
 # Debug de mutaciones (GA)
-DEBUG_MUTATION = False
+DEBUG_MUTATION = True
 
 # Capital inicial para reportes de optimización
 START_CAPITAL = 100000.0
@@ -783,53 +783,6 @@ class SpotBot:
         except BinanceAPIException as e:
             self._emit("log", {"msg": f"[ERROR] Error de Binance al vender: {e}"})
             return None
-
-    def manual_buy_by_quote_pct(self, pct: float) -> Optional[Trade]:
-        usdt_free = get_free_balance(self.client, QUOTE_ASSET)
-        if usdt_free <= 0:
-            self._emit("log", {"msg": "[MANUAL BUY] USDT libre = 0, no compro"})
-            return None
-        target = usdt_free * (pct / 100.0)
-        target = float(target)
-        if target <= 0:
-            self._emit("log", {"msg": "[MANUAL BUY] Porcentaje inválido, no compro"})
-            return None
-        if not DRY_RUN and self.min_notional:
-            price = None
-            try:
-                price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
-            except Exception as e:
-                self._emit("log", {"msg": f"[AVISO] No pude leer precio para compra manual: {e}"})
-            min_quote = self._min_quote_for_notional(price) if price else self.min_notional
-            min_quote = min_quote + BUY_NOTIONAL_BUFFER_USDT if min_quote else self.min_notional
-            if target < min_quote:
-                if usdt_free >= min_quote:
-                    self._emit(
-                        "log",
-                        {
-                            "msg": f"[MANUAL BUY] % muy bajo para minNotional, ajusto a {min_quote:.4f} USDT"
-                        },
-                    )
-                    target = min_quote
-                else:
-                    self._emit(
-                        "log",
-                        {
-                            "msg": f"[MANUAL BUY] USDT libre {usdt_free:.4f} < minNotional {min_quote:.4f}"
-                        },
-                    )
-                    return None
-            else:
-                pass
-        return self._place_market_buy_by_quote(target, reason="MANUAL_BUY")
-
-    def manual_sell_all_base(self) -> Optional[Trade]:
-        sol_free = get_free_balance(self.client, BASE_ASSET)
-        qty = round_step(sol_free, self.step)
-        if qty <= 0:
-            self._emit("log", {"msg": "[MANUAL SELL] No hay SOL libre para vender"})
-            return None
-        return self._place_market_sell_qty(qty, reason="MANUAL_SELL")
 
     def manual_buy_by_quote_pct(self, pct: float) -> Optional[Trade]:
         usdt_free = get_free_balance(self.client, QUOTE_ASSET)
@@ -2069,15 +2022,22 @@ def make_child_blocky(
             else:
                 multi_factor = 1.0 + 0.4 * max(0, len(chosen) - 1)
                 eff_strength = min(1.8, strength * multi_factor)
+            pre_mutation = child.copy()
             for bn in chosen:
                 mutate_block(child, space, bn, strength=eff_strength)
                 mutated_blocks.append(bn)
                 mutated_genes.extend(BLOCKS[bn])
-            mutated = True
-            if forced_blocks:
-                mutation_type = "mutado_completo" if len(chosen) == len(forced_blocks) else "mutado_parcial"
-            else:
-                mutation_type = "mutado_completo" if len(chosen) >= max_blocks_per_child else "mutado_parcial"
+            mutated_genes = [g for g in mutated_genes if child[g] != pre_mutation[g]]
+            mutated_blocks = [
+                bn for bn in mutated_blocks
+                if any(child[g] != pre_mutation[g] for g in BLOCKS[bn])
+            ]
+            mutated = len(mutated_genes) > 0
+            if mutated:
+                if forced_blocks:
+                    mutation_type = "mutado_completo" if len(mutated_blocks) == len(forced_blocks) else "mutado_parcial"
+                else:
+                    mutation_type = "mutado_completo" if len(mutated_blocks) >= max_blocks_per_child else "mutado_parcial"
 
     ge = Genome(**child)
     ge = space.clamp_genome(ge)
@@ -2189,17 +2149,55 @@ def run_ga(
             return 0.85
         return 1.15
 
-    def format_genome(ge: Genome) -> str:
+    def format_gene(value, mutated: bool, fmt: str) -> str:
+        out = format(value, fmt)
+        return f"{out}*" if mutated else out
+
+    def format_genome(ge: Genome, mutated_genes: Optional[set] = None) -> str:
+        mutated_genes = mutated_genes or set()
+        ha = format_gene(ge.use_ha, "use_ha" in mutated_genes, "d")
+        rsi_p = format_gene(ge.rsi_period, "rsi_period" in mutated_genes, "d")
+        rsi_os = format_gene(ge.rsi_oversold, "rsi_oversold" in mutated_genes, ".0f")
+        rsi_ob = format_gene(ge.rsi_overbought, "rsi_overbought" in mutated_genes, ".0f")
+        macd_f = format_gene(ge.macd_fast, "macd_fast" in mutated_genes, "d")
+        macd_s = format_gene(ge.macd_slow, "macd_slow" in mutated_genes, "d")
+        macd_sig = format_gene(ge.macd_signal, "macd_signal" in mutated_genes, "d")
+        consec_r = format_gene(ge.consec_red, "consec_red" in mutated_genes, "d")
+        consec_g = format_gene(ge.consec_green, "consec_green" in mutated_genes, "d")
+        tp = format_gene(ge.take_profit, "take_profit" in mutated_genes, ".3f")
+        sl = format_gene(ge.stop_loss, "stop_loss" in mutated_genes, ".3f")
+        cd = format_gene(ge.cooldown, "cooldown" in mutated_genes, "d")
+        edge = format_gene(ge.edge_trigger, "edge_trigger" in mutated_genes, "d")
+        wbr = format_gene(ge.w_buy_rsi, "w_buy_rsi" in mutated_genes, ".2f")
+        wbm = format_gene(ge.w_buy_macd, "w_buy_macd" in mutated_genes, ".2f")
+        wbc = format_gene(ge.w_buy_consec, "w_buy_consec" in mutated_genes, ".2f")
+        wsr = format_gene(ge.w_sell_rsi, "w_sell_rsi" in mutated_genes, ".2f")
+        wsm = format_gene(ge.w_sell_macd, "w_sell_macd" in mutated_genes, ".2f")
+        wsc = format_gene(ge.w_sell_consec, "w_sell_consec" in mutated_genes, ".2f")
+        buy_th = format_gene(ge.buy_th, "buy_th" in mutated_genes, ".2f")
+        sell_th = format_gene(ge.sell_th, "sell_th" in mutated_genes, ".2f")
         return (
-            f"HA={ge.use_ha} | "
-            f"RSI(p={ge.rsi_period},os={ge.rsi_oversold:.0f},ob={ge.rsi_overbought:.0f}) | "
-            f"MACD({ge.macd_fast},{ge.macd_slow},{ge.macd_signal}) | "
-            f"CONSEC(R={ge.consec_red},G={ge.consec_green}) | "
-            f"PESOS_COMPRA({ge.w_buy_rsi:.2f},{ge.w_buy_macd:.2f},{ge.w_buy_consec:.2f}) "
-            f"PESOS_VENTA({ge.w_sell_rsi:.2f},{ge.w_sell_macd:.2f},{ge.w_sell_consec:.2f}) | "
-            f"UMBRALES(buy={ge.buy_th:.2f},sell={ge.sell_th:.2f}) | "
-            f"RISK(TP={ge.take_profit:.3f},SL={ge.stop_loss:.3f},cd={ge.cooldown},edge={ge.edge_trigger})"
+            f"HA={ha} "
+            f"RSI(p={rsi_p},os={rsi_os},ob={rsi_ob}) "
+            f"MACD({macd_f},{macd_s},{macd_sig}) "
+            f"consec(R={consec_r},G={consec_g}) "
+            f"TP={tp} SL={sl} cd={cd} edge={edge} "
+            f"Wbuy=({wbr},{wbm},{wbc}) Wsell=({wsr},{wsm},{wsc}) "
+            f"umbrales(buy={buy_th},sell={sell_th})"
         )
+
+    mutation_counter = {gene: 0 for gene in space.spec.keys()}
+    mode_label = "ambos"
+    if allowed_blocks == ["CONF"]:
+        mode_label = "pesos"
+    elif allowed_blocks and "CONF" not in allowed_blocks:
+        mode_label = "parametros"
+    weights_counter_printed = False
+
+    def print_mutation_counter(reason: str):
+        print(f"[MUTATION COUNTER] {reason}")
+        for gene in sorted(mutation_counter.keys()):
+            print(f"{gene}={mutation_counter[gene]}")
 
     for gen in range(1, cfg.generations + 1):
         if stop_flag():
@@ -2253,6 +2251,8 @@ def run_ga(
             schedule_idx = (schedule_idx + 1) % len(mutation_schedule)
             active_forced_blocks = mutation_schedule[schedule_idx]
             log_fn(f"[MUT_SCHED] estancado={stuck} forzando={active_forced_blocks}")
+            if DEBUG_MUTATION:
+                print_mutation_counter("cambio_bloque")
 
         if stuck >= 15:
             stuck = 0
@@ -2368,6 +2368,8 @@ def run_ga(
                     mutated_count += 1
                     for bn in meta["mutated_blocks"]:
                         block_counts[bn] += 1
+                    for gene in meta["mutated_genes"]:
+                        mutation_counter[gene] += 1
 
             structural_blocks = {"RSI", "MACD", "CONSEC", "RISK"}
             structural_mutated = any(block_counts[bn] > 0 for bn in structural_blocks)
@@ -2383,10 +2385,11 @@ def run_ga(
                     meta["untouched_genes"] = all_genes
                 if "mutated_genes" not in meta:
                     meta["mutated_genes"] = []
-                log_fn(
-                    f"[MUTDBG] {label} tipo={meta['mutation_type']} "
+                mutated_set = set(meta.get("mutated_genes", []))
+                print(
+                    f"[{label.upper()}] tipo={meta['mutation_type']} "
                     f"mutados={meta['mutated_genes']} no_tocados={meta['untouched_genes']} | "
-                    f"{format_genome(ge)}"
+                    f"{format_genome(ge, mutated_set)}"
                 )
 
             elite_sample = elite[0] if elite else random.choice(pop)
@@ -2395,6 +2398,11 @@ def run_ga(
             if children:
                 child_sample = children[0]
                 child_sample_meta = child_meta[0] if child_meta else None
+                for idx, meta in enumerate(child_meta):
+                    if meta["mutation_type"] == "copiado":
+                        child_sample = children[idx]
+                        child_sample_meta = meta
+                        break
                 log_individual("hijo", child_sample, child_sample_meta)
 
             mutated_sample = None
@@ -2410,14 +2418,32 @@ def run_ga(
             random_sample = random.choice(pop)
             log_individual("aleatorio", random_sample)
 
+            cloned_count = sum(1 for meta in child_meta if meta["mutation_type"] == "copiado")
             block_summary = (
-                f"RSI={block_counts['RSI']} MACD={block_counts['MACD']} "
-                f"CONSEC={block_counts['CONSEC']} PESOS={block_counts['CONF']} "
+                f"RSI={block_counts['RSI']} | MACD={block_counts['MACD']} | "
+                f"CONSEC={block_counts['CONSEC']} | PESOS={block_counts['CONF']} | "
                 f"RISK={block_counts['RISK']}"
             )
-            log_fn(f"[MUTDBG] mutados={mutated_count}/{len(children)} por_bloque: {block_summary}")
+            block_label = (
+                f"{schedule_idx + 1}" if active_forced_blocks else "AUTO"
+            )
+            active_label = active_forced_blocks if active_forced_blocks else []
+            print(
+                f"[GEN {gen_display}][BLOQUE {block_label}] modo={mode_label} "
+                f"activos={active_label} total={cfg.population} "
+                f"mutados={mutated_count} clonados={cloned_count}"
+            )
+            print(f"Mutaciones: {block_summary}")
             if not structural_mutated:
-                log_fn("[MUTDBG] aviso: no se mutaron bloques estructurales en esta generación")
+                print("[MUTDBG] aviso: no se mutaron bloques estructurales en esta generación")
+
+            if gen_display % 10 == 0:
+                print_mutation_counter("cada_10_gen")
+            if stuck > 0:
+                print_mutation_counter("sin_mejora")
+            if mode_label == "pesos" and not weights_counter_printed:
+                print_mutation_counter("optimizador_pesos")
+                weights_counter_printed = True
 
         new_pop = elite + children
         if extra_cov:
