@@ -75,7 +75,7 @@ JOURNAL_CSV = "bot_journal.csv"
 
 # Debug de mutaciones (GA)
 DEBUG_MUTATION = True
-DEBUG_FULL_POPULATION = True
+DEBUG_FULL_POPULATION = False
 
 # Capital inicial para reportes de optimización
 START_CAPITAL = 100000.0
@@ -2446,49 +2446,6 @@ def run_ga(
                     f"{format_genome(ge, mutated_set)}"
                 )
 
-            elite_sample = elite[0] if elite else random.choice(pop)
-            log_individual("elite", elite_sample)
-
-            if children:
-                child_sample = children[0]
-                child_sample_meta = child_meta[0] if child_meta else None
-                for idx, meta in enumerate(child_meta):
-                    if meta["mutation_type"] == "copiado":
-                        child_sample = children[idx]
-                        child_sample_meta = meta
-                        break
-                log_individual("hijo", child_sample, child_sample_meta)
-
-            mutated_sample = None
-            mutated_meta = None
-            for idx, meta in enumerate(child_meta):
-                if meta["mutated"]:
-                    mutated_sample = children[idx]
-                    mutated_meta = meta
-                    break
-            if mutated_sample is not None:
-                log_individual("mutado", mutated_sample, mutated_meta)
-
-            random_sample = random.choice(pop)
-            log_individual("aleatorio", random_sample)
-
-            cloned_count = (cfg.population - 1) - mutated_count
-            block_summary = (
-                f"RSI={block_counts['RSI']} | MACD={block_counts['MACD']} | "
-                f"CONSEC={block_counts['CONSEC']} | PESOS={block_counts['CONF']} | "
-                f"RISK={block_counts['RISK']}"
-            )
-            block_label = "MASK"
-            active_label = active_mask_blocks if active_mask_blocks else []
-            print(
-                f"[GEN {gen_display}][BLOQUE {block_label}] modo={mode_label} "
-                f"activos={active_label} total={cfg.population} "
-                f"mutados={mutated_count} clonados={cloned_count}"
-            )
-            print(f"Mutaciones: {block_summary}")
-            if not structural_mutated:
-                print("[MUTDBG] aviso: no se mutaron bloques estructurales en esta generación")
-
             if gen_display % 10 == 0:
                 print_mutation_counter("cada_10_gen")
             if stuck > 0:
@@ -2581,48 +2538,42 @@ def run_ga(
 
         pop = new_pop
 
-        if DEBUG_FULL_POPULATION:
-            count_mutados = 0
-            count_clonados = 0
-            count_elite = 0
-            count_aleatorios = 0
-            count_sin_mutacion = 0
-            blocks_used = set()
-            for idx, entry in enumerate(population_entries):
-                meta = entry["meta"] or {}
-                mutated_genes = set(meta.get("mutated_genes", []))
-                if entry["type"] == "elite":
-                    count_elite += 1
-                elif entry["type"] == "mutado":
-                    count_mutados += 1
-                elif entry["type"] == "aleatorio":
-                    count_aleatorios += 1
-                else:
-                    count_clonados += 1
+        evaluated = len(scored)
+        pop_size = len(pop)
+        sim_ok = evaluated == pop_size
+        print(f"===== GEN {gen_display} | POP={pop_size} | SIM_OK={evaluated}/{pop_size} =====")
+        if not sim_ok:
+            print(f"[ERROR] Generación {gen_display}: simulación incompleta (evaluated={evaluated}, expected={pop_size})")
+            return best_global, best_metrics
 
-                if entry["type"] != "elite" and not meta.get("mutated", False):
-                    count_sin_mutacion += 1
-                    if gen_display > 1:
-                        print(f"[WARNING] Individuo sin mutación detectado (IND {idx + 1})")
+        top = scored[:3]
+        for idx, (score, ge, m) in enumerate(top, start=1):
+            print(f"[GEN {gen_display}][BEST #{idx}]")
+            print(f"score={score}")
+            print(f"net={m.net}")
+            print(f"PF={m.pf}")
+            print(f"DD={m.dd_pct}")
+            print(f"trades={m.trades}")
+            print(format_full_genes(ge, set()))
 
-                for bn in entry["blocks"]:
-                    blocks_used.add(bn)
-
-                print(
-                    f"[GEN {gen_display}][IND {idx + 1}/{len(population_entries)}]"
-                    f"[TIPO={entry['type']}]"
-                )
-                print(f"bloques_mutados={entry['blocks']}")
-                print(format_full_genes(entry["genome"], mutated_genes))
-
-            print(f"--- RESUMEN GEN {gen_display} ---")
-            print(f"pop_size={len(population_entries)}")
-            print(f"mutados={count_mutados}")
-            print(f"clonados={count_clonados}")
-            print(f"elite={count_elite}")
-            print(f"aleatorios={count_aleatorios}")
-            print(f"sin_mutacion={count_sin_mutacion}")
-            print(f"bloques_usados={sorted(blocks_used)}")
+        avg_score = sum(s for s, _, _ in scored) / pop_size
+        avg_net = sum(m.net for _, _, m in scored) / pop_size
+        avg_dd = sum(m.dd_pct for _, _, m in scored) / pop_size
+        avg_trades = sum(m.trades for _, _, m in scored) / pop_size
+        blocks_used = sorted({bn for meta in child_meta for bn in meta.get("mutated_blocks", [])}) if child_meta else []
+        elite_preserved = best_global is not None and elite[0] == best_global[1]
+        print(f"--- RESUMEN GEN {gen_display} ---")
+        print(f"best_score={scored[0][0]}")
+        print(f"best_net={scored[0][2].net}")
+        print(f"avg_score={avg_score}")
+        print(f"avg_net={avg_net}")
+        print(f"avg_DD={avg_dd}")
+        print(f"avg_trades={avg_trades}")
+        print(f"unique_genomes={len(unique_hashes)}")
+        print(f"bloques_usados={blocks_used}")
+        print(f"elite_preserved={elite_preserved}")
+        if not elite_preserved:
+            print("[WARNING] elite_preserved=False")
 
     if return_population:
         return best_global, best_metrics, pop
