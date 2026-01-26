@@ -77,6 +77,7 @@ JOURNAL_CSV = "bot_journal.csv"
 DEBUG_MUTATION = False
 DEBUG_FULL_POPULATION = False
 GA_DASHBOARD_MODE = True
+GA_WATCHDOG_SEC = 10
 
 # Capital inicial para reportes de optimización
 START_CAPITAL = 100000.0
@@ -2153,6 +2154,7 @@ def run_ga(
     prev_best_hash = None
     stuck = 0
     prev_best_global_score = None
+    last_output_ts = time.time()
     active_mask_blocks = None
     recent_masks = deque(maxlen=7)
     schedule_blocks = allowed_blocks if allowed_blocks else list(BLOCKS.keys())
@@ -2552,36 +2554,45 @@ def run_ga(
         pop_size = len(pop)
         sim_ok = evaluated == pop_size
         if not sim_ok:
-            print(f"[ERROR] GEN {gen_display}: simulación incompleta (evaluated={evaluated}, expected={pop_size})")
+            print(f"[ERROR] GEN {gen_display}: simulación incompleta (evaluated={evaluated}, expected={pop_size})", flush=True)
             return best_global, best_metrics
 
-        if not dashboard_header_printed:
-            print("GEN | SCORE | NET | PF | DD | TRADES | UNIQUE | BLOCKS")
+        if not dashboard_header_printed and not GA_DASHBOARD_MODE:
+            print("GEN | SCORE | NET | PF | DD | TRADES | UNIQUE | BLOCKS", flush=True)
             dashboard_header_printed = True
 
         blocks_used = sorted({bn for meta in child_meta for bn in meta.get("mutated_blocks", [])}) if child_meta else []
         blocks_label = "+".join(blocks_used) if blocks_used else "-"
-        line = (
-            f"{gen_display} | {best_score:.3f} | {best_m.net:.0f} | {best_m.pf:.2f} | "
-            f"{best_m.dd_pct:.1f} | {best_m.trades} | {len(unique_hashes)} | {blocks_label}"
-        )
-        sys.stdout.write("\r" + line)
-        sys.stdout.flush()
+        if GA_DASHBOARD_MODE:
+            os.system("cls" if os.name == "nt" else "clear")
+            print("GEN | SCORE | NET | PF | DD | TRADES | UNIQUE | BLOCKS", flush=True)
+            print(
+                f"{gen_display} | {best_score:.3f} | {best_m.net:.0f} | {best_m.pf:.2f} | "
+                f"{best_m.dd_pct:.1f} | {best_m.trades} | {len(unique_hashes)} | {blocks_label}",
+                flush=True,
+            )
+            last_output_ts = time.time()
 
         elite_preserved = best_global is not None and elite[0] == best_global[1]
         if prev_best_global_score is None or best_score > prev_best_global_score + 1e-9:
-            print()
-            print("[NEW GLOBAL BEST]")
-            print(f"GEN={gen_display}")
-            print(f"score={best_score}")
-            print(f"net={best_m.net}")
-            print(f"PF={best_m.pf}")
-            print(f"DD={best_m.dd_pct}")
-            print(f"trades={best_m.trades}")
-            print(format_full_genes(best_ge, set()))
+            print("", flush=True)
+            print("[NEW GLOBAL BEST]", flush=True)
+            print(f"GEN={gen_display}", flush=True)
+            print(f"score={best_score}", flush=True)
+            print(f"net={best_m.net}", flush=True)
+            print(f"PF={best_m.pf}", flush=True)
+            print(f"DD={best_m.dd_pct}", flush=True)
+            print(f"trades={best_m.trades}", flush=True)
+            print(format_full_genes(best_ge, set()), flush=True)
+            last_output_ts = time.time()
         if not elite_preserved:
-            print()
-            print("[WARNING] elite_preserved=False")
+            print("", flush=True)
+            print("[WARNING] elite_preserved=False", flush=True)
+            last_output_ts = time.time()
+
+        if time.time() - last_output_ts > GA_WATCHDOG_SEC:
+            print(f"[RUNNING] GEN {gen_display} | optimizer active", flush=True)
+            last_output_ts = time.time()
 
     if return_population:
         return best_global, best_metrics, pop
