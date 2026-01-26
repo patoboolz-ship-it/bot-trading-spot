@@ -76,11 +76,8 @@ JOURNAL_CSV = "bot_journal.csv"
 # Debug de mutaciones (GA)
 DEBUG_MUTATION = False
 DEBUG_FULL_POPULATION = False
-GA_DASHBOARD_MODE = True
-GA_WATCHDOG_SEC = 10
-MAX_WEIGHT_GENS = 5
-MAX_WEIGHT_ATTEMPTS = 50
-WEIGHT_NO_IMPROVE_LIMIT = 3
+
+BLOCK_STUCK_LIMIT = 5
 
 # Capital inicial para reportes de optimización
 START_CAPITAL = 100000.0
@@ -327,6 +324,17 @@ def normalize3(a,b,c):
     if s <= 1e-12:
         return (1/3,1/3,1/3)
     return (a/s, b/s, c/s)
+
+def normalize3_safe(a: float, b: float, c: float):
+    a = max(0.0, a)
+    b = max(0.0, b)
+    c = max(0.0, c)
+    s = a + b + c
+    if s <= 1e-12:
+        r1, r2, r3 = random.random(), random.random(), random.random()
+        s = r1 + r2 + r3
+        return (r1 / s, r2 / s, r3 / s)
+    return (a / s, b / s, c / s)
 
 def compute_scores(params: dict, candles: list):
     """
@@ -789,7 +797,6 @@ class SpotBot:
         except BinanceAPIException as e:
             self._emit("log", {"msg": f"[ERROR] Error de Binance al vender: {e}"})
             return None
-        return self._place_market_sell_qty(qty, reason="MANUAL_SELL")
 
     def manual_buy_by_quote_pct(self, pct: float) -> Optional[Trade]:
         usdt_free = get_free_balance(self.client, QUOTE_ASSET)
@@ -1902,15 +1909,6 @@ def fitness_from_metrics(m: Metrics, cfg: GAConfig) -> float:
     return pf_term - dd_pen - trade_pen + bonus
 
 
-WEIGHT_GENES = [
-    "w_buy_rsi",
-    "w_buy_macd",
-    "w_buy_consec",
-    "w_sell_rsi",
-    "w_sell_macd",
-    "w_sell_consec",
-]
-
 PARAM_GENES = [
     "rsi_period",
     "rsi_oversold",
@@ -1934,10 +1932,11 @@ BLOCKS = {
     "MACD": ["macd_fast", "macd_slow", "macd_signal"],
     "CONSEC": ["consec_red", "consec_green"],
     "RISK": ["take_profit", "stop_loss", "cooldown", "edge_trigger", "use_ha"],
-    "CONF": [
-        "w_buy_rsi", "w_buy_macd", "w_buy_consec", "buy_th",
-        "w_sell_rsi", "w_sell_macd", "w_sell_consec", "sell_th",
+    "WEIGHTS": [
+        "w_buy_rsi", "w_buy_macd", "w_buy_consec",
+        "w_sell_rsi", "w_sell_macd", "w_sell_consec",
     ],
+    "CONF": ["buy_th", "sell_th"],
 }
 
 
@@ -1967,11 +1966,11 @@ def mutate_block(child, space: ParamSpace, block_name: str, strength: float):
 
         child[gk] = space.quantize(gk, child[gk])
 
-    if block_name == "CONF":
-        child["w_buy_rsi"], child["w_buy_macd"], child["w_buy_consec"] = normalize3(
+    if block_name == "WEIGHTS":
+        child["w_buy_rsi"], child["w_buy_macd"], child["w_buy_consec"] = normalize3_safe(
             child["w_buy_rsi"], child["w_buy_macd"], child["w_buy_consec"]
         )
-        child["w_sell_rsi"], child["w_sell_macd"], child["w_sell_consec"] = normalize3(
+        child["w_sell_rsi"], child["w_sell_macd"], child["w_sell_consec"] = normalize3_safe(
             child["w_sell_rsi"], child["w_sell_macd"], child["w_sell_consec"]
         )
 
@@ -2131,8 +2130,7 @@ def run_ga(
     fee_per_side = cfg.fee_side * cfg.fee_mult
     slip_per_side = cfg.slip_side
 
-    if not GA_DASHBOARD_MODE:
-        log_fn(f"[COSTOS] SPOT | fee_lado={fee_per_side:.6f} (incluye mult) | slip_lado={slip_per_side:.6f}")
+    # logging mínimo: evitar logs internos del GA
 
     if sample_fn is None:
         sample_fn = space.sample
@@ -2150,20 +2148,11 @@ def run_ga(
     if not initial_population:
         cov = force_coverage(space, max(12, cfg.population // 6))
         pop[:len(cov)] = [postprocess_fn(ge) for ge in cov]
-        if not GA_DASHBOARD_MODE:
-            log_fn(f"[COBERTURA] forcé {len(cov)} individuos para cubrir rangos completos (inicio)")
 
     best_global = None
     best_metrics = None
     prev_best_hash = None
     stuck = 0
-    prev_best_global_score = None
-    last_output_ts = time.time()
-    is_weight_opt = allowed_blocks == ["CONF"]
-    weight_attempts = 0
-    weight_unique = 0
-    weight_no_improve = 0
-    weight_hashes = set()
     active_mask_blocks = None
     recent_masks = deque(maxlen=7)
     schedule_blocks = allowed_blocks if allowed_blocks else list(BLOCKS.keys())
@@ -2211,6 +2200,25 @@ def run_ga(
             f"Wbuy=({wbr},{wbm},{wbc}) Wsell=({wsr},{wsm},{wsc}) "
             f"umbrales(buy={buy_th},sell={sell_th})"
         )
+
+    mutation_counter = {gene: 0 for gene in space.spec.keys()}
+
+    def print_mutation_counter(reason: str):
+        print(f"[MUTATION COUNTER] {reason}")
+        for gene in sorted(mutation_counter.keys()):
+            print(f"{gene}={mutation_counter[gene]}")
+
+    def pick_random_mask() -> list[str]:
+        if not schedule_blocks:
+            return []
+        while True:
+            max_blocks = min(3, len(schedule_blocks))
+            count = random.choice([1, 2, 3][:max_blocks])
+            blocks = random.sample(schedule_blocks, count)
+            mask_key = tuple(sorted(blocks))
+            if mask_key not in recent_masks:
+                recent_masks.append(mask_key)
+                return list(mask_key)
 
     mutation_counter = {gene: 0 for gene in space.spec.keys()}
     mode_label = "ambos"
@@ -2306,7 +2314,6 @@ def run_ga(
 
     for gen in range(1, total_gens + 1):
         if stop_flag():
-            log_fn("[STOP] detenido por el usuario.")
             return best_global, best_metrics
 
         if is_weight_opt:
@@ -2336,7 +2343,6 @@ def run_ga(
 
         scored.sort(key=lambda x: x[0], reverse=True)
         best_score, best_ge, best_m = scored[0]
-        best_hash = hash(tuple(asdict(best_ge).items()))
         unique_hashes = {hash(tuple(asdict(ge).items())) for _, ge, _ in scored}
         elite_hashes = [hash(tuple(asdict(ge).items())) for ge in [x[1] for x in scored[:cfg.elite]]]
         elite_unique = len(set(elite_hashes))
@@ -2347,8 +2353,6 @@ def run_ga(
             best_metrics = best_m
             stuck = 0
             active_mask_blocks = None
-            if is_weight_opt:
-                weight_no_improve = 0
         else:
             stuck += 1
             if is_weight_opt:
@@ -2385,25 +2389,25 @@ def run_ga(
                 print("[INFO] Weight optimizer: no improvement → exit", flush=True)
                 break
 
+        gen_display = gen + gen_offset
+        print(
+            f"GEN {gen_display} | best_score={best_score:.4f} | net={best_m.net:.4f} | "
+            f"PF={best_m.pf:.2f} | DD={best_m.dd_pct:.1f} | unique={len(unique_hashes)}",
+            flush=True,
+        )
         mask_saturated = False
-        if stuck > 0:
-            mask_saturated = True
-        if best_hash == prev_best_hash:
-            mask_saturated = True
-        if elite_unique <= max(1, cfg.elite // 2):
+        if stuck >= BLOCK_STUCK_LIMIT:
             mask_saturated = True
 
         if active_mask_blocks is None:
             active_mask_blocks = pick_random_mask()
-            if DEBUG_MUTATION and not GA_DASHBOARD_MODE:
-                print(f"[MASK INIT] {active_mask_blocks}")
+            print(f"[BLOQUE] activos: {' + '.join(active_mask_blocks)} | gens={BLOCK_STUCK_LIMIT}", flush=True)
         elif mask_saturated:
             prev_mask = active_mask_blocks
             active_mask_blocks = pick_random_mask()
-            if DEBUG_MUTATION and not GA_DASHBOARD_MODE:
-                print(f"[MASK SATURATED] {prev_mask} -> {active_mask_blocks}")
-            if DEBUG_MUTATION:
-                print_mutation_counter("cambio_bloque")
+            print("[INFO] Bloque sin mejora → cambiando bloque", flush=True)
+            print(f"[BLOQUE] activos: {' + '.join(active_mask_blocks)} | gens={BLOCK_STUCK_LIMIT}", flush=True)
+            stuck = 0
 
         if DEBUG_FULL_POPULATION:
             print(
@@ -2411,15 +2415,7 @@ def run_ga(
                 f"BLOQUE(S) ACTIVOS: {active_mask_blocks} ====="
             )
 
-        if stuck >= 15:
-            stuck = 0
-            active_mask_blocks = None
-            if not GA_DASHBOARD_MODE:
-                log_fn("[ANTI-PEGADO] se pegó -> meto más wild + más cobertura")
-            cfg.n_wild = min(cfg.population - cfg.elite, cfg.n_wild + 20)
-            extra_cov = force_coverage(space, max(10, cfg.population // 8))
-        else:
-            extra_cov = []
+        extra_cov = []
 
         elite = [best_global[1]] if best_global else [scored[0][1]]
         pool = [x[1] for x in scored[:max(cfg.elite * 6, cfg.population // 2)]]
@@ -2532,9 +2528,6 @@ def run_ga(
                 print_mutation_counter("cada_10_gen")
             if stuck > 0:
                 print_mutation_counter("sin_mejora")
-            if mode_label == "pesos" and not weights_counter_printed:
-                print_mutation_counter("optimizador_pesos")
-                weights_counter_printed = True
 
         new_pop = elite + children
         population_entries = []
@@ -2627,73 +2620,9 @@ def run_ga(
             print(f"[ERROR] GEN {gen_display}: simulación incompleta (evaluated={evaluated}, expected={pop_size})", flush=True)
             return best_global, best_metrics
 
-        if not dashboard_header_printed and not GA_DASHBOARD_MODE:
-            print("GEN | SCORE | NET | PF | DD | TRADES | UNIQUE | BLOCKS", flush=True)
-            dashboard_header_printed = True
-
-        blocks_used = sorted({bn for meta in child_meta for bn in meta.get("mutated_blocks", [])}) if child_meta else []
-        blocks_label = "+".join(blocks_used) if blocks_used else "-"
-        if GA_DASHBOARD_MODE:
-            os.system("cls" if os.name == "nt" else "clear")
-            print("GEN | SCORE | NET | PF | DD | TRADES | UNIQUE | BLOCKS", flush=True)
-            print(
-                f"{gen_display} | {best_score:.3f} | {best_m.net:.0f} | {best_m.pf:.2f} | "
-                f"{best_m.dd_pct:.1f} | {best_m.trades} | {len(unique_hashes)} | {blocks_label}",
-                flush=True,
-            )
-            last_output_ts = time.time()
-
-        elite_preserved = best_global is not None and elite[0] == best_global[1]
-        if prev_best_global_score is None or best_score > prev_best_global_score + 1e-9:
-            print("", flush=True)
-            print("[NEW GLOBAL BEST]", flush=True)
-            print(f"GEN={gen_display}", flush=True)
-            print(f"score={best_score}", flush=True)
-            print(f"net={best_m.net}", flush=True)
-            print(f"PF={best_m.pf}", flush=True)
-            print(f"DD={best_m.dd_pct}", flush=True)
-            print(f"trades={best_m.trades}", flush=True)
-            print(format_full_genes(best_ge, set()), flush=True)
-            last_output_ts = time.time()
-        if not elite_preserved:
-            print("", flush=True)
-            print("[WARNING] elite_preserved=False", flush=True)
-            last_output_ts = time.time()
-
-        if time.time() - last_output_ts > GA_WATCHDOG_SEC:
-            print(f"[RUNNING] GEN {gen_display} | optimizer active", flush=True)
-            last_output_ts = time.time()
-
     if return_population:
         return best_global, best_metrics, pop
     return best_global, best_metrics
-
-
-def run_ga_weights_only(
-    candles,
-    space: ParamSpace,
-    cfg: GAConfig,
-    stop_flag,
-    log_fn,
-    base_params=None,
-    initial_population=None,
-    gen_offset: int = 0,
-    return_population: bool = False,
-):
-    base = make_base_genome(space, base_params)
-    freeze_fn = make_freeze_fn(space, base, WEIGHT_GENES)
-    return run_ga(
-        candles=candles,
-        space=space,
-        cfg=cfg,
-        stop_flag=stop_flag,
-        log_fn=log_fn,
-        postprocess_fn=freeze_fn,
-        allowed_blocks=["CONF"],
-        initial_population=initial_population,
-        gen_offset=gen_offset,
-        return_population=return_population,
-    )
 
 
 def run_ga_params_only(
@@ -2849,7 +2778,7 @@ class OptimizerGUI:
 
         mode = ttk.LabelFrame(frm, text="Modo de optimización")
         mode.pack(fill="x", padx=pad, pady=pad)
-        for text in ("Optimizar Pesos", "Optimizar Parámetros", "Ambos"):
+        for text in ("Optimizar Parámetros", "Ambos"):
             ttk.Radiobutton(mode, text=text, variable=self.var_opt_mode, value=text).pack(side="left", padx=8)
 
         ranges = ttk.LabelFrame(frm, text="Rangos (min / max / step)")
@@ -3191,19 +3120,7 @@ class OptimizerGUI:
                             lambda: self.update_inspector(metrics, trace_payload, cfg),
                         )
 
-                    if mode == "Optimizar Pesos":
-                        best_global, best_metrics = run_ga_weights_only(
-                            candles=candles,
-                            space=self.space,
-                            cfg=cfg,
-                            stop_flag=lambda: self._stop,
-                            log_fn=log_fn,
-                        )
-                        self.best_genome = best_global[1] if best_global else None
-                        self.best_metrics = best_metrics
-                        if self.best_genome:
-                            refresh_inspector(self.best_genome)
-                    elif mode == "Optimizar Parámetros":
+                    if mode == "Optimizar Parámetros":
                         best_global, best_metrics = run_ga_params_only(
                             candles=candles,
                             space=self.space,
@@ -3216,105 +3133,17 @@ class OptimizerGUI:
                         if self.best_genome:
                             refresh_inspector(self.best_genome)
                     else:
-                        self.log("[MODO] Ambos: optimización en serie por bloques (parámetros -> pesos).")
-                        params_chunk = 5
-                        weight_burst = 5
-                        stuck_limit = 15
-                        total_gens = cfg.generations
-                        best_genome = None
-                        best_metrics = None
-                        best_score = None
-                        pop = None
-                        gen_offset = 0
-                        stuck_gens = 0
-
-                        remaining = total_gens
-                        block_idx = 0
-                        while remaining > 0 and not self._stop:
-                            block_idx += 1
-                            current_block = min(params_chunk, remaining)
-                            remaining -= current_block
-
-                            self.log(f"[MODO] Bloque {block_idx}: optimizando parámetros ({current_block} gens)...")
-                            cfg_params = GAConfig(**{**asdict(cfg), "generations": current_block})
-                            params_best, params_metrics, pop = run_ga(
-                                candles=candles,
-                                space=self.space,
-                                cfg=cfg_params,
-                                stop_flag=lambda: self._stop,
-                                log_fn=log_fn,
-                                initial_population=pop,
-                                gen_offset=gen_offset,
-                                return_population=True,
-                            )
-                            if not params_best and best_genome is None:
-                                break
-
-                            params_ge = params_best[1] if params_best else best_genome
-                            if params_best:
-                                params_score = params_best[0]
-                                params_metrics = params_metrics or simulate_spot(
-                                    candles,
-                                    params_ge,
-                                    fee_per_side,
-                                    slip_per_side,
-                                )
-                                if best_score is None or params_score > best_score + 1e-9:
-                                    best_score = params_score
-                                    best_genome = params_ge
-                                    best_metrics = params_metrics
-                                    stuck_gens = 0
-                                elif best_genome is None:
-                                    best_genome = params_ge
-                                    best_metrics = params_metrics
-                                    stuck_gens = 0
-                                else:
-                                    stuck_gens += current_block
-                                refresh_inspector(params_ge)
-
-                            gen_offset += current_block
-
-                            if self._stop:
-                                break
-
-                            if stuck_gens >= stuck_limit and remaining > 0:
-                                self.log("[MODO] Activando optimizador de pesos (pegado)...")
-                                cfg_weights = GAConfig(**{**asdict(cfg), "generations": weight_burst})
-                                prev_pop = pop
-                                weights_best, weights_metrics, weights_pop = run_ga_weights_only(
-                                    candles=candles,
-                                    space=self.space,
-                                    cfg=cfg_weights,
-                                    stop_flag=lambda: self._stop,
-                                    log_fn=log_fn,
-                                    base_params=asdict(best_genome),
-                                    initial_population=pop,
-                                    gen_offset=gen_offset,
-                                    return_population=True,
-                                )
-                                gen_offset += weight_burst
-                                remaining = max(0, remaining - weight_burst)
-                                weights_ge = weights_best[1] if weights_best else None
-                                if weights_ge:
-                                    weights_metrics = weights_metrics or simulate_spot(
-                                        candles,
-                                        weights_ge,
-                                        fee_per_side,
-                                        slip_per_side,
-                                    )
-                                    if fitness_from_metrics(weights_metrics, cfg) > fitness_from_metrics(best_metrics, cfg):
-                                        self.log("[MODO] Pesos mejoraron fitness. Manteniendo nuevos pesos.")
-                                        best_genome = weights_ge
-                                        best_metrics = weights_metrics
-                                        pop = weights_pop
-                                    else:
-                                        self.log("[MODO] Pesos no mejoraron fitness. Manteniendo parámetros actuales.")
-                                        pop = prev_pop
-                                    refresh_inspector(weights_ge)
-                                stuck_gens = 0
-
-                        self.best_genome = best_genome
+                        best_global, best_metrics = run_ga(
+                            candles=candles,
+                            space=self.space,
+                            cfg=cfg,
+                            stop_flag=lambda: self._stop,
+                            log_fn=log_fn,
+                        )
+                        self.best_genome = best_global[1] if best_global else None
                         self.best_metrics = best_metrics
+                        if self.best_genome:
+                            refresh_inspector(self.best_genome)
 
                     if self.best_genome:
                         self.root.after(0, self.log, "[FIN] Mejor encontrado:")
