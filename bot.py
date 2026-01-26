@@ -846,100 +846,6 @@ class SpotBot:
             return None
         return self._place_market_sell_qty(qty, reason="MANUAL_SELL")
 
-    def manual_buy_by_quote_pct(self, pct: float) -> Optional[Trade]:
-        usdt_free = get_free_balance(self.client, QUOTE_ASSET)
-        if usdt_free <= 0:
-            self._emit("log", {"msg": "[MANUAL BUY] USDT libre = 0, no compro"})
-            return None
-        target = usdt_free * (pct / 100.0)
-        target = float(target)
-        if target <= 0:
-            self._emit("log", {"msg": "[MANUAL BUY] Porcentaje inválido, no compro"})
-            return None
-        if not DRY_RUN and self.min_notional:
-            price = None
-            try:
-                price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
-            except Exception as e:
-                self._emit("log", {"msg": f"[AVISO] No pude leer precio para compra manual: {e}"})
-            min_quote = self._min_quote_for_notional(price) if price else self.min_notional
-            min_quote = min_quote + BUY_NOTIONAL_BUFFER_USDT if min_quote else self.min_notional
-            if target < min_quote:
-                if usdt_free >= min_quote:
-                    self._emit(
-                        "log",
-                        {
-                            "msg": f"[MANUAL BUY] % muy bajo para minNotional, ajusto a {min_quote:.4f} USDT"
-                        },
-                    )
-                    target = min_quote
-                else:
-                    self._emit(
-                        "log",
-                        {
-                            "msg": f"[MANUAL BUY] USDT libre {usdt_free:.4f} < minNotional {min_quote:.4f}"
-                        },
-                    )
-                    return None
-            else:
-                pass
-        return self._place_market_buy_by_quote(target, reason="MANUAL_BUY")
-
-    def manual_sell_all_base(self) -> Optional[Trade]:
-        sol_free = get_free_balance(self.client, BASE_ASSET)
-        qty = round_step(sol_free, self.step)
-        if qty <= 0:
-            self._emit("log", {"msg": "[MANUAL SELL] No hay SOL libre para vender"})
-            return None
-        return self._place_market_sell_qty(qty, reason="MANUAL_SELL")
-
-    def manual_buy_by_quote_pct(self, pct: float) -> Optional[Trade]:
-        usdt_free = get_free_balance(self.client, QUOTE_ASSET)
-        if usdt_free <= 0:
-            self._emit("log", {"msg": "[MANUAL BUY] USDT libre = 0, no compro"})
-            return None
-        target = usdt_free * (pct / 100.0)
-        target = float(target)
-        if target <= 0:
-            self._emit("log", {"msg": "[MANUAL BUY] Porcentaje inválido, no compro"})
-            return None
-        if not DRY_RUN and self.min_notional:
-            price = None
-            try:
-                price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
-            except Exception as e:
-                self._emit("log", {"msg": f"[AVISO] No pude leer precio para compra manual: {e}"})
-            min_quote = self._min_quote_for_notional(price) if price else self.min_notional
-            min_quote = min_quote + BUY_NOTIONAL_BUFFER_USDT if min_quote else self.min_notional
-            if target < min_quote:
-                if usdt_free >= min_quote:
-                    self._emit(
-                        "log",
-                        {
-                            "msg": f"[MANUAL BUY] % muy bajo para minNotional, ajusto a {min_quote:.4f} USDT"
-                        },
-                    )
-                    target = min_quote
-                else:
-                    self._emit(
-                        "log",
-                        {
-                            "msg": f"[MANUAL BUY] USDT libre {usdt_free:.4f} < minNotional {min_quote:.4f}"
-                        },
-                    )
-                    return None
-            else:
-                pass
-        return self._place_market_buy_by_quote(target, reason="MANUAL_BUY")
-
-    def manual_sell_all_base(self) -> Optional[Trade]:
-        sol_free = get_free_balance(self.client, BASE_ASSET)
-        qty = round_step(sol_free, self.step)
-        if qty <= 0:
-            self._emit("log", {"msg": "[MANUAL SELL] No hay SOL libre para vender"})
-            return None
-        return self._place_market_sell_qty(qty, reason="MANUAL_SELL")
-
     def _open_position_from_trade(self, buy_trade: Trade, last_close_time_ms: int):
         ep = buy_trade.price
         qty = buy_trade.qty
@@ -2315,25 +2221,7 @@ def run_ga(
                 recent_masks.append(mask_key)
                 return list(mask_key)
 
-    mutation_counter = {gene: 0 for gene in space.spec.keys()}
-
-    def print_mutation_counter(reason: str):
-        print(f"[MUTATION COUNTER] {reason}")
-        for gene in sorted(mutation_counter.keys()):
-            print(f"{gene}={mutation_counter[gene]}")
-
-    def pick_random_mask() -> list[str]:
-        if not schedule_blocks:
-            return []
-        while True:
-            max_blocks = min(3, len(schedule_blocks))
-            count = random.choice([1, 2, 3][:max_blocks])
-            blocks = random.sample(schedule_blocks, count)
-            mask_key = tuple(sorted(blocks))
-            if mask_key not in recent_masks:
-                recent_masks.append(mask_key)
-                return list(mask_key)
-
+    total_gens = cfg.generations
     for gen in range(1, total_gens + 1):
         if stop_flag():
             return best_global, best_metrics
