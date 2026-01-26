@@ -845,6 +845,53 @@ class SpotBot:
             return None
         return self._place_market_sell_qty(qty, reason="MANUAL_SELL")
 
+    def manual_buy_by_quote_pct(self, pct: float) -> Optional[Trade]:
+        usdt_free = get_free_balance(self.client, QUOTE_ASSET)
+        if usdt_free <= 0:
+            self._emit("log", {"msg": "[MANUAL BUY] USDT libre = 0, no compro"})
+            return None
+        target = usdt_free * (pct / 100.0)
+        target = float(target)
+        if target <= 0:
+            self._emit("log", {"msg": "[MANUAL BUY] Porcentaje inválido, no compro"})
+            return None
+        if not DRY_RUN and self.min_notional:
+            price = None
+            try:
+                price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
+            except Exception as e:
+                self._emit("log", {"msg": f"[AVISO] No pude leer precio para compra manual: {e}"})
+            min_quote = self._min_quote_for_notional(price) if price else self.min_notional
+            min_quote = min_quote + BUY_NOTIONAL_BUFFER_USDT if min_quote else self.min_notional
+            if target < min_quote:
+                if usdt_free >= min_quote:
+                    self._emit(
+                        "log",
+                        {
+                            "msg": f"[MANUAL BUY] % muy bajo para minNotional, ajusto a {min_quote:.4f} USDT"
+                        },
+                    )
+                    target = min_quote
+                else:
+                    self._emit(
+                        "log",
+                        {
+                            "msg": f"[MANUAL BUY] USDT libre {usdt_free:.4f} < minNotional {min_quote:.4f}"
+                        },
+                    )
+                    return None
+            else:
+                pass
+        return self._place_market_buy_by_quote(target, reason="MANUAL_BUY")
+
+    def manual_sell_all_base(self) -> Optional[Trade]:
+        sol_free = get_free_balance(self.client, BASE_ASSET)
+        qty = round_step(sol_free, self.step)
+        if qty <= 0:
+            self._emit("log", {"msg": "[MANUAL SELL] No hay SOL libre para vender"})
+            return None
+        return self._place_market_sell_qty(qty, reason="MANUAL_SELL")
+
     def _open_position_from_trade(self, buy_trade: Trade, last_close_time_ms: int):
         ep = buy_trade.price
         qty = buy_trade.qty
@@ -2220,98 +2267,6 @@ def run_ga(
                 recent_masks.append(mask_key)
                 return list(mask_key)
 
-    mutation_counter = {gene: 0 for gene in space.spec.keys()}
-    mode_label = "ambos"
-    if allowed_blocks == ["CONF"]:
-        mode_label = "pesos"
-    elif allowed_blocks and "CONF" not in allowed_blocks:
-        mode_label = "parametros"
-    weights_counter_printed = False
-    dashboard_header_printed = False
-
-    def print_mutation_counter(reason: str):
-        print(f"[MUTATION COUNTER] {reason}")
-        for gene in sorted(mutation_counter.keys()):
-            print(f"{gene}={mutation_counter[gene]}")
-
-    def pick_random_mask() -> list[str]:
-        if not schedule_blocks:
-            return []
-        while True:
-            count = random.randint(1, min(2, len(schedule_blocks)))
-            blocks = random.sample(schedule_blocks, count)
-            mask_key = tuple(sorted(blocks))
-            if mask_key not in recent_masks:
-                recent_masks.append(mask_key)
-                return list(mask_key)
-
-    def format_value(gene: str, value, mutated: bool) -> str:
-        spec = space.spec[gene]
-        if spec["type"] == "int":
-            out = f"{int(value)}"
-        else:
-            out = f"{float(value):.4f}"
-        return f"{out}*" if mutated else out
-
-    def format_full_genes(ge: Genome, mutated_genes: set) -> str:
-        ordered = [
-            "rsi_period",
-            "rsi_overbought",
-            "rsi_oversold",
-            "macd_fast",
-            "macd_slow",
-            "macd_signal",
-            "consec_green",
-            "consec_red",
-            "buy_th",
-            "sell_th",
-            "cooldown",
-            "edge_trigger",
-            "take_profit",
-            "stop_loss",
-            "use_ha",
-            "w_buy_rsi",
-            "w_buy_macd",
-            "w_buy_consec",
-            "w_sell_rsi",
-            "w_sell_macd",
-            "w_sell_consec",
-        ]
-        lines = []
-        for gene in ordered:
-            lines.append(f"  {gene}={format_value(gene, getattr(ge, gene), gene in mutated_genes)}")
-        return "genes={\n" + ",\n".join(lines) + "\n}"
-
-    total_gens = cfg.generations
-    if is_weight_opt:
-        total_gens = min(total_gens, MAX_WEIGHT_GENS)
-
-    def _empty_metrics() -> Metrics:
-        return Metrics(
-            score=-1e9,
-            net=-1.0,
-            balance=0.0,
-            profit=0.0,
-            gross_profit=0.0,
-            gross_loss=0.0,
-            max_dd=1.0,
-            dd_pct=100.0,
-            trades=0,
-            wins=0,
-            losses=0,
-            winrate=0.0,
-            pf=0.0,
-            years=0.0,
-            trades_per_year=0.0,
-            buy_signal_rate=0.0,
-            sell_signal_rate=0.0,
-        )
-
-    def _refresh_weight_genome(ge: Genome, strength: float = 0.9) -> Genome:
-        payload = asdict(ge)
-        mutate_block(payload, space, "CONF", strength=strength)
-        return space.clamp_genome(Genome(**payload))
-
     for gen in range(1, total_gens + 1):
         if stop_flag():
             return best_global, best_metrics
@@ -3104,7 +3059,6 @@ class OptimizerGUI:
                     candles = fetch_klines_public(symbol, tf, n)
                     self.cached_candles = candles
                     self.log(f"[OK] {symbol} cargado: {len(candles)} velas ({tf})")
-                    mode = self.var_opt_mode.get()
                     log_fn = lambda s: self.root.after(0, self.log, s)
                     fee_per_side = self.var_fee.get() * self.var_fee_mult.get()
                     slip_per_side = self.var_slip.get()
@@ -3120,30 +3074,17 @@ class OptimizerGUI:
                             lambda: self.update_inspector(metrics, trace_payload, cfg),
                         )
 
-                    if mode == "Optimizar Parámetros":
-                        best_global, best_metrics = run_ga_params_only(
-                            candles=candles,
-                            space=self.space,
-                            cfg=cfg,
-                            stop_flag=lambda: self._stop,
-                            log_fn=log_fn,
-                        )
-                        self.best_genome = best_global[1] if best_global else None
-                        self.best_metrics = best_metrics
-                        if self.best_genome:
-                            refresh_inspector(self.best_genome)
-                    else:
-                        best_global, best_metrics = run_ga(
-                            candles=candles,
-                            space=self.space,
-                            cfg=cfg,
-                            stop_flag=lambda: self._stop,
-                            log_fn=log_fn,
-                        )
-                        self.best_genome = best_global[1] if best_global else None
-                        self.best_metrics = best_metrics
-                        if self.best_genome:
-                            refresh_inspector(self.best_genome)
+                    best_global, best_metrics = run_ga(
+                        candles=candles,
+                        space=self.space,
+                        cfg=cfg,
+                        stop_flag=lambda: self._stop,
+                        log_fn=log_fn,
+                    )
+                    self.best_genome = best_global[1] if best_global else None
+                    self.best_metrics = best_metrics
+                    if self.best_genome:
+                        refresh_inspector(self.best_genome)
 
                     if self.best_genome:
                         self.root.after(0, self.log, "[FIN] Mejor encontrado:")
