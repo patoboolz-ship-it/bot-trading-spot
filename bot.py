@@ -2002,8 +2002,10 @@ def make_child_blocky(
             if len(chosen) >= need:
                 break
 
+        multi_factor = 1.0 + 0.4 * max(0, len(chosen) - 1)
+        eff_strength = min(1.8, strength * multi_factor)
         for bn in chosen:
-            mutate_block(child, space, bn, strength=strength)
+            mutate_block(child, space, bn, strength=eff_strength)
 
     ge = Genome(**child)
     return space.clamp_genome(ge)
