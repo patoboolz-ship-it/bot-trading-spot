@@ -3,7 +3,6 @@
 
 """
 BOT SPOT Binance - RSI + MACD + Consecutivas (con HA opcional) + GUI + Excel
-- Solo LONG: compra y cierra (venta para cerrar)
 - Señales SOLO con vela cerrada (evita repaint intrabar)
 - Compra con 98% USDT libre, aunque tengas "polvo" SOL
 - Verifica compra: gasto >= 90% de lo objetivo; si no, reintenta
@@ -18,6 +17,7 @@ Seguridad:
 """
 
 import os
+import sys
 import time
 import math
 import json
@@ -74,8 +74,9 @@ DRY_RUN = True
 JOURNAL_CSV = "bot_journal.csv"
 
 # Debug de mutaciones (GA)
-DEBUG_MUTATION = True
+DEBUG_MUTATION = False
 DEBUG_FULL_POPULATION = False
+GA_DASHBOARD_MODE = True
 
 # Capital inicial para reportes de optimización
 START_CAPITAL = 100000.0
@@ -2125,7 +2126,8 @@ def run_ga(
     fee_per_side = cfg.fee_side * cfg.fee_mult
     slip_per_side = cfg.slip_side
 
-    log_fn(f"[COSTOS] SPOT | fee_lado={fee_per_side:.6f} (incluye mult) | slip_lado={slip_per_side:.6f}")
+    if not GA_DASHBOARD_MODE:
+        log_fn(f"[COSTOS] SPOT | fee_lado={fee_per_side:.6f} (incluye mult) | slip_lado={slip_per_side:.6f}")
 
     if sample_fn is None:
         sample_fn = space.sample
@@ -2143,12 +2145,14 @@ def run_ga(
     if not initial_population:
         cov = force_coverage(space, max(12, cfg.population // 6))
         pop[:len(cov)] = [postprocess_fn(ge) for ge in cov]
-        log_fn(f"[COBERTURA] forcé {len(cov)} individuos para cubrir rangos completos (inicio)")
+        if not GA_DASHBOARD_MODE:
+            log_fn(f"[COBERTURA] forcé {len(cov)} individuos para cubrir rangos completos (inicio)")
 
     best_global = None
     best_metrics = None
     prev_best_hash = None
     stuck = 0
+    prev_best_global_score = None
     active_mask_blocks = None
     recent_masks = deque(maxlen=7)
     schedule_blocks = allowed_blocks if allowed_blocks else list(BLOCKS.keys())
@@ -2204,6 +2208,7 @@ def run_ga(
     elif allowed_blocks and "CONF" not in allowed_blocks:
         mode_label = "parametros"
     weights_counter_printed = False
+    dashboard_header_printed = False
 
     def print_mutation_counter(reason: str):
         print(f"[MUTATION COUNTER] {reason}")
@@ -2278,6 +2283,7 @@ def run_ga(
         elite_unique = len(set(elite_hashes))
 
         if best_global is None or best_score > best_global[0] + 1e-9:
+            prev_best_global_score = best_global[0] if best_global else None
             best_global = (best_score, copy.deepcopy(best_ge))
             best_metrics = best_m
             stuck = 0
@@ -2286,24 +2292,25 @@ def run_ga(
             stuck += 1
 
         gen_display = gen + gen_offset
-        log_fn(
-            f"[GEN {gen_display}] score={best_score:.4f} PF={best_m.pf:.2f} "
-            f"trades={best_m.trades} tpy={best_m.trades_per_year:.1f} "
-            f"DD={best_m.dd_pct:.2f}% net={best_m.net:.4f} | "
-            f"ganancia={best_m.profit:.2f} balance={best_m.balance:.2f} | "
-            f"wr={best_m.winrate:.1f}% | "
-            f"HA={best_ge.use_ha} RSI(p={best_ge.rsi_period},os={best_ge.rsi_oversold:.0f},ob={best_ge.rsi_overbought:.0f}) | "
-            f"MACD({best_ge.macd_fast},{best_ge.macd_slow},{best_ge.macd_signal}) | "
-            f"consec(R={best_ge.consec_red},G={best_ge.consec_green}) | "
-            f"TP={best_ge.take_profit:.3f} SL={best_ge.stop_loss:.3f} cd={best_ge.cooldown} edge={best_ge.edge_trigger} | "
-            f"buy_th={best_ge.buy_th:.2f} sell_th={best_ge.sell_th:.2f} | "
-            f"Wbuy({best_ge.w_buy_rsi:.2f},{best_ge.w_buy_macd:.2f},{best_ge.w_buy_consec:.2f}) "
-            f"Wsell({best_ge.w_sell_rsi:.2f},{best_ge.w_sell_macd:.2f},{best_ge.w_sell_consec:.2f})"
-        )
-        log_fn(
-            f"[DBG] uniq={len(unique_hashes)} elite_unique={elite_unique} "
-            f"best_hash={best_hash} repeated={best_hash == prev_best_hash}"
-        )
+        if not GA_DASHBOARD_MODE:
+            log_fn(
+                f"[GEN {gen_display}] score={best_score:.4f} PF={best_m.pf:.2f} "
+                f"trades={best_m.trades} tpy={best_m.trades_per_year:.1f} "
+                f"DD={best_m.dd_pct:.2f}% net={best_m.net:.4f} | "
+                f"ganancia={best_m.profit:.2f} balance={best_m.balance:.2f} | "
+                f"wr={best_m.winrate:.1f}% | "
+                f"HA={best_ge.use_ha} RSI(p={best_ge.rsi_period},os={best_ge.rsi_oversold:.0f},ob={best_ge.rsi_overbought:.0f}) | "
+                f"MACD({best_ge.macd_fast},{best_ge.macd_slow},{best_ge.macd_signal}) | "
+                f"consec(R={best_ge.consec_red},G={best_ge.consec_green}) | "
+                f"TP={best_ge.take_profit:.3f} SL={best_ge.stop_loss:.3f} cd={best_ge.cooldown} edge={best_ge.edge_trigger} | "
+                f"buy_th={best_ge.buy_th:.2f} sell_th={best_ge.sell_th:.2f} | "
+                f"Wbuy({best_ge.w_buy_rsi:.2f},{best_ge.w_buy_macd:.2f},{best_ge.w_buy_consec:.2f}) "
+                f"Wsell({best_ge.w_sell_rsi:.2f},{best_ge.w_sell_macd:.2f},{best_ge.w_sell_consec:.2f})"
+            )
+            log_fn(
+                f"[DBG] uniq={len(unique_hashes)} elite_unique={elite_unique} "
+                f"best_hash={best_hash} repeated={best_hash == prev_best_hash}"
+            )
         prev_best_hash = best_hash
 
         mask_saturated = False
@@ -2316,11 +2323,13 @@ def run_ga(
 
         if active_mask_blocks is None:
             active_mask_blocks = pick_random_mask()
-            print(f"[MASK INIT] {active_mask_blocks}")
+            if DEBUG_MUTATION and not GA_DASHBOARD_MODE:
+                print(f"[MASK INIT] {active_mask_blocks}")
         elif mask_saturated:
             prev_mask = active_mask_blocks
             active_mask_blocks = pick_random_mask()
-            print(f"[MASK SATURATED] {prev_mask} -> {active_mask_blocks}")
+            if DEBUG_MUTATION and not GA_DASHBOARD_MODE:
+                print(f"[MASK SATURATED] {prev_mask} -> {active_mask_blocks}")
             if DEBUG_MUTATION:
                 print_mutation_counter("cambio_bloque")
 
@@ -2333,7 +2342,8 @@ def run_ga(
         if stuck >= 15:
             stuck = 0
             active_mask_blocks = None
-            log_fn("[ANTI-PEGADO] se pegó -> meto más wild + más cobertura")
+            if not GA_DASHBOARD_MODE:
+                log_fn("[ANTI-PEGADO] se pegó -> meto más wild + más cobertura")
             cfg.n_wild = min(cfg.population - cfg.elite, cfg.n_wild + 20)
             extra_cov = force_coverage(space, max(10, cfg.population // 8))
         else:
@@ -2541,38 +2551,36 @@ def run_ga(
         evaluated = len(scored)
         pop_size = len(pop)
         sim_ok = evaluated == pop_size
-        print(f"===== GEN {gen_display} | POP={pop_size} | SIM_OK={evaluated}/{pop_size} =====")
         if not sim_ok:
-            print(f"[ERROR] Generación {gen_display}: simulación incompleta (evaluated={evaluated}, expected={pop_size})")
+            print(f"[ERROR] GEN {gen_display}: simulación incompleta (evaluated={evaluated}, expected={pop_size})")
             return best_global, best_metrics
 
-        top = scored[:3]
-        for idx, (score, ge, m) in enumerate(top, start=1):
-            print(f"[GEN {gen_display}][BEST #{idx}]")
-            print(f"score={score}")
-            print(f"net={m.net}")
-            print(f"PF={m.pf}")
-            print(f"DD={m.dd_pct}")
-            print(f"trades={m.trades}")
-            print(format_full_genes(ge, set()))
+        if not dashboard_header_printed:
+            print("GEN | SCORE | NET | PF | DD | TRADES | UNIQUE | BLOCKS")
+            dashboard_header_printed = True
 
-        avg_score = sum(s for s, _, _ in scored) / pop_size
-        avg_net = sum(m.net for _, _, m in scored) / pop_size
-        avg_dd = sum(m.dd_pct for _, _, m in scored) / pop_size
-        avg_trades = sum(m.trades for _, _, m in scored) / pop_size
         blocks_used = sorted({bn for meta in child_meta for bn in meta.get("mutated_blocks", [])}) if child_meta else []
+        blocks_label = "+".join(blocks_used) if blocks_used else "-"
+        line = (
+            f"{gen_display} | {best_score:.3f} | {best_m.net:.0f} | {best_m.pf:.2f} | "
+            f"{best_m.dd_pct:.1f} | {best_m.trades} | {len(unique_hashes)} | {blocks_label}"
+        )
+        sys.stdout.write("\r" + line)
+        sys.stdout.flush()
+
         elite_preserved = best_global is not None and elite[0] == best_global[1]
-        print(f"--- RESUMEN GEN {gen_display} ---")
-        print(f"best_score={scored[0][0]}")
-        print(f"best_net={scored[0][2].net}")
-        print(f"avg_score={avg_score}")
-        print(f"avg_net={avg_net}")
-        print(f"avg_DD={avg_dd}")
-        print(f"avg_trades={avg_trades}")
-        print(f"unique_genomes={len(unique_hashes)}")
-        print(f"bloques_usados={blocks_used}")
-        print(f"elite_preserved={elite_preserved}")
+        if prev_best_global_score is None or best_score > prev_best_global_score + 1e-9:
+            print()
+            print("[NEW GLOBAL BEST]")
+            print(f"GEN={gen_display}")
+            print(f"score={best_score}")
+            print(f"net={best_m.net}")
+            print(f"PF={best_m.pf}")
+            print(f"DD={best_m.dd_pct}")
+            print(f"trades={best_m.trades}")
+            print(format_full_genes(best_ge, set()))
         if not elite_preserved:
+            print()
             print("[WARNING] elite_preserved=False")
 
     if return_population:
