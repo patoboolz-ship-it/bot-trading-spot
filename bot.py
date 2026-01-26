@@ -17,6 +17,7 @@ Seguridad:
 """
 
 import os
+import sys
 import time
 import math
 import json
@@ -913,6 +914,8 @@ class SpotBot:
                     time.sleep(2)
                     continue
                 last_seen_close_time = close_time
+                close_time_utc = datetime.fromtimestamp(close_time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                self._emit("log", {"msg": f"[VELA] Nueva vela cerrada {close_time_utc} close={last_close:.4f}"})
 
                 bScore, sScore, score_close = compute_scores(self.params, candles)
                 last_close = score_close
