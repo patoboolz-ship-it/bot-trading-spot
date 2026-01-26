@@ -25,6 +25,7 @@ import random
 import statistics
 import copy
 import threading
+import itertools
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 
@@ -910,7 +911,8 @@ class SpotBot:
                 close_time_utc = datetime.fromtimestamp(close_time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 self._emit("log", {"msg": f"[VELA] Nueva vela cerrada {close_time_utc} close={last_close:.4f}"})
 
-                bScore, sScore, last_close = compute_scores(self.params, candles)
+                bScore, sScore, score_close = compute_scores(self.params, candles)
+                last_close = score_close
                 close_time_utc = datetime.fromtimestamp(close_time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 self._emit("log", {"msg": f"[VELA] Nueva vela cerrada {close_time_utc} close={last_close:.4f}"})
 
@@ -1975,7 +1977,7 @@ def make_child_blocky(
     p2: Genome,
     mut_rate: float,
     max_blocks_per_child: int,
-    forced_block: Optional[str] = None,
+    forced_blocks: Optional[list[str]] = None,
     strength: float = 0.8,
     allowed_blocks: Optional[list[str]] = None,
 ):
@@ -1991,21 +1993,28 @@ def make_child_blocky(
         random.shuffle(block_names)
 
         chosen = []
-        if forced_block and forced_block in BLOCKS:
-            chosen.append(forced_block)
+        if forced_blocks:
+            chosen = [
+                bn for bn in forced_blocks
+                if bn in BLOCKS and (allowed_blocks is None or bn in allowed_blocks)
+            ]
+        else:
+            need = random.randint(1, max_blocks_per_child)
+            for bn in block_names:
+                if bn in chosen:
+                    continue
+                chosen.append(bn)
+                if len(chosen) >= need:
+                    break
 
-        need = random.randint(1, max_blocks_per_child)
-        for bn in block_names:
-            if bn in chosen:
-                continue
-            chosen.append(bn)
-            if len(chosen) >= need:
-                break
-
-        multi_factor = 1.0 + 0.4 * max(0, len(chosen) - 1)
-        eff_strength = min(1.8, strength * multi_factor)
-        for bn in chosen:
-            mutate_block(child, space, bn, strength=eff_strength)
+        if chosen:
+            if forced_blocks:
+                eff_strength = strength
+            else:
+                multi_factor = 1.0 + 0.4 * max(0, len(chosen) - 1)
+                eff_strength = min(1.8, strength * multi_factor)
+            for bn in chosen:
+                mutate_block(child, space, bn, strength=eff_strength)
 
     ge = Genome(**child)
     return space.clamp_genome(ge)
@@ -2088,6 +2097,21 @@ def run_ga(
     best_metrics = None
     prev_best_hash = None
     stuck = 0
+    mutation_schedule = []
+    schedule_idx = -1
+    active_forced_blocks = None
+
+    schedule_blocks = allowed_blocks if allowed_blocks else list(BLOCKS.keys())
+    for r in range(1, len(schedule_blocks) + 1):
+        for combo in itertools.combinations(schedule_blocks, r):
+            mutation_schedule.append(list(combo))
+
+    def strength_for_combo(count: int) -> float:
+        if count <= 1:
+            return 0.55
+        if count == 2:
+            return 0.85
+        return 1.15
 
     for gen in range(1, cfg.generations + 1):
         if stop_flag():
@@ -2112,6 +2136,7 @@ def run_ga(
             best_global = (best_score, copy.deepcopy(best_ge))
             best_metrics = best_m
             stuck = 0
+            active_forced_blocks = None
         else:
             stuck += 1
 
@@ -2136,8 +2161,14 @@ def run_ga(
         )
         prev_best_hash = best_hash
 
+        if stuck > 0 and mutation_schedule and stuck % 5 == 0:
+            schedule_idx = (schedule_idx + 1) % len(mutation_schedule)
+            active_forced_blocks = mutation_schedule[schedule_idx]
+            log_fn(f"[MUT_SCHED] estancado={stuck} forzando={active_forced_blocks}")
+
         if stuck >= 15:
             stuck = 0
+            active_forced_blocks = None
             log_fn("[ANTI-PEGADO] se pegó -> meto más wild + más cobertura")
             cfg.n_wild = min(cfg.population - cfg.elite, cfg.n_wild + 20)
             extra_cov = force_coverage(space, max(10, cfg.population // 8))
@@ -2151,20 +2182,22 @@ def run_ga(
 
         block_cycle = allowed_blocks or ["RSI", "MACD", "CONSEC", "RISK", "CONF"]
         bc_i = 0
+        forced_strength = strength_for_combo(len(active_forced_blocks)) if active_forced_blocks else None
 
         for _ in range(cfg.n_cons):
             p1 = random.choice(pool)
             p2 = random.choice(pool)
-            forced = block_cycle[bc_i % len(block_cycle)]
-            bc_i += 1
+            forced = block_cycle[bc_i % len(block_cycle)] if not active_forced_blocks else None
+            bc_i += 1 if not active_forced_blocks else 0
+            forced_blocks = active_forced_blocks if active_forced_blocks else [forced]
             child = make_child_blocky(
                 space,
                 p1,
                 p2,
                 mut_rate=0.28,
                 max_blocks_per_child=1,
-                forced_block=forced,
-                strength=0.55,
+                forced_blocks=forced_blocks,
+                strength=forced_strength if active_forced_blocks else 0.55,
                 allowed_blocks=allowed_blocks,
             )
             children.append(postprocess_fn(child))
@@ -2172,16 +2205,17 @@ def run_ga(
         for _ in range(cfg.n_exp):
             p1 = random.choice(pool)
             p2 = random.choice(pool)
-            forced = block_cycle[bc_i % len(block_cycle)]
-            bc_i += 1
+            forced = block_cycle[bc_i % len(block_cycle)] if not active_forced_blocks else None
+            bc_i += 1 if not active_forced_blocks else 0
+            forced_blocks = active_forced_blocks if active_forced_blocks else [forced]
             child = make_child_blocky(
                 space,
                 p1,
                 p2,
                 mut_rate=0.60,
                 max_blocks_per_child=2,
-                forced_block=forced,
-                strength=0.80,
+                forced_blocks=forced_blocks,
+                strength=forced_strength if active_forced_blocks else 0.80,
                 allowed_blocks=allowed_blocks,
             )
             children.append(postprocess_fn(child))
@@ -2192,16 +2226,17 @@ def run_ga(
             else:
                 p1 = random.choice(pool)
                 p2 = random.choice(pool)
-                forced = block_cycle[bc_i % len(block_cycle)]
-                bc_i += 1
+                forced = block_cycle[bc_i % len(block_cycle)] if not active_forced_blocks else None
+                bc_i += 1 if not active_forced_blocks else 0
+                forced_blocks = active_forced_blocks if active_forced_blocks else [forced]
                 child = make_child_blocky(
                     space,
                     p1,
                     p2,
                     mut_rate=0.90,
                     max_blocks_per_child=3,
-                    forced_block=forced,
-                    strength=1.00,
+                    forced_blocks=forced_blocks,
+                    strength=forced_strength if active_forced_blocks else 1.00,
                     allowed_blocks=allowed_blocks,
                 )
                 children.append(postprocess_fn(child))
