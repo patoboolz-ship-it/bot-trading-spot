@@ -78,6 +78,9 @@ DEBUG_MUTATION = False
 DEBUG_FULL_POPULATION = False
 GA_DASHBOARD_MODE = True
 GA_WATCHDOG_SEC = 10
+MAX_WEIGHT_GENS = 5
+MAX_WEIGHT_ATTEMPTS = 50
+WEIGHT_NO_IMPROVE_LIMIT = 3
 
 # Capital inicial para reportes de optimización
 START_CAPITAL = 100000.0
@@ -786,6 +789,7 @@ class SpotBot:
         except BinanceAPIException as e:
             self._emit("log", {"msg": f"[ERROR] Error de Binance al vender: {e}"})
             return None
+        return self._place_market_sell_qty(qty, reason="MANUAL_SELL")
 
     def manual_buy_by_quote_pct(self, pct: float) -> Optional[Trade]:
         usdt_free = get_free_balance(self.client, QUOTE_ASSET)
@@ -2155,6 +2159,11 @@ def run_ga(
     stuck = 0
     prev_best_global_score = None
     last_output_ts = time.time()
+    is_weight_opt = allowed_blocks == ["CONF"]
+    weight_attempts = 0
+    weight_unique = 0
+    weight_no_improve = 0
+    weight_hashes = set()
     active_mask_blocks = None
     recent_masks = deque(maxlen=7)
     schedule_blocks = allowed_blocks if allowed_blocks else list(BLOCKS.keys())
@@ -2265,16 +2274,64 @@ def run_ga(
             lines.append(f"  {gene}={format_value(gene, getattr(ge, gene), gene in mutated_genes)}")
         return "genes={\n" + ",\n".join(lines) + "\n}"
 
-    for gen in range(1, cfg.generations + 1):
+    total_gens = cfg.generations
+    if is_weight_opt:
+        total_gens = min(total_gens, MAX_WEIGHT_GENS)
+
+    def _empty_metrics() -> Metrics:
+        return Metrics(
+            score=-1e9,
+            net=-1.0,
+            balance=0.0,
+            profit=0.0,
+            gross_profit=0.0,
+            gross_loss=0.0,
+            max_dd=1.0,
+            dd_pct=100.0,
+            trades=0,
+            wins=0,
+            losses=0,
+            winrate=0.0,
+            pf=0.0,
+            years=0.0,
+            trades_per_year=0.0,
+            buy_signal_rate=0.0,
+            sell_signal_rate=0.0,
+        )
+
+    def _refresh_weight_genome(ge: Genome, strength: float = 0.9) -> Genome:
+        payload = asdict(ge)
+        mutate_block(payload, space, "CONF", strength=strength)
+        return space.clamp_genome(Genome(**payload))
+
+    for gen in range(1, total_gens + 1):
         if stop_flag():
             log_fn("[STOP] detenido por el usuario.")
             return best_global, best_metrics
 
+        if is_weight_opt:
+            weight_attempts = 0
+            weight_unique = 0
+
         scored = []
-        for ge in pop:
+        for idx, ge in enumerate(pop):
+            if is_weight_opt:
+                attempts = 0
+                while attempts < MAX_WEIGHT_ATTEMPTS:
+                    weight_attempts += 1
+                    weight_key = tuple(getattr(ge, g) for g in BLOCKS["CONF"])
+                    if weight_key not in weight_hashes:
+                        weight_hashes.add(weight_key)
+                        weight_unique += 1
+                        pop[idx] = ge
+                        break
+                    attempts += 1
+                    ge = _refresh_weight_genome(ge)
+                if attempts >= MAX_WEIGHT_ATTEMPTS:
+                    scored.append((-1e12, ge, _empty_metrics()))
+                    continue
             m = simulate_spot(candles, ge, fee_per_side, slip_per_side)
             score = fitness_from_metrics(m, cfg)
-
             scored.append((score, ge, m))
 
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -2290,8 +2347,12 @@ def run_ga(
             best_metrics = best_m
             stuck = 0
             active_mask_blocks = None
+            if is_weight_opt:
+                weight_no_improve = 0
         else:
             stuck += 1
+            if is_weight_opt:
+                weight_no_improve += 1
 
         gen_display = gen + gen_offset
         if not GA_DASHBOARD_MODE:
@@ -2314,6 +2375,15 @@ def run_ga(
                 f"best_hash={best_hash} repeated={best_hash == prev_best_hash}"
             )
         prev_best_hash = best_hash
+        if is_weight_opt:
+            print(
+                f"[WEIGHT-OPT] gen={gen_display} | attempts={weight_attempts} | "
+                f"unique={weight_unique} | best_score={best_score}",
+                flush=True,
+            )
+            if weight_no_improve >= WEIGHT_NO_IMPROVE_LIMIT:
+                print("[INFO] Weight optimizer: no improvement → exit", flush=True)
+                break
 
         mask_saturated = False
         if stuck > 0:
