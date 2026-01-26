@@ -25,7 +25,7 @@ import random
 import statistics
 import copy
 import threading
-import itertools
+from collections import deque
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 
@@ -783,6 +783,7 @@ class SpotBot:
         except BinanceAPIException as e:
             self._emit("log", {"msg": f"[ERROR] Error de Binance al vender: {e}"})
             return None
+        return self._place_market_sell_qty(qty, reason="MANUAL_SELL")
 
     def manual_buy_by_quote_pct(self, pct: float) -> Optional[Trade]:
         usdt_free = get_free_balance(self.client, QUOTE_ASSET)
@@ -2025,6 +2026,21 @@ def make_child_blocky(
             pre_mutation = child.copy()
             for bn in chosen:
                 mutate_block(child, space, bn, strength=eff_strength)
+                if not any(child[g] != pre_mutation[g] for g in BLOCKS[bn]):
+                    gk = random.choice(BLOCKS[bn])
+                    spec = space.spec[gk]
+                    lo, hi, tp = spec["min"], spec["max"], spec["type"]
+                    if tp == "int":
+                        current = int(child[gk])
+                        options = [v for v in range(int(lo), int(hi) + 1, int(spec["step"])) if v != current]
+                        if options:
+                            child[gk] = random.choice(options)
+                    else:
+                        current = float(child[gk])
+                        new_val = lo + (hi - lo) * random.random()
+                        if abs(new_val - current) < 1e-9:
+                            new_val = lo if abs(lo - current) > abs(hi - current) else hi
+                        child[gk] = space.quantize(gk, new_val)
                 mutated_blocks.append(bn)
                 mutated_genes.extend(BLOCKS[bn])
             mutated_genes = [g for g in mutated_genes if child[g] != pre_mutation[g]]
@@ -2133,14 +2149,9 @@ def run_ga(
     best_metrics = None
     prev_best_hash = None
     stuck = 0
-    mutation_schedule = []
-    schedule_idx = -1
-    active_forced_blocks = None
-
+    active_mask_blocks = None
+    recent_masks = deque(maxlen=7)
     schedule_blocks = allowed_blocks if allowed_blocks else list(BLOCKS.keys())
-    for r in range(1, len(schedule_blocks) + 1):
-        for combo in itertools.combinations(schedule_blocks, r):
-            mutation_schedule.append(list(combo))
 
     def strength_for_combo(count: int) -> float:
         if count <= 1:
@@ -2199,6 +2210,17 @@ def run_ga(
         for gene in sorted(mutation_counter.keys()):
             print(f"{gene}={mutation_counter[gene]}")
 
+    def pick_random_mask() -> list[str]:
+        if not schedule_blocks:
+            return []
+        while True:
+            count = random.randint(1, min(2, len(schedule_blocks)))
+            blocks = random.sample(schedule_blocks, count)
+            mask_key = tuple(sorted(blocks))
+            if mask_key not in recent_masks:
+                recent_masks.append(mask_key)
+                return list(mask_key)
+
     for gen in range(1, cfg.generations + 1):
         if stop_flag():
             log_fn("[STOP] detenido por el usuario.")
@@ -2222,7 +2244,7 @@ def run_ga(
             best_global = (best_score, copy.deepcopy(best_ge))
             best_metrics = best_m
             stuck = 0
-            active_forced_blocks = None
+            active_mask_blocks = None
         else:
             stuck += 1
 
@@ -2247,46 +2269,53 @@ def run_ga(
         )
         prev_best_hash = best_hash
 
-        if stuck > 0 and mutation_schedule and stuck % 5 == 0:
-            schedule_idx = (schedule_idx + 1) % len(mutation_schedule)
-            active_forced_blocks = mutation_schedule[schedule_idx]
-            log_fn(f"[MUT_SCHED] estancado={stuck} forzando={active_forced_blocks}")
+        mask_saturated = False
+        if stuck > 0:
+            mask_saturated = True
+        if best_hash == prev_best_hash:
+            mask_saturated = True
+        if elite_unique <= max(1, cfg.elite // 2):
+            mask_saturated = True
+
+        if active_mask_blocks is None:
+            active_mask_blocks = pick_random_mask()
+            print(f"[MASK INIT] {active_mask_blocks}")
+        elif mask_saturated:
+            prev_mask = active_mask_blocks
+            active_mask_blocks = pick_random_mask()
+            print(f"[MASK SATURATED] {prev_mask} -> {active_mask_blocks}")
             if DEBUG_MUTATION:
                 print_mutation_counter("cambio_bloque")
 
         if stuck >= 15:
             stuck = 0
-            active_forced_blocks = None
+            active_mask_blocks = None
             log_fn("[ANTI-PEGADO] se pegó -> meto más wild + más cobertura")
             cfg.n_wild = min(cfg.population - cfg.elite, cfg.n_wild + 20)
             extra_cov = force_coverage(space, max(10, cfg.population // 8))
         else:
             extra_cov = []
 
-        elite = [x[1] for x in scored[:cfg.elite]]
+        elite = [best_global[1]] if best_global else [scored[0][1]]
         pool = [x[1] for x in scored[:max(cfg.elite * 6, cfg.population // 2)]]
 
         children = []
         child_meta = [] if DEBUG_MUTATION else None
 
-        block_cycle = allowed_blocks or ["RSI", "MACD", "CONSEC", "RISK", "CONF"]
-        bc_i = 0
-        forced_strength = strength_for_combo(len(active_forced_blocks)) if active_forced_blocks else None
+        forced_strength = strength_for_combo(len(active_mask_blocks)) if active_mask_blocks else None
 
         for _ in range(cfg.n_cons):
             p1 = random.choice(pool)
             p2 = random.choice(pool)
-            forced = block_cycle[bc_i % len(block_cycle)] if not active_forced_blocks else None
-            bc_i += 1 if not active_forced_blocks else 0
-            forced_blocks = active_forced_blocks if active_forced_blocks else [forced]
+            forced_blocks = active_mask_blocks
             child_result = make_child_blocky(
                 space,
                 p1,
                 p2,
-                mut_rate=0.28,
+                mut_rate=1.0,
                 max_blocks_per_child=1,
                 forced_blocks=forced_blocks,
-                strength=forced_strength if active_forced_blocks else 0.55,
+                strength=forced_strength if active_mask_blocks else 0.55,
                 allowed_blocks=allowed_blocks,
                 return_meta=DEBUG_MUTATION,
             )
@@ -2300,17 +2329,15 @@ def run_ga(
         for _ in range(cfg.n_exp):
             p1 = random.choice(pool)
             p2 = random.choice(pool)
-            forced = block_cycle[bc_i % len(block_cycle)] if not active_forced_blocks else None
-            bc_i += 1 if not active_forced_blocks else 0
-            forced_blocks = active_forced_blocks if active_forced_blocks else [forced]
+            forced_blocks = active_mask_blocks
             child_result = make_child_blocky(
                 space,
                 p1,
                 p2,
-                mut_rate=0.60,
+                mut_rate=1.0,
                 max_blocks_per_child=2,
                 forced_blocks=forced_blocks,
-                strength=forced_strength if active_forced_blocks else 0.80,
+                strength=forced_strength if active_mask_blocks else 0.80,
                 allowed_blocks=allowed_blocks,
                 return_meta=DEBUG_MUTATION,
             )
@@ -2322,42 +2349,26 @@ def run_ga(
             children.append(postprocess_fn(child))
 
         for _ in range(cfg.n_wild):
-            if random.random() < 0.35:
-                child = postprocess_fn(sample_fn())
-                children.append(child)
-                if DEBUG_MUTATION:
-                    child_meta.append(
-                        {
-                            "mutated": False,
-                            "mutation_type": "aleatorio",
-                            "mutated_blocks": [],
-                            "mutated_genes": [],
-                            "untouched_genes": [],
-                        }
-                    )
+            p1 = random.choice(pool)
+            p2 = random.choice(pool)
+            forced_blocks = active_mask_blocks
+            child_result = make_child_blocky(
+                space,
+                p1,
+                p2,
+                mut_rate=1.0,
+                max_blocks_per_child=2,
+                forced_blocks=forced_blocks,
+                strength=forced_strength if active_mask_blocks else 1.00,
+                allowed_blocks=allowed_blocks,
+                return_meta=DEBUG_MUTATION,
+            )
+            if DEBUG_MUTATION:
+                child, meta = child_result
+                child_meta.append(meta)
             else:
-                p1 = random.choice(pool)
-                p2 = random.choice(pool)
-                forced = block_cycle[bc_i % len(block_cycle)] if not active_forced_blocks else None
-                bc_i += 1 if not active_forced_blocks else 0
-                forced_blocks = active_forced_blocks if active_forced_blocks else [forced]
-                child_result = make_child_blocky(
-                    space,
-                    p1,
-                    p2,
-                    mut_rate=0.90,
-                    max_blocks_per_child=3,
-                    forced_blocks=forced_blocks,
-                    strength=forced_strength if active_forced_blocks else 1.00,
-                    allowed_blocks=allowed_blocks,
-                    return_meta=DEBUG_MUTATION,
-                )
-                if DEBUG_MUTATION:
-                    child, meta = child_result
-                    child_meta.append(meta)
-                else:
-                    child = child_result
-                children.append(postprocess_fn(child))
+                child = child_result
+            children.append(postprocess_fn(child))
 
         if DEBUG_MUTATION:
             all_genes = sorted(space.spec.keys())
@@ -2418,16 +2429,14 @@ def run_ga(
             random_sample = random.choice(pop)
             log_individual("aleatorio", random_sample)
 
-            cloned_count = sum(1 for meta in child_meta if meta["mutation_type"] == "copiado")
+            cloned_count = (cfg.population - 1) - mutated_count
             block_summary = (
                 f"RSI={block_counts['RSI']} | MACD={block_counts['MACD']} | "
                 f"CONSEC={block_counts['CONSEC']} | PESOS={block_counts['CONF']} | "
                 f"RISK={block_counts['RISK']}"
             )
-            block_label = (
-                f"{schedule_idx + 1}" if active_forced_blocks else "AUTO"
-            )
-            active_label = active_forced_blocks if active_forced_blocks else []
+            block_label = "MASK"
+            active_label = active_mask_blocks if active_mask_blocks else []
             print(
                 f"[GEN {gen_display}][BLOQUE {block_label}] modo={mode_label} "
                 f"activos={active_label} total={cfg.population} "
