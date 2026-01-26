@@ -783,6 +783,7 @@ class SpotBot:
         except BinanceAPIException as e:
             self._emit("log", {"msg": f"[ERROR] Error de Binance al vender: {e}"})
             return None
+        return self._place_market_sell_qty(qty, reason="MANUAL_SELL")
 
     def manual_buy_by_quote_pct(self, pct: float) -> Optional[Trade]:
         usdt_free = get_free_balance(self.client, QUOTE_ASSET)
@@ -911,6 +912,8 @@ class SpotBot:
                     time.sleep(2)
                     continue
                 last_seen_close_time = close_time
+                close_time_utc = datetime.fromtimestamp(close_time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                self._emit("log", {"msg": f"[VELA] Nueva vela cerrada {close_time_utc} close={last_close:.4f}"})
 
                 bScore, sScore, score_close = compute_scores(self.params, candles)
                 last_close = score_close
