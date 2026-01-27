@@ -337,46 +337,157 @@ def normalize3_safe(a: float, b: float, c: float):
         return (r1 / s, r2 / s, r3 / s)
     return (a / s, b / s, c / s)
 
+WEIGHT_MIN = 0.05
+WEIGHT_MAX = 0.90
+
+def clamp_weight(value: float, min_w: float = WEIGHT_MIN, max_w: float = WEIGHT_MAX) -> float:
+    return max(min_w, min(max_w, value))
+
+def normalize3_clamped(a: float, b: float, c: float, min_w: float = WEIGHT_MIN, max_w: float = WEIGHT_MAX):
+    a = clamp_weight(a, min_w, max_w)
+    b = clamp_weight(b, min_w, max_w)
+    c = clamp_weight(c, min_w, max_w)
+    s = a + b + c
+    if s <= 1e-12:
+        return (1 / 3, 1 / 3, 1 / 3)
+    return (a / s, b / s, c / s)
+
+def apply_weight_constraints(child: dict):
+    child["w_buy_rsi"], child["w_buy_macd"], child["w_buy_consec"] = normalize3_clamped(
+        child["w_buy_rsi"], child["w_buy_macd"], child["w_buy_consec"]
+    )
+    child["w_sell_rsi"], child["w_sell_macd"], child["w_sell_consec"] = normalize3_clamped(
+        child["w_sell_rsi"], child["w_sell_macd"], child["w_sell_consec"]
+    )
+
+def score_components_at_index(
+    close: list,
+    rsi_arr: list,
+    mh_arr: list,
+    i: int,
+    *,
+    rsi_oversold: float,
+    rsi_overbought: float,
+    consec_red: int,
+    consec_green: int,
+    edge_trigger: int,
+    w_buy_rsi: float,
+    w_buy_macd: float,
+    w_buy_consec: float,
+    w_sell_rsi: float,
+    w_sell_macd: float,
+    w_sell_consec: float,
+) -> dict:
+    """
+    Ecuación (fuente de verdad):
+
+    BUY_SCORE  = Wbuy_rsi * RSI_buy + Wbuy_macd * MACD_buy + Wbuy_consec * CONSEC_buy
+    SELL_SCORE = Wsell_rsi * RSI_sell + Wsell_macd * MACD_sell + Wsell_consec * CONSEC_sell
+
+    Donde las señales están en rango 0..1 y los pesos se normalizan para sumar 1.
+    """
+    rsi_val = rsi_arr[i]
+    mh = mh_arr[i]
+    mh_prev = mh_arr[i - 1] if i > 0 else mh
+
+    buy_rsi = buy_rsi_signal(rsi_val, rsi_oversold, rsi_overbought)
+    sell_rsi = sell_rsi_signal(rsi_val, rsi_oversold, rsi_overbought)
+    buy_macd = buy_macd_signal(mh, mh_prev, edge_trigger)
+    sell_macd = sell_macd_signal(mh, mh_prev, edge_trigger)
+    buy_consec = consec_up(close[: i + 1], consec_green)
+    sell_consec = consec_down(close[: i + 1], consec_red)
+
+    wbr, wbm, wbc = normalize3(w_buy_rsi, w_buy_macd, w_buy_consec)
+    wsr, wsm, wsc = normalize3(w_sell_rsi, w_sell_macd, w_sell_consec)
+
+    buy_score = wbr * buy_rsi + wbm * buy_macd + wbc * buy_consec
+    sell_score = wsr * sell_rsi + wsm * sell_macd + wsc * sell_consec
+
+    return {
+        "buy_score": buy_score,
+        "sell_score": sell_score,
+        "signals": {
+            "buy_rsi": buy_rsi,
+            "buy_macd": buy_macd,
+            "buy_consec": buy_consec,
+            "sell_rsi": sell_rsi,
+            "sell_macd": sell_macd,
+            "sell_consec": sell_consec,
+        },
+    }
+
+
+def compute_score_snapshot_from_params(params: dict, candles: list, index: Optional[int] = None):
+    """
+    Calcula scores y señales usando los parámetros del bot (dict).
+    """
+    use_ha = int(params["use_ha"]) == 1
+    edge = int(params["edge_trigger"])
+
+    src = heikin_ashi(candles) if use_ha else candles
+    close = [c["close"] for c in src]
+
+    rsi_period = int(params["rsi_period"])
+    rsi_vals = rsi(close, rsi_period)
+    hist = macd_hist(close, int(params["macd_fast"]), int(params["macd_slow"]), int(params["macd_signal"]))
+
+    idx = len(close) - 1 if index is None else int(index)
+    payload = score_components_at_index(
+        close,
+        rsi_vals,
+        hist,
+        idx,
+        rsi_oversold=float(params["rsi_oversold"]),
+        rsi_overbought=float(params["rsi_overbought"]),
+        consec_red=int(params["consec_red"]),
+        consec_green=int(params["consec_green"]),
+        edge_trigger=edge,
+        w_buy_rsi=float(params["w_buy_rsi"]),
+        w_buy_macd=float(params["w_buy_macd"]),
+        w_buy_consec=float(params["w_buy_consec"]),
+        w_sell_rsi=float(params["w_sell_rsi"]),
+        w_sell_macd=float(params["w_sell_macd"]),
+        w_sell_consec=float(params["w_sell_consec"]),
+    )
+    return payload, close[idx]
+
+
+def compute_score_snapshot_from_genome(ge: "Genome", candles: list, index: Optional[int] = None):
+    """
+    Calcula scores y señales usando un Genome (simulador/GA).
+    """
+    data = heikin_ashi(candles) if ge.use_ha == 1 else candles
+    close = [c["close"] for c in data]
+    rsi_arr = rsi(close, ge.rsi_period)
+    mh_arr = macd_hist(close, ge.macd_fast, ge.macd_slow, ge.macd_signal)
+    idx = len(close) - 1 if index is None else int(index)
+    payload = score_components_at_index(
+        close,
+        rsi_arr,
+        mh_arr,
+        idx,
+        rsi_oversold=ge.rsi_oversold,
+        rsi_overbought=ge.rsi_overbought,
+        consec_red=ge.consec_red,
+        consec_green=ge.consec_green,
+        edge_trigger=ge.edge_trigger,
+        w_buy_rsi=ge.w_buy_rsi,
+        w_buy_macd=ge.w_buy_macd,
+        w_buy_consec=ge.w_buy_consec,
+        w_sell_rsi=ge.w_sell_rsi,
+        w_sell_macd=ge.w_sell_macd,
+        w_sell_consec=ge.w_sell_consec,
+    )
+    return payload, close[idx]
+
+
 def compute_scores(params: dict, candles: list):
     """
     candles: list of dict open/high/low/close
     returns (buyScore, sellScore, last_close)
     """
-    use_ha = int(params["use_ha"]) == 1
-    edge = int(params["edge_trigger"])
-
-    if use_ha:
-        src = heikin_ashi(candles)
-    else:
-        src = candles
-
-    close = [c["close"] for c in src]
-
-    rsi_period = int(params["rsi_period"])
-    rsi_vals = rsi(close, rsi_period)
-    rsi_last = rsi_vals[-1]
-
-    hist = macd_hist(close, int(params["macd_fast"]), int(params["macd_slow"]), int(params["macd_signal"]))
-    hist_now = hist[-1]
-    hist_prev = hist[-2] if len(hist) >= 2 else 0.0
-
-    # weights
-    wBR, wBM, wBC = normalize3(float(params["w_buy_rsi"]), float(params["w_buy_macd"]), float(params["w_buy_consec"]))
-    wSR, wSM, wSC = normalize3(float(params["w_sell_rsi"]), float(params["w_sell_macd"]), float(params["w_sell_consec"]))
-
-    b = (
-        wBR * buy_rsi_signal(rsi_last, float(params["rsi_oversold"]), float(params["rsi_overbought"])) +
-        wBM * buy_macd_signal(hist_now, hist_prev, edge) +
-        wBC * consec_up(close, int(params["consec_green"]))
-    )
-
-    s = (
-        wSR * sell_rsi_signal(rsi_last, float(params["rsi_oversold"]), float(params["rsi_overbought"])) +
-        wSM * sell_macd_signal(hist_now, hist_prev, edge) +
-        wSC * consec_down(close, int(params["consec_red"]))
-    )
-
-    return b, s, close[-1]
+    payload, last_close = compute_score_snapshot_from_params(params, candles)
+    return payload["buy_score"], payload["sell_score"], last_close
 
 
 # =========================
@@ -797,52 +908,6 @@ class SpotBot:
 
         except BinanceAPIException as e:
             self._emit("log", {"msg": f"[ERROR] Error de Binance al vender: {e}"})
-            return None
-
-    def manual_buy_by_quote_pct(self, pct: float) -> Optional[Trade]:
-        usdt_free = get_free_balance(self.client, QUOTE_ASSET)
-        if usdt_free <= 0:
-            self._emit("log", {"msg": "[MANUAL BUY] USDT libre = 0, no compro"})
-            return None
-        target = usdt_free * (pct / 100.0)
-        target = float(target)
-        if target <= 0:
-            self._emit("log", {"msg": "[MANUAL BUY] Porcentaje inválido, no compro"})
-            return None
-        if not DRY_RUN and self.min_notional:
-            price = None
-            try:
-                price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
-            except Exception as e:
-                self._emit("log", {"msg": f"[AVISO] No pude leer precio para compra manual: {e}"})
-            min_quote = self._min_quote_for_notional(price) if price else self.min_notional
-            min_quote = min_quote + BUY_NOTIONAL_BUFFER_USDT if min_quote else self.min_notional
-            if target < min_quote:
-                if usdt_free >= min_quote:
-                    self._emit(
-                        "log",
-                        {
-                            "msg": f"[MANUAL BUY] % muy bajo para minNotional, ajusto a {min_quote:.4f} USDT"
-                        },
-                    )
-                    target = min_quote
-                else:
-                    self._emit(
-                        "log",
-                        {
-                            "msg": f"[MANUAL BUY] USDT libre {usdt_free:.4f} < minNotional {min_quote:.4f}"
-                        },
-                    )
-                    return None
-            else:
-                pass
-        return self._place_market_buy_by_quote(target, reason="MANUAL_BUY")
-
-    def manual_sell_all_base(self) -> Optional[Trade]:
-        sol_free = get_free_balance(self.client, BASE_ASSET)
-        qty = round_step(sol_free, self.step)
-        if qty <= 0:
-            self._emit("log", {"msg": "[MANUAL SELL] No hay SOL libre para vender"})
             return None
         return self._place_market_sell_qty(qty, reason="MANUAL_SELL")
 
@@ -1686,12 +1751,7 @@ class ParamSpace:
                 g[k] = lo + (hi - lo) * random.random()
                 g[k] = self.quantize(k, g[k])
 
-        g["w_buy_rsi"], g["w_buy_macd"], g["w_buy_consec"] = normalize3(
-            g["w_buy_rsi"], g["w_buy_macd"], g["w_buy_consec"]
-        )
-        g["w_sell_rsi"], g["w_sell_macd"], g["w_sell_consec"] = normalize3(
-            g["w_sell_rsi"], g["w_sell_macd"], g["w_sell_consec"]
-        )
+        apply_weight_constraints(g)
         if g["macd_slow"] <= g["macd_fast"]:
             g["macd_slow"] = min(self.spec["macd_slow"]["max"], g["macd_fast"] + 5)
         return Genome(**g)
@@ -1701,12 +1761,7 @@ class ParamSpace:
         for k in d:
             d[k] = self.quantize(k, d[k])
 
-        d["w_buy_rsi"], d["w_buy_macd"], d["w_buy_consec"] = normalize3(
-            d["w_buy_rsi"], d["w_buy_macd"], d["w_buy_consec"]
-        )
-        d["w_sell_rsi"], d["w_sell_macd"], d["w_sell_consec"] = normalize3(
-            d["w_sell_rsi"], d["w_sell_macd"], d["w_sell_consec"]
-        )
+        apply_weight_constraints(d)
         if d["macd_slow"] <= d["macd_fast"]:
             d["macd_slow"] = min(self.spec["macd_slow"]["max"], d["macd_fast"] + 5)
         return Genome(**d)
@@ -1762,26 +1817,6 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
     rsi_arr = rsi(close, ge.rsi_period)
     mh_arr = macd_hist(close, ge.macd_fast, ge.macd_slow, ge.macd_signal)
 
-    def buy_score(i: int) -> float:
-        rsi_val = rsi_arr[i]
-        mh = mh_arr[i]
-        mh_prev = mh_arr[i - 1] if i > 0 else mh
-        rsi_sig = buy_rsi_signal(rsi_val, ge.rsi_oversold, ge.rsi_overbought)
-        macd_sig = buy_macd_signal(mh, mh_prev, ge.edge_trigger)
-        cons_sig = consec_up(close[: i + 1], ge.consec_green)
-        wbr, wbm, wbc = normalize3(ge.w_buy_rsi, ge.w_buy_macd, ge.w_buy_consec)
-        return wbr * rsi_sig + wbm * macd_sig + wbc * cons_sig
-
-    def sell_score(i: int) -> float:
-        rsi_val = rsi_arr[i]
-        mh = mh_arr[i]
-        mh_prev = mh_arr[i - 1] if i > 0 else mh
-        rsi_sig = sell_rsi_signal(rsi_val, ge.rsi_oversold, ge.rsi_overbought)
-        macd_sig = sell_macd_signal(mh, mh_prev, ge.edge_trigger)
-        cons_sig = consec_down(close[: i + 1], ge.consec_red)
-        wsr, wsm, wsc = normalize3(ge.w_sell_rsi, ge.w_sell_macd, ge.w_sell_consec)
-        return wsr * rsi_sig + wsm * macd_sig + wsc * cons_sig
-
     equity = 1.0
     peak = equity
     max_dd = 0.0
@@ -1833,17 +1868,32 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
     buy_signal_hits = 0
     sell_signal_hits = 0
 
-    for i in range(2, len(close)):
+    for i in range(1, len(close)):
         peak = max(peak, equity)
         dd = peak - equity
         if dd > max_dd:
             max_dd = dd
 
-        sig_i = i - 1
         exec_px = close[i]
-
-        bs = buy_score(sig_i)
-        ss = sell_score(sig_i)
+        score_payload = score_components_at_index(
+            close,
+            rsi_arr,
+            mh_arr,
+            i,
+            rsi_oversold=ge.rsi_oversold,
+            rsi_overbought=ge.rsi_overbought,
+            consec_red=ge.consec_red,
+            consec_green=ge.consec_green,
+            edge_trigger=ge.edge_trigger,
+            w_buy_rsi=ge.w_buy_rsi,
+            w_buy_macd=ge.w_buy_macd,
+            w_buy_consec=ge.w_buy_consec,
+            w_sell_rsi=ge.w_sell_rsi,
+            w_sell_macd=ge.w_sell_macd,
+            w_sell_consec=ge.w_sell_consec,
+        )
+        bs = score_payload["buy_score"]
+        ss = score_payload["sell_score"]
         if bs >= ge.buy_th:
             buy_signal_hits += 1
         if ss >= ge.sell_th:
@@ -1861,9 +1911,9 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
                 entry_i = i
                 last_trade_i = i
                 entry_buy_score = bs
-                entry_rsi = rsi_arr[sig_i]
-                entry_macd = mh_arr[sig_i]
-                entry_close = close[sig_i]
+                entry_rsi = rsi_arr[i]
+                entry_macd = mh_arr[i]
+                entry_close = close[i]
         else:
             if i <= entry_i:
                 continue
@@ -2022,6 +2072,16 @@ PARAM_GENES = [
     "use_ha",
 ]
 
+PARAM_BLOCKS = ["RSI", "MACD", "CONSEC"]
+WEIGHT_KEYS = [
+    "w_buy_rsi", "w_buy_macd", "w_buy_consec",
+    "w_sell_rsi", "w_sell_macd", "w_sell_consec",
+]
+
+WEIGHT_MUT_RATE = 0.35
+PARAM_MUT_RATE = 0.08
+WEIGHT_MUT_SIGMA = 0.06
+
 BLOCKS = {
     "RSI": ["rsi_period", "rsi_oversold", "rsi_overbought"],
     "MACD": ["macd_fast", "macd_slow", "macd_signal"],
@@ -2033,6 +2093,12 @@ BLOCKS = {
     ],
     "CONF": ["buy_th", "sell_th"],
 }
+
+def mutate_weights(child: dict, *, sigma: float = WEIGHT_MUT_SIGMA):
+    chosen = random.sample(WEIGHT_KEYS, k=random.choice([1, 2]))
+    for key in chosen:
+        child[key] = clamp_weight(child[key] + random.gauss(0, sigma))
+    apply_weight_constraints(child)
 
 
 def mutate_block(child, space: ParamSpace, block_name: str, strength: float):
@@ -2062,12 +2128,7 @@ def mutate_block(child, space: ParamSpace, block_name: str, strength: float):
         child[gk] = space.quantize(gk, child[gk])
 
     if block_name == "WEIGHTS":
-        child["w_buy_rsi"], child["w_buy_macd"], child["w_buy_consec"] = normalize3_safe(
-            child["w_buy_rsi"], child["w_buy_macd"], child["w_buy_consec"]
-        )
-        child["w_sell_rsi"], child["w_sell_macd"], child["w_sell_consec"] = normalize3_safe(
-            child["w_sell_rsi"], child["w_sell_macd"], child["w_sell_consec"]
-        )
+        apply_weight_constraints(child)
 
     if block_name == "MACD":
         if child["macd_slow"] <= child["macd_fast"]:
@@ -2079,84 +2140,59 @@ def make_child_blocky(
     space: ParamSpace,
     p1: Genome,
     p2: Genome,
-    mut_rate: float,
-    max_blocks_per_child: int,
-    forced_blocks: Optional[list[str]] = None,
-    strength: float = 0.8,
-    allowed_blocks: Optional[list[str]] = None,
+    param_block: Optional[str],
+    *,
+    param_mut_rate: float = PARAM_MUT_RATE,
+    weight_mut_rate: float = WEIGHT_MUT_RATE,
+    weight_sigma: float = WEIGHT_MUT_SIGMA,
+    strength: float = 0.55,
     return_meta: bool = False,
 ):
     d1 = asdict(p1)
     d2 = asdict(p2)
-    child = {}
+    child = {k: d1[k] if random.random() < 0.5 else d2[k] for k in d1}
 
-    for k in d1:
-        child[k] = d1[k] if random.random() < 0.5 else d2[k]
-
-    mutated = False
     mutated_blocks = []
     mutated_genes = []
     mutation_type = "copiado"
 
-    if random.random() < mut_rate:
-        block_names = allowed_blocks if allowed_blocks else list(BLOCKS.keys())
-        random.shuffle(block_names)
+    pre_mutation = child.copy()
 
-        chosen = []
-        if forced_blocks:
-            chosen = [
-                bn for bn in forced_blocks
-                if bn in BLOCKS and (allowed_blocks is None or bn in allowed_blocks)
-            ]
-        else:
-            need = random.randint(1, max_blocks_per_child)
-            for bn in block_names:
-                if bn in chosen:
-                    continue
-                chosen.append(bn)
-                if len(chosen) >= need:
-                    break
+    if random.random() < weight_mut_rate:
+        mutate_weights(child, sigma=weight_sigma)
+        mutated_weight_genes = [k for k in WEIGHT_KEYS if child[k] != pre_mutation[k]]
+        if mutated_weight_genes:
+            mutated_blocks.append("WEIGHTS")
+            mutated_genes.extend(mutated_weight_genes)
 
-        if chosen:
-            if forced_blocks:
-                eff_strength = strength
+    if param_block and random.random() < param_mut_rate:
+        before = child.copy()
+        mutate_block(child, space, param_block, strength=strength)
+        if not any(child[g] != before[g] for g in BLOCKS[param_block]):
+            gk = random.choice(BLOCKS[param_block])
+            spec = space.spec[gk]
+            lo, hi, tp = spec["min"], spec["max"], spec["type"]
+            if tp == "int":
+                current = int(child[gk])
+                options = [v for v in range(int(lo), int(hi) + 1, int(spec["step"])) if v != current]
+                if options:
+                    child[gk] = random.choice(options)
             else:
-                multi_factor = 1.0 + 0.4 * max(0, len(chosen) - 1)
-                eff_strength = min(1.8, strength * multi_factor)
-            pre_mutation = child.copy()
-            for bn in chosen:
-                mutate_block(child, space, bn, strength=eff_strength)
-                if not any(child[g] != pre_mutation[g] for g in BLOCKS[bn]):
-                    gk = random.choice(BLOCKS[bn])
-                    spec = space.spec[gk]
-                    lo, hi, tp = spec["min"], spec["max"], spec["type"]
-                    if tp == "int":
-                        current = int(child[gk])
-                        options = [v for v in range(int(lo), int(hi) + 1, int(spec["step"])) if v != current]
-                        if options:
-                            child[gk] = random.choice(options)
-                    else:
-                        current = float(child[gk])
-                        new_val = lo + (hi - lo) * random.random()
-                        if abs(new_val - current) < 1e-9:
-                            new_val = lo if abs(lo - current) > abs(hi - current) else hi
-                        child[gk] = space.quantize(gk, new_val)
-                mutated_blocks.append(bn)
-                mutated_genes.extend(BLOCKS[bn])
-            mutated_genes = [g for g in mutated_genes if child[g] != pre_mutation[g]]
-            mutated_blocks = [
-                bn for bn in mutated_blocks
-                if any(child[g] != pre_mutation[g] for g in BLOCKS[bn])
-            ]
-            mutated = len(mutated_genes) > 0
-            if mutated:
-                if forced_blocks:
-                    mutation_type = "mutado_completo" if len(mutated_blocks) == len(forced_blocks) else "mutado_parcial"
-                else:
-                    mutation_type = "mutado_completo" if len(mutated_blocks) >= max_blocks_per_child else "mutado_parcial"
+                current = float(child[gk])
+                new_val = lo + (hi - lo) * random.random()
+                if abs(new_val - current) < 1e-9:
+                    new_val = lo if abs(lo - current) > abs(hi - current) else hi
+                child[gk] = space.quantize(gk, new_val)
+        mutated_param_genes = [g for g in BLOCKS[param_block] if child[g] != before[g]]
+        if mutated_param_genes:
+            mutated_blocks.append(param_block)
+            mutated_genes.extend(mutated_param_genes)
 
-    ge = Genome(**child)
-    ge = space.clamp_genome(ge)
+    mutated = len(mutated_genes) > 0
+    if mutated:
+        mutation_type = "mutado"
+
+    ge = space.clamp_genome(Genome(**child))
     if return_meta:
         all_genes = set(space.spec.keys())
         mutated_genes_set = set(mutated_genes)
@@ -2223,7 +2259,6 @@ def run_ga(
     return_population: bool = False,
 ):
     GA_DASHBOARD_MODE = False
-    is_weight_opt = False
     fee_per_side = cfg.fee_side * cfg.fee_mult
     slip_per_side = cfg.slip_side
 
@@ -2251,9 +2286,11 @@ def run_ga(
     prev_best_hash = None
     stuck = 0
     prev_best_hash = None
-    active_mask_blocks = None
-    recent_masks = deque(maxlen=7)
-    schedule_blocks = allowed_blocks if allowed_blocks else list(BLOCKS.keys())
+    active_param_block = None
+    recent_blocks = deque(maxlen=7)
+    param_blocks = [b for b in (allowed_blocks or PARAM_BLOCKS) if b in PARAM_BLOCKS]
+    if not param_blocks:
+        param_blocks = PARAM_BLOCKS[:]
 
     def strength_for_combo(count: int) -> float:
         if count <= 1:
@@ -2306,17 +2343,14 @@ def run_ga(
         for gene in sorted(mutation_counter.keys()):
             print(f"{gene}={mutation_counter[gene]}")
 
-    def pick_random_mask() -> list[str]:
-        if not schedule_blocks:
-            return []
+    def pick_random_block() -> Optional[str]:
+        if not param_blocks:
+            return None
         while True:
-            max_blocks = min(3, len(schedule_blocks))
-            count = random.choice([1, 2, 3][:max_blocks])
-            blocks = random.sample(schedule_blocks, count)
-            mask_key = tuple(sorted(blocks))
-            if mask_key not in recent_masks:
-                recent_masks.append(mask_key)
-                return list(mask_key)
+            block = random.choice(param_blocks)
+            if block not in recent_blocks:
+                recent_blocks.append(block)
+                return block
 
     total_gens = cfg.generations
     for gen in range(1, total_gens + 1):
@@ -2360,7 +2394,7 @@ def run_ga(
             best_global = (best_score, copy.deepcopy(best_ge))
             best_metrics = best_m
             stuck = 0
-            active_mask_blocks = None
+            active_param_block = None
         else:
             stuck += 1
             if is_weight_opt:
@@ -2408,20 +2442,19 @@ def run_ga(
         if stuck >= BLOCK_STUCK_LIMIT:
             mask_saturated = True
 
-        if active_mask_blocks is None:
-            active_mask_blocks = pick_random_mask()
-            print(f"[BLOQUE] activos: {' + '.join(active_mask_blocks)} | gens={BLOCK_STUCK_LIMIT}", flush=True)
+        if active_param_block is None:
+            active_param_block = pick_random_block()
+            print(f"[BLOQUE] activo: {active_param_block} | pesos siempre mutan | gens={BLOCK_STUCK_LIMIT}", flush=True)
         elif mask_saturated:
-            prev_mask = active_mask_blocks
-            active_mask_blocks = pick_random_mask()
+            active_param_block = pick_random_block()
             print("[INFO] Bloque sin mejora -> cambiando bloque", flush=True)
-            print(f"[BLOQUE] activos: {' + '.join(active_mask_blocks)} | gens={BLOCK_STUCK_LIMIT}", flush=True)
+            print(f"[BLOQUE] activo: {active_param_block} | pesos siempre mutan | gens={BLOCK_STUCK_LIMIT}", flush=True)
             stuck = 0
 
         if DEBUG_FULL_POPULATION:
             print(
                 f"===== GENERACION {gen_display} | POP_SIZE={len(pop)} | "
-                f"BLOQUE(S) ACTIVOS: {active_mask_blocks} ====="
+                f"BLOQUE ACTIVO: {active_param_block} (pesos siempre mutan) ====="
             )
 
         extra_cov = []
@@ -2432,21 +2465,17 @@ def run_ga(
         children = []
         child_meta = [] if DEBUG_MUTATION else None
 
-        forced_strength = strength_for_combo(len(active_mask_blocks)) if active_mask_blocks else None
+        forced_strength = strength_for_combo(1) if active_param_block else None
 
         for _ in range(cfg.n_cons):
             p1 = random.choice(pool)
             p2 = random.choice(pool)
-            forced_blocks = active_mask_blocks
             child_result = make_child_blocky(
                 space,
                 p1,
                 p2,
-                mut_rate=1.0,
-                max_blocks_per_child=1,
-                forced_blocks=forced_blocks,
-                strength=forced_strength if active_mask_blocks else 0.55,
-                allowed_blocks=allowed_blocks,
+                param_block=active_param_block,
+                strength=forced_strength if active_param_block else 0.55,
                 return_meta=DEBUG_MUTATION,
             )
             if DEBUG_MUTATION:
@@ -2459,16 +2488,12 @@ def run_ga(
         for _ in range(cfg.n_exp):
             p1 = random.choice(pool)
             p2 = random.choice(pool)
-            forced_blocks = active_mask_blocks
             child_result = make_child_blocky(
                 space,
                 p1,
                 p2,
-                mut_rate=1.0,
-                max_blocks_per_child=2,
-                forced_blocks=forced_blocks,
-                strength=forced_strength if active_mask_blocks else 0.80,
-                allowed_blocks=allowed_blocks,
+                param_block=active_param_block,
+                strength=forced_strength if active_param_block else 0.80,
                 return_meta=DEBUG_MUTATION,
             )
             if DEBUG_MUTATION:
@@ -2481,16 +2506,12 @@ def run_ga(
         for _ in range(cfg.n_wild):
             p1 = random.choice(pool)
             p2 = random.choice(pool)
-            forced_blocks = active_mask_blocks
             child_result = make_child_blocky(
                 space,
                 p1,
                 p2,
-                mut_rate=1.0,
-                max_blocks_per_child=2,
-                forced_blocks=forced_blocks,
-                strength=forced_strength if active_mask_blocks else 1.00,
-                allowed_blocks=allowed_blocks,
+                param_block=active_param_block,
+                strength=forced_strength if active_param_block else 1.00,
                 return_meta=DEBUG_MUTATION,
             )
             if DEBUG_MUTATION:
@@ -2564,11 +2585,8 @@ def run_ga(
                     space,
                     ge,
                     ge,
-                    mut_rate=1.0,
-                    max_blocks_per_child=1,
-                    forced_blocks=active_mask_blocks,
-                    strength=forced_strength if active_mask_blocks else 0.80,
-                    allowed_blocks=allowed_blocks,
+                    param_block=active_param_block,
+                    strength=forced_strength if active_param_block else 0.80,
                     return_meta=DEBUG_MUTATION,
                 )
                 if DEBUG_MUTATION:
@@ -2598,11 +2616,8 @@ def run_ga(
                 space,
                 seed,
                 seed,
-                mut_rate=1.0,
-                max_blocks_per_child=1,
-                forced_blocks=active_mask_blocks,
-                strength=forced_strength if active_mask_blocks else 0.80,
-                allowed_blocks=allowed_blocks,
+                param_block=active_param_block,
+                strength=forced_strength if active_param_block else 0.80,
                 return_meta=DEBUG_MUTATION,
             )
             if DEBUG_MUTATION:
@@ -2654,7 +2669,7 @@ def run_ga_params_only(
         stop_flag=stop_flag,
         log_fn=log_fn,
         postprocess_fn=freeze_fn,
-        allowed_blocks=["RSI", "MACD", "CONSEC", "RISK"],
+        allowed_blocks=PARAM_BLOCKS,
         initial_population=initial_population,
         gen_offset=gen_offset,
         return_population=return_population,
