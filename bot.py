@@ -846,6 +846,53 @@ class SpotBot:
             return None
         return self._place_market_sell_qty(qty, reason="MANUAL_SELL")
 
+    def manual_buy_by_quote_pct(self, pct: float) -> Optional[Trade]:
+        usdt_free = get_free_balance(self.client, QUOTE_ASSET)
+        if usdt_free <= 0:
+            self._emit("log", {"msg": "[MANUAL BUY] USDT libre = 0, no compro"})
+            return None
+        target = usdt_free * (pct / 100.0)
+        target = float(target)
+        if target <= 0:
+            self._emit("log", {"msg": "[MANUAL BUY] Porcentaje inválido, no compro"})
+            return None
+        if not DRY_RUN and self.min_notional:
+            price = None
+            try:
+                price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
+            except Exception as e:
+                self._emit("log", {"msg": f"[AVISO] No pude leer precio para compra manual: {e}"})
+            min_quote = self._min_quote_for_notional(price) if price else self.min_notional
+            min_quote = min_quote + BUY_NOTIONAL_BUFFER_USDT if min_quote else self.min_notional
+            if target < min_quote:
+                if usdt_free >= min_quote:
+                    self._emit(
+                        "log",
+                        {
+                            "msg": f"[MANUAL BUY] % muy bajo para minNotional, ajusto a {min_quote:.4f} USDT"
+                        },
+                    )
+                    target = min_quote
+                else:
+                    self._emit(
+                        "log",
+                        {
+                            "msg": f"[MANUAL BUY] USDT libre {usdt_free:.4f} < minNotional {min_quote:.4f}"
+                        },
+                    )
+                    return None
+            else:
+                pass
+        return self._place_market_buy_by_quote(target, reason="MANUAL_BUY")
+
+    def manual_sell_all_base(self) -> Optional[Trade]:
+        sol_free = get_free_balance(self.client, BASE_ASSET)
+        qty = round_step(sol_free, self.step)
+        if qty <= 0:
+            self._emit("log", {"msg": "[MANUAL SELL] No hay SOL libre para vender"})
+            return None
+        return self._place_market_sell_qty(qty, reason="MANUAL_SELL")
+
     def _open_position_from_trade(self, buy_trade: Trade, last_close_time_ms: int):
         ep = buy_trade.price
         qty = buy_trade.qty
@@ -2156,6 +2203,7 @@ def run_ga(
     best_metrics = None
     prev_best_hash = None
     stuck = 0
+    prev_best_hash = None
     active_mask_blocks = None
     recent_masks = deque(maxlen=7)
     schedule_blocks = allowed_blocks if allowed_blocks else list(BLOCKS.keys())
@@ -2255,6 +2303,7 @@ def run_ga(
 
         scored.sort(key=lambda x: x[0], reverse=True)
         best_score, best_ge, best_m = scored[0]
+        best_hash = hash(tuple(asdict(best_ge).items()))
         unique_hashes = {hash(tuple(asdict(ge).items())) for _, ge, _ in scored}
         elite_hashes = [hash(tuple(asdict(ge).items())) for ge in [x[1] for x in scored[:cfg.elite]]]
         elite_unique = len(set(elite_hashes))
@@ -2307,6 +2356,7 @@ def run_ga(
             f"PF={best_m.pf:.2f} | DD={best_m.dd_pct:.1f} | unique={len(unique_hashes)}",
             flush=True,
         )
+        prev_best_hash = best_hash
         mask_saturated = False
         if stuck >= BLOCK_STUCK_LIMIT:
             mask_saturated = True
