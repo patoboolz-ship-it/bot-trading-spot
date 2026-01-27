@@ -17,6 +17,7 @@ Seguridad:
 """
 
 import os
+import sys
 import time
 import math
 import json
@@ -925,6 +926,8 @@ class SpotBot:
                     time.sleep(2)
                     continue
                 last_seen_close_time = close_time
+                close_time_utc = datetime.fromtimestamp(close_time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                self._emit("log", {"msg": f"[VELA] Nueva vela cerrada {close_time_utc} close={last_close:.4f}"})
 
                 bScore, sScore, score_close = compute_scores(self.params, candles)
                 last_close = score_close
@@ -2151,6 +2154,7 @@ def run_ga(
 
     best_global = None
     best_metrics = None
+    prev_best_hash = None
     stuck = 0
     active_mask_blocks = None
     recent_masks = deque(maxlen=7)
@@ -2224,8 +2228,27 @@ def run_ga(
         if stop_flag():
             return best_global, best_metrics
 
+        if is_weight_opt:
+            weight_attempts = 0
+            weight_unique = 0
+
         scored = []
-        for ge in pop:
+        for idx, ge in enumerate(pop):
+            if is_weight_opt:
+                attempts = 0
+                while attempts < MAX_WEIGHT_ATTEMPTS:
+                    weight_attempts += 1
+                    weight_key = tuple(getattr(ge, g) for g in BLOCKS["CONF"])
+                    if weight_key not in weight_hashes:
+                        weight_hashes.add(weight_key)
+                        weight_unique += 1
+                        pop[idx] = ge
+                        break
+                    attempts += 1
+                    ge = _refresh_weight_genome(ge)
+                if attempts >= MAX_WEIGHT_ATTEMPTS:
+                    scored.append((-1e12, ge, _empty_metrics()))
+                    continue
             m = simulate_spot(candles, ge, fee_per_side, slip_per_side)
             score = fitness_from_metrics(m, cfg)
             scored.append((score, ge, m))
@@ -2244,6 +2267,39 @@ def run_ga(
             active_mask_blocks = None
         else:
             stuck += 1
+            if is_weight_opt:
+                weight_no_improve += 1
+
+        gen_display = gen + gen_offset
+        if not GA_DASHBOARD_MODE:
+            log_fn(
+                f"[GEN {gen_display}] score={best_score:.4f} PF={best_m.pf:.2f} "
+                f"trades={best_m.trades} tpy={best_m.trades_per_year:.1f} "
+                f"DD={best_m.dd_pct:.2f}% net={best_m.net:.4f} | "
+                f"ganancia={best_m.profit:.2f} balance={best_m.balance:.2f} | "
+                f"wr={best_m.winrate:.1f}% | "
+                f"HA={best_ge.use_ha} RSI(p={best_ge.rsi_period},os={best_ge.rsi_oversold:.0f},ob={best_ge.rsi_overbought:.0f}) | "
+                f"MACD({best_ge.macd_fast},{best_ge.macd_slow},{best_ge.macd_signal}) | "
+                f"consec(R={best_ge.consec_red},G={best_ge.consec_green}) | "
+                f"TP={best_ge.take_profit:.3f} SL={best_ge.stop_loss:.3f} cd={best_ge.cooldown} edge={best_ge.edge_trigger} | "
+                f"buy_th={best_ge.buy_th:.2f} sell_th={best_ge.sell_th:.2f} | "
+                f"Wbuy({best_ge.w_buy_rsi:.2f},{best_ge.w_buy_macd:.2f},{best_ge.w_buy_consec:.2f}) "
+                f"Wsell({best_ge.w_sell_rsi:.2f},{best_ge.w_sell_macd:.2f},{best_ge.w_sell_consec:.2f})"
+            )
+            log_fn(
+                f"[DBG] uniq={len(unique_hashes)} elite_unique={elite_unique} "
+                f"best_hash={best_hash} repeated={best_hash == prev_best_hash}"
+            )
+        prev_best_hash = best_hash
+        if is_weight_opt:
+            print(
+                f"[WEIGHT-OPT] gen={gen_display} | attempts={weight_attempts} | "
+                f"unique={weight_unique} | best_score={best_score}",
+                flush=True,
+            )
+            if weight_no_improve >= WEIGHT_NO_IMPROVE_LIMIT:
+                print("[INFO] Weight optimizer: no improvement → exit", flush=True)
+                break
 
         gen_display = gen + gen_offset
         print(
@@ -2541,6 +2597,8 @@ class OptimizerGUI:
         self.var_trade_floor = tk.IntVar(value=120)
         self.var_pen_missing = tk.DoubleVar(value=0.35)
 
+        self.var_opt_mode = tk.StringVar(value="Ambos")
+
         self.space = self.build_space_defaults()
         self.build_ui()
 
@@ -2629,6 +2687,11 @@ class OptimizerGUI:
         add_labeled(fit, "DD weight:", self.var_dd_w, 6)
         add_labeled(fit, "Trade floor:", self.var_trade_floor, 8)
         add_labeled(fit, "Pen/trade falt.:", self.var_pen_missing, 8)
+
+        mode = ttk.LabelFrame(frm, text="Modo de optimización")
+        mode.pack(fill="x", padx=pad, pady=pad)
+        for text in ("Optimizar Parámetros", "Ambos"):
+            ttk.Radiobutton(mode, text=text, variable=self.var_opt_mode, value=text).pack(side="left", padx=8)
 
         ranges = ttk.LabelFrame(frm, text="Rangos (min / max / step)")
         ranges.pack(fill="both", expand=False, padx=pad, pady=pad)
