@@ -77,6 +77,8 @@ JOURNAL_CSV = "bot_journal.csv"
 # Debug de mutaciones (GA)
 DEBUG_MUTATION = False
 DEBUG_FULL_POPULATION = False
+DEBUG_GA_PROGRESS = True
+GA_PROGRESS_EVERY = 25
 
 BLOCK_STUCK_LIMIT = 5
 
@@ -908,6 +910,41 @@ class SpotBot:
 
         except BinanceAPIException as e:
             self._emit("log", {"msg": f"[ERROR] Error de Binance al vender: {e}"})
+            return None
+        if not DRY_RUN and self.min_notional:
+            price = None
+            try:
+                price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
+            except Exception as e:
+                self._emit("log", {"msg": f"[AVISO] No pude leer precio para compra manual: {e}"})
+            min_quote = self._min_quote_for_notional(price) if price else self.min_notional
+            min_quote = min_quote + BUY_NOTIONAL_BUFFER_USDT if min_quote else self.min_notional
+            if target < min_quote:
+                if usdt_free >= min_quote:
+                    self._emit(
+                        "log",
+                        {
+                            "msg": f"[MANUAL BUY] % muy bajo para minNotional, ajusto a {min_quote:.4f} USDT"
+                        },
+                    )
+                    target = min_quote
+                else:
+                    self._emit(
+                        "log",
+                        {
+                            "msg": f"[MANUAL BUY] USDT libre {usdt_free:.4f} < minNotional {min_quote:.4f}"
+                        },
+                    )
+                    return None
+            else:
+                pass
+        return self._place_market_buy_by_quote(target, reason="MANUAL_BUY")
+
+    def manual_sell_all_base(self) -> Optional[Trade]:
+        sol_free = get_free_balance(self.client, BASE_ASSET)
+        qty = round_step(sol_free, self.step)
+        if qty <= 0:
+            self._emit("log", {"msg": "[MANUAL SELL] No hay SOL libre para vender"})
             return None
         return self._place_market_sell_qty(qty, reason="MANUAL_SELL")
 
@@ -2405,31 +2442,21 @@ def run_ga(
         if stop_flag():
             return best_global, best_metrics
 
-        if is_weight_opt:
-            weight_attempts = 0
-            weight_unique = 0
-
+        gen_display = gen + gen_offset
+        gen_start = time.perf_counter()
         scored = []
-        for idx, ge in enumerate(pop):
-            if is_weight_opt:
-                attempts = 0
-                while attempts < MAX_WEIGHT_ATTEMPTS:
-                    weight_attempts += 1
-                    weight_key = tuple(getattr(ge, g) for g in BLOCKS["CONF"])
-                    if weight_key not in weight_hashes:
-                        weight_hashes.add(weight_key)
-                        weight_unique += 1
-                        pop[idx] = ge
-                        break
-                    attempts += 1
-                    ge = _refresh_weight_genome(ge)
-                if attempts >= MAX_WEIGHT_ATTEMPTS:
-                    scored.append((-1e12, ge, _empty_metrics()))
-                    continue
+        for idx, ge in enumerate(pop, start=1):
+            if DEBUG_GA_PROGRESS and idx % GA_PROGRESS_EVERY == 0:
+                elapsed = time.perf_counter() - gen_start
+                print(
+                    f"[GA] GEN {gen_display} progreso {idx}/{len(pop)} | elapsed={elapsed:.1f}s",
+                    flush=True,
+                )
             m = simulate_spot(candles, ge, fee_per_side, slip_per_side)
             score = fitness_from_metrics(m, cfg)
             scored.append((score, ge, m))
 
+        eval_elapsed = time.perf_counter() - gen_start
         scored.sort(key=lambda x: x[0], reverse=True)
         best_score, best_ge, best_m = scored[0]
         best_hash = hash(tuple(asdict(best_ge).items()))
@@ -2479,12 +2506,13 @@ def run_ga(
                 print("[INFO] Weight optimizer: no improvement → exit", flush=True)
                 break
 
-        gen_display = gen + gen_offset
         print(
             f"GEN {gen_display} | best_score={best_score:.4f} | net={best_m.net:.4f} | "
             f"PF={best_m.pf:.2f} | DD={best_m.dd_pct:.1f} | unique={len(unique_hashes)}",
             flush=True,
         )
+        if DEBUG_GA_PROGRESS:
+            print(f"[GA] GEN {gen_display} eval_time={eval_elapsed:.1f}s", flush=True)
         prev_best_hash = best_hash
         mask_saturated = False
         if stuck >= BLOCK_STUCK_LIMIT:
