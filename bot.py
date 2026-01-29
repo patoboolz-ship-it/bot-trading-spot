@@ -3,7 +3,6 @@
 
 """
 BOT SPOT Binance - RSI + MACD + Consecutivas (con HA opcional) + GUI + Excel
-- Solo LONG: compra y cierra (venta para cerrar)
 - Señales SOLO con vela cerrada (evita repaint intrabar)
 - Compra con 98% USDT libre, aunque tengas "polvo" SOL
 - Verifica compra: gasto >= 90% de lo objetivo; si no, reintenta
@@ -22,7 +21,11 @@ import time
 import math
 import json
 import random
+import statistics
+import copy
 import threading
+import traceback
+from collections import deque
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 
@@ -33,6 +36,9 @@ from binance.exceptions import BinanceAPIException
 import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 from typing import Optional
+
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
 import requests
 
 
@@ -66,6 +72,28 @@ DRY_RUN = True
 
 # Logs / journal
 JOURNAL_CSV = "bot_journal.csv"
+
+# Debug de mutaciones (GA)
+DEBUG_MUTATION = False
+DEBUG_FULL_POPULATION = False
+DEBUG_GA_PROGRESS = True
+GA_PROGRESS_EVERY = 25
+GA_INDIVIDUAL_WARN_S = 5.0
+
+BLOCK_STUCK_LIMIT = 5
+
+# Capital inicial para reportes de optimización
+START_CAPITAL = 100000.0
+
+# Red / Binance
+BINANCE_TIMEOUT_SEC = 30
+BINANCE_MAX_RETRIES = 3
+BINANCE_RETRY_BACKOFF_SEC = 1.5
+SELL_NOTIONAL_BUFFER_USDT = 1.0
+BUY_NOTIONAL_BUFFER_USDT = 1.0
+RECONNECT_MAX_RETRIES = 5
+RECONNECT_BACKOFF_SEC = 2.0
+GUI_CONNECT_RETRY_SEC = 5.0
 
 
 # =========================
@@ -105,6 +133,15 @@ def read_key(path: str) -> str:
         return f.read().strip()
 
 
+def normalize_tp_sl(tp_input: float, sl_input: float) -> tuple[float, float]:
+    # [TP/SL ABS NORMALIZATION] magnitudes only (no signo)
+    tp_pct = abs(float(tp_input))
+    sl_pct = abs(float(sl_input))
+    if tp_pct >= 1.0 or sl_pct >= 1.0:
+        raise ValueError("TP/SL inválido: porcentaje debe ser < 1 (100%).")
+    return tp_pct, sl_pct
+
+
 # =========================
 # Dataclasses
 # =========================
@@ -119,6 +156,13 @@ class Trade:
     quote_spent: float    # USDT
     time_utc: str
     reason: str           # SIGNAL / TP / SL / CLOSE
+    entry_price: float = 0.0
+    tp_pct: float = 0.0
+    sl_pct: float = 0.0
+    tp_price: float = 0.0
+    sl_price: float = 0.0
+    pnl_pct_real: float = 0.0
+    pnl_usdt_real: float = 0.0
     order_id: str = ""
     raw: str = ""
 
@@ -128,9 +172,12 @@ class Position:
     symbol: str
     qty: float
     entry_price: float
+    entry_quote_spent: float
     entry_time_utc: str
-    tp_price: float
-    sl_price: float
+    tp_price: Optional[float]
+    sl_price: Optional[float]
+    tp_pct: float
+    sl_pct: float
 
 
 # =========================
@@ -281,46 +328,168 @@ def normalize3(a,b,c):
         return (1/3,1/3,1/3)
     return (a/s, b/s, c/s)
 
+def normalize3_safe(a: float, b: float, c: float):
+    a = max(0.0, a)
+    b = max(0.0, b)
+    c = max(0.0, c)
+    s = a + b + c
+    if s <= 1e-12:
+        r1, r2, r3 = random.random(), random.random(), random.random()
+        s = r1 + r2 + r3
+        return (r1 / s, r2 / s, r3 / s)
+    return (a / s, b / s, c / s)
+
+WEIGHT_MIN = 0.05
+WEIGHT_MAX = 0.90
+
+def clamp_weight(value: float, min_w: float = WEIGHT_MIN, max_w: float = WEIGHT_MAX) -> float:
+    return max(min_w, min(max_w, value))
+
+def normalize3_clamped(a: float, b: float, c: float, min_w: float = WEIGHT_MIN, max_w: float = WEIGHT_MAX):
+    a = clamp_weight(a, min_w, max_w)
+    b = clamp_weight(b, min_w, max_w)
+    c = clamp_weight(c, min_w, max_w)
+    s = a + b + c
+    if s <= 1e-12:
+        return (1 / 3, 1 / 3, 1 / 3)
+    return (a / s, b / s, c / s)
+
+def apply_weight_constraints(child: dict):
+    child["w_buy_rsi"], child["w_buy_macd"], child["w_buy_consec"] = normalize3_clamped(
+        child["w_buy_rsi"], child["w_buy_macd"], child["w_buy_consec"]
+    )
+    child["w_sell_rsi"], child["w_sell_macd"], child["w_sell_consec"] = normalize3_clamped(
+        child["w_sell_rsi"], child["w_sell_macd"], child["w_sell_consec"]
+    )
+
+def score_components_at_index(
+    close: list,
+    rsi_arr: list,
+    mh_arr: list,
+    i: int,
+    *,
+    rsi_oversold: float,
+    rsi_overbought: float,
+    consec_red: int,
+    consec_green: int,
+    edge_trigger: int,
+    w_buy_rsi: float,
+    w_buy_macd: float,
+    w_buy_consec: float,
+    w_sell_rsi: float,
+    w_sell_macd: float,
+    w_sell_consec: float,
+) -> dict:
+    """
+    Ecuación (fuente de verdad):
+
+    BUY_SCORE  = Wbuy_rsi * RSI_buy + Wbuy_macd * MACD_buy + Wbuy_consec * CONSEC_buy
+    SELL_SCORE = Wsell_rsi * RSI_sell + Wsell_macd * MACD_sell + Wsell_consec * CONSEC_sell
+
+    Donde las señales están en rango 0..1 y los pesos se normalizan para sumar 1.
+    """
+    rsi_val = rsi_arr[i]
+    mh = mh_arr[i]
+    mh_prev = mh_arr[i - 1] if i > 0 else mh
+
+    buy_rsi = buy_rsi_signal(rsi_val, rsi_oversold, rsi_overbought)
+    sell_rsi = sell_rsi_signal(rsi_val, rsi_oversold, rsi_overbought)
+    buy_macd = buy_macd_signal(mh, mh_prev, edge_trigger)
+    sell_macd = sell_macd_signal(mh, mh_prev, edge_trigger)
+    buy_consec = consec_up(close[: i + 1], consec_green)
+    sell_consec = consec_down(close[: i + 1], consec_red)
+
+    wbr, wbm, wbc = normalize3(w_buy_rsi, w_buy_macd, w_buy_consec)
+    wsr, wsm, wsc = normalize3(w_sell_rsi, w_sell_macd, w_sell_consec)
+
+    buy_score = wbr * buy_rsi + wbm * buy_macd + wbc * buy_consec
+    sell_score = wsr * sell_rsi + wsm * sell_macd + wsc * sell_consec
+
+    return {
+        "buy_score": buy_score,
+        "sell_score": sell_score,
+        "signals": {
+            "buy_rsi": buy_rsi,
+            "buy_macd": buy_macd,
+            "buy_consec": buy_consec,
+            "sell_rsi": sell_rsi,
+            "sell_macd": sell_macd,
+            "sell_consec": sell_consec,
+        },
+    }
+
+
+def compute_score_snapshot_from_params(params: dict, candles: list, index: Optional[int] = None):
+    """
+    Calcula scores y señales usando los parámetros del bot (dict).
+    """
+    use_ha = int(params["use_ha"]) == 1
+    edge = int(params["edge_trigger"])
+
+    src = heikin_ashi(candles) if use_ha else candles
+    close = [c["close"] for c in src]
+
+    rsi_period = int(params["rsi_period"])
+    rsi_vals = rsi(close, rsi_period)
+    hist = macd_hist(close, int(params["macd_fast"]), int(params["macd_slow"]), int(params["macd_signal"]))
+
+    idx = len(close) - 1 if index is None else int(index)
+    payload = score_components_at_index(
+        close,
+        rsi_vals,
+        hist,
+        idx,
+        rsi_oversold=float(params["rsi_oversold"]),
+        rsi_overbought=float(params["rsi_overbought"]),
+        consec_red=int(params["consec_red"]),
+        consec_green=int(params["consec_green"]),
+        edge_trigger=edge,
+        w_buy_rsi=float(params["w_buy_rsi"]),
+        w_buy_macd=float(params["w_buy_macd"]),
+        w_buy_consec=float(params["w_buy_consec"]),
+        w_sell_rsi=float(params["w_sell_rsi"]),
+        w_sell_macd=float(params["w_sell_macd"]),
+        w_sell_consec=float(params["w_sell_consec"]),
+    )
+    return payload, close[idx]
+
+
+def compute_score_snapshot_from_genome(ge: "Genome", candles: list, index: Optional[int] = None):
+    """
+    Calcula scores y señales usando un Genome (simulador/GA).
+    """
+    data = heikin_ashi(candles) if ge.use_ha == 1 else candles
+    close = [c["close"] for c in data]
+    rsi_arr = rsi(close, ge.rsi_period)
+    mh_arr = macd_hist(close, ge.macd_fast, ge.macd_slow, ge.macd_signal)
+    idx = len(close) - 1 if index is None else int(index)
+    payload = score_components_at_index(
+        close,
+        rsi_arr,
+        mh_arr,
+        idx,
+        rsi_oversold=ge.rsi_oversold,
+        rsi_overbought=ge.rsi_overbought,
+        consec_red=ge.consec_red,
+        consec_green=ge.consec_green,
+        edge_trigger=ge.edge_trigger,
+        w_buy_rsi=ge.w_buy_rsi,
+        w_buy_macd=ge.w_buy_macd,
+        w_buy_consec=ge.w_buy_consec,
+        w_sell_rsi=ge.w_sell_rsi,
+        w_sell_macd=ge.w_sell_macd,
+        w_sell_consec=ge.w_sell_consec,
+    )
+    return payload, close[idx]
+
+
 def compute_scores(params: dict, candles: list):
     """
     candles: list of dict open/high/low/close
     returns (buyScore, sellScore, last_close)
     """
-    use_ha = int(params["use_ha"]) == 1
-    edge = int(params["edge_trigger"])
-
-    if use_ha:
-        src = heikin_ashi(candles)
-    else:
-        src = candles
-
-    close = [c["close"] for c in src]
-
-    rsi_period = int(params["rsi_period"])
-    rsi_vals = rsi(close, rsi_period)
-    rsi_last = rsi_vals[-1]
-
-    hist = macd_hist(close, int(params["macd_fast"]), int(params["macd_slow"]), int(params["macd_signal"]))
-    hist_now = hist[-1]
-    hist_prev = hist[-2] if len(hist) >= 2 else 0.0
-
-    # weights
-    wBR, wBM, wBC = normalize3(float(params["w_buy_rsi"]), float(params["w_buy_macd"]), float(params["w_buy_consec"]))
-    wSR, wSM, wSC = normalize3(float(params["w_sell_rsi"]), float(params["w_sell_macd"]), float(params["w_sell_consec"]))
-
-    b = (
-        wBR * buy_rsi_signal(rsi_last, float(params["rsi_oversold"]), float(params["rsi_overbought"])) +
-        wBM * buy_macd_signal(hist_now, hist_prev, edge) +
-        wBC * consec_up(close, int(params["consec_green"]))
-    )
-
-    s = (
-        wSR * sell_rsi_signal(rsi_last, float(params["rsi_oversold"]), float(params["rsi_overbought"])) +
-        wSM * sell_macd_signal(hist_now, hist_prev, edge) +
-        wSC * consec_down(close, int(params["consec_red"]))
-    )
-
-    return b, s, close[-1]
+    payload, last_close = compute_score_snapshot_from_params(params, candles)
+    return payload["buy_score"], payload["sell_score"], last_close
 
 
 # =========================
@@ -339,21 +508,42 @@ def get_filters(client: Client, symbol: str):
     tick = None
     step = None
     min_notional = None
+    min_qty = None
     for f in info["filters"]:
         if f["filterType"] == "PRICE_FILTER":
             tick = float(f["tickSize"])
         elif f["filterType"] == "LOT_SIZE":
             step = float(f["stepSize"])
+            min_qty = float(f.get("minQty", 0.0))
         elif f["filterType"] in ("MIN_NOTIONAL", "NOTIONAL"):
             # NOTIONAL aparece en algunos símbolos; usamos minNotional si existe
             min_notional = float(f.get("minNotional", f.get("notional", 0.0)))
-    return tick, step, min_notional
+    return tick, step, min_notional, min_qty
 
 def get_free_balance(client: Client, asset: str) -> float:
     bal = client.get_asset_balance(asset=asset)
     if not bal:
         return 0.0
     return float(bal["free"])
+
+def get_spot_balances(client: Client) -> list[dict]:
+    account = client.get_account()
+    balances = []
+    for bal in account.get("balances", []):
+        free = float(bal.get("free", 0.0))
+        locked = float(bal.get("locked", 0.0))
+        total = free + locked
+        if total > 0:
+            balances.append(
+                {
+                    "asset": bal.get("asset", ""),
+                    "free": free,
+                    "locked": locked,
+                    "total": total,
+                }
+            )
+    balances.sort(key=lambda item: item["asset"])
+    return balances
 
 def fetch_klines_closed(client: Client, symbol: str, interval: str, limit: int):
     """
@@ -391,9 +581,12 @@ class SpotBot:
         self.symbol = symbol
         self.interval = interval
         self.params = params.copy()
+        tp_pct, sl_pct = normalize_tp_sl(self.params.get("take_profit", 0.0), self.params.get("stop_loss", 0.0))
+        self.params["take_profit"] = tp_pct
+        self.params["stop_loss"] = sl_pct
         self.ui_cb = ui_cb  # callback para UI
 
-        self.tick, self.step, self.min_notional = get_filters(client, symbol)
+        self.tick, self.step, self.min_notional, self.min_qty = get_filters(client, symbol)
 
         self.running = False
         self.thread = None
@@ -437,6 +630,7 @@ class SpotBot:
         self.running = False
 
     def export_excel(self, path: str):
+        # [EXCEL EXPORT] incluye entry_price, tp/sl, y PNL con signo
         open_rows = [asdict(t) for t in self.open_trades]
         closed_rows = [asdict(t) for t in self.closed_trades]
         df_open = pd.DataFrame(open_rows)
@@ -447,6 +641,43 @@ class SpotBot:
 
     def _now_utc(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+
+    def _retry_connection(self) -> bool:
+        self._emit("net", {"status": "reconnecting"})
+        cycle = 1
+        while self.running:
+            for attempt in range(1, RECONNECT_MAX_RETRIES + 1):
+                if not self.running:
+                    self._emit("net", {"status": "offline"})
+                    return False
+                try:
+                    self.client.ping()
+                    self._emit("net", {"status": "online"})
+                    self._emit(
+                        "log",
+                        {
+                            "msg": (
+                                f"[NET] Reconexion OK (ciclo {cycle}, intento "
+                                f"{attempt}/{RECONNECT_MAX_RETRIES})"
+                            )
+                        },
+                    )
+                    return True
+                except Exception as e:
+                    wait_s = RECONNECT_BACKOFF_SEC * attempt
+                    self._emit(
+                        "log",
+                        {
+                            "msg": (
+                                f"[NET] Reintentando conexion (ciclo {cycle}) "
+                                f"{attempt}/{RECONNECT_MAX_RETRIES} en {wait_s:.1f}s: {e}"
+                            )
+                        },
+                    )
+                    time.sleep(wait_s)
+            cycle += 1
+        self._emit("net", {"status": "offline"})
+        return False
 
     def _cooldown_ok(self, last_closed_close_time: int) -> bool:
         cd = int(self.params["cooldown"])
@@ -469,6 +700,15 @@ class SpotBot:
         }
         return mapping.get(interval, 3600)
 
+    def _min_quote_for_notional(self, price: float) -> Optional[float]:
+        if not self.min_notional or not price or price <= 0:
+            return None
+        step = self.step if self.step else 0.0
+        if step <= 0:
+            return self.min_notional
+        qty_min = math.ceil((self.min_notional / price) / step) * step
+        return qty_min * price
+
     def _place_market_buy_by_quote(self, quote_amount: float, reason: str):
         """
         Compra gastando quote_amount USDT (aprox).
@@ -478,17 +718,28 @@ class SpotBot:
         if quote_amount <= 0:
             return None
 
-        if self.min_notional and quote_amount < self.min_notional:
-            self._emit("log", {"msg": f"[BUY] quote {quote_amount:.4f} < minNotional {self.min_notional:.4f} -> no compro"})
-            return None
-
         if DRY_RUN:
             # Simulación simple: asumimos ejecución a precio actual
             price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
             qty = quote_amount / price
             qty = round_step(qty, self.step)
             if qty <= 0:
+                self._emit("log", {"msg": "[BUY] qty calculada <= 0 en simulación"})
                 return None
+            if self.min_notional and quote_amount < self.min_notional:
+                self._emit(
+                    "log",
+                    {
+                        "msg": f"[BUY] (DRY_RUN) quote {quote_amount:.4f} < minNotional {self.min_notional:.4f} -> simulo igual"
+                    },
+                )
+            if self.min_qty and qty < self.min_qty:
+                self._emit(
+                    "log",
+                    {
+                        "msg": f"[BUY] (DRY_RUN) qty {qty:.8f} < minQty {self.min_qty:.8f} -> simulo igual"
+                    },
+                )
             trade = Trade(
                 trade_id=f"SIMBUY-{int(time.time())}",
                 symbol=self.symbol,
@@ -502,6 +753,37 @@ class SpotBot:
                 raw=""
             )
             return trade
+
+        price = None
+        try:
+            price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
+        except Exception as e:
+            self._emit("log", {"msg": f"[AVISO] No pude leer precio para validar compra: {e}"})
+
+        if self.min_notional:
+            min_quote = self._min_quote_for_notional(price) if price else self.min_notional
+            min_quote = min_quote + BUY_NOTIONAL_BUFFER_USDT if min_quote else self.min_notional
+            if quote_amount < min_quote:
+                self._emit(
+                    "log",
+                    {
+                        "msg": (
+                            f"[BUY] quote {quote_amount:.4f} < minNotional+buffer {min_quote:.4f} -> no compro"
+                        )
+                    },
+                )
+                return None
+
+        if self.min_qty and price:
+            est_qty = quote_amount / price
+            if est_qty < self.min_qty:
+                self._emit(
+                    "log",
+                    {
+                        "msg": f"[BUY] qty estimada {est_qty:.8f} < minQty {self.min_qty:.8f} -> no compro"
+                    },
+                )
+                return None
 
         try:
             order = self.client.create_order(
@@ -536,13 +818,33 @@ class SpotBot:
             return trade
 
         except BinanceAPIException as e:
-            self._emit("log", {"msg": f"[BUY] BinanceAPIException: {e}"})
+            self._emit("log", {"msg": f"[ERROR] Error de Binance al comprar: {e}"})
             return None
 
     def _place_market_sell_qty(self, qty: float, reason: str):
         qty = round_step(qty, self.step)
         if qty <= 0:
             return None
+
+        est_notional = None
+        try:
+            price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
+            est_notional = price * qty
+        except Exception as e:
+            self._emit("log", {"msg": f"[AVISO] No pude estimar notional para venta: {e}"})
+
+        if DRY_RUN:
+            if est_notional is not None and self.min_notional:
+                if est_notional < (self.min_notional + SELL_NOTIONAL_BUFFER_USDT):
+                    self._emit(
+                        "log",
+                        {
+                            "msg": (
+                                "[SELL] (DRY_RUN) notional bajo "
+                                f"{est_notional:.4f} < {self.min_notional + SELL_NOTIONAL_BUFFER_USDT:.4f} -> simulo igual"
+                            )
+                        },
+                    )
 
         if DRY_RUN:
             price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
@@ -559,6 +861,20 @@ class SpotBot:
                 raw=""
             )
             return trade
+
+        if est_notional is not None and self.min_notional:
+            min_required = self.min_notional + SELL_NOTIONAL_BUFFER_USDT
+            if est_notional < min_required:
+                self._emit(
+                    "log",
+                    {
+                        "msg": (
+                            f"[SELL] notional {est_notional:.4f} < {min_required:.4f} "
+                            f"(minNotional+buffer) -> no vendo (dejo dust)"
+                        )
+                    },
+                )
+                return None
 
         try:
             order = self.client.create_order(
@@ -593,23 +909,80 @@ class SpotBot:
             return trade
 
         except BinanceAPIException as e:
-            self._emit("log", {"msg": f"[SELL] BinanceAPIException: {e}"})
+            self._emit("log", {"msg": f"[ERROR] Error de Binance al vender: {e}"})
             return None
+
+    def manual_buy_by_quote_pct(self, pct: float) -> Optional[Trade]:
+        usdt_free = get_free_balance(self.client, QUOTE_ASSET)
+        if usdt_free <= 0:
+            self._emit("log", {"msg": "[MANUAL BUY] USDT libre = 0, no compro"})
+            return None
+        target = usdt_free * (pct / 100.0)
+        target = float(target)
+        if target <= 0:
+            self._emit("log", {"msg": "[MANUAL BUY] Porcentaje inválido, no compro"})
+            return None
+        if not DRY_RUN and self.min_notional:
+            price = None
+            try:
+                price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
+            except Exception as e:
+                self._emit("log", {"msg": f"[AVISO] No pude leer precio para compra manual: {e}"})
+            min_quote = self._min_quote_for_notional(price) if price else self.min_notional
+            min_quote = min_quote + BUY_NOTIONAL_BUFFER_USDT if min_quote else self.min_notional
+            if target < min_quote:
+                if usdt_free >= min_quote:
+                    self._emit(
+                        "log",
+                        {
+                            "msg": f"[MANUAL BUY] % muy bajo para minNotional, ajusto a {min_quote:.4f} USDT"
+                        },
+                    )
+                    target = min_quote
+                else:
+                    self._emit(
+                        "log",
+                        {
+                            "msg": f"[MANUAL BUY] USDT libre {usdt_free:.4f} < minNotional {min_quote:.4f}"
+                        },
+                    )
+                    return None
+            else:
+                pass
+        return self._place_market_buy_by_quote(target, reason="MANUAL_BUY")
+
+    def manual_sell_all_base(self) -> Optional[Trade]:
+        sol_free = get_free_balance(self.client, BASE_ASSET)
+        qty = round_step(sol_free, self.step)
+        if qty <= 0:
+            self._emit("log", {"msg": "[MANUAL SELL] No hay SOL libre para vender"})
+            return None
+        return self._place_market_sell_qty(qty, reason="MANUAL_SELL")
 
     def _open_position_from_trade(self, buy_trade: Trade, last_close_time_ms: int):
         ep = buy_trade.price
         qty = buy_trade.qty
-        tp = ep * (1.0 + float(self.params["take_profit"]))
-        sl = ep * (1.0 - float(self.params["stop_loss"]))
+        tp_pct, sl_pct = normalize_tp_sl(self.params["take_profit"], self.params["stop_loss"])
+        # [TP/SL PRICE CALCULATION] usando magnitudes abs
+        tp = ep * (1.0 + tp_pct) if tp_pct > 0 else None
+        sl = ep * (1.0 - sl_pct) if sl_pct > 0 else None
         self.position = Position(
             symbol=self.symbol,
             qty=qty,
             entry_price=ep,
+            entry_quote_spent=buy_trade.quote_spent,
             entry_time_utc=buy_trade.time_utc,
             tp_price=tp,
-            sl_price=sl
+            sl_price=sl,
+            tp_pct=tp_pct,
+            sl_pct=sl_pct
         )
         self.last_action_bar_close_time = last_close_time_ms
+        buy_trade.entry_price = ep
+        buy_trade.tp_pct = tp_pct
+        buy_trade.sl_pct = sl_pct
+        buy_trade.tp_price = tp or 0.0
+        buy_trade.sl_price = sl or 0.0
         self.open_trades.append(buy_trade)
         self._append_journal(buy_trade)
 
@@ -629,6 +1002,16 @@ class SpotBot:
 
         sell_trade = self._place_market_sell_qty(qty, reason=reason)
         if sell_trade:
+            # [P&L WITH SIGN] resultado real con signo
+            pnl_pct_real = (sell_trade.price - self.position.entry_price) / (self.position.entry_price + 1e-12)
+            pnl_usdt_real = sell_trade.quote_spent - self.position.entry_quote_spent
+            sell_trade.entry_price = self.position.entry_price
+            sell_trade.tp_pct = self.position.tp_pct
+            sell_trade.sl_pct = self.position.sl_pct
+            sell_trade.tp_price = self.position.tp_price or 0.0
+            sell_trade.sl_price = self.position.sl_price or 0.0
+            sell_trade.pnl_pct_real = pnl_pct_real
+            sell_trade.pnl_usdt_real = pnl_usdt_real
             self.closed_trades.append(sell_trade)
             self._append_journal(sell_trade)
 
@@ -637,7 +1020,7 @@ class SpotBot:
         self._emit("position", {"pos": None})
 
     def _loop(self):
-        self._emit("log", {"msg": f"[BOT] Start {self.symbol} {self.interval} | DRY_RUN={DRY_RUN} | tick={self.tick} step={self.step} minNot={self.min_notional}"})
+        self._emit("log", {"msg": f"[BOT] Inicio {self.symbol} {self.interval} | DRY_RUN={DRY_RUN} | tick={self.tick} step={self.step} minNot={self.min_notional} minQty={self.min_qty}"})
 
         last_seen_close_time = None
 
@@ -657,7 +1040,10 @@ class SpotBot:
                     continue
                 last_seen_close_time = close_time
 
-                bScore, sScore, last_close = compute_scores(self.params, candles)
+                bScore, sScore, score_close = compute_scores(self.params, candles)
+                last_close = score_close
+                close_time_utc = datetime.fromtimestamp(close_time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+                self._emit("log", {"msg": f"[VELA] Nueva vela cerrada {close_time_utc} close={last_close:.4f}"})
 
                 in_pos = self.position is not None
                 cool_ok = self._cooldown_ok(close_time)
@@ -668,20 +1054,44 @@ class SpotBot:
                 # TP/SL (si hay posición)
                 tp_hit = sl_hit = False
                 if in_pos:
-                    if last_close >= self.position.tp_price:
+                    if self.position.tp_price is not None and last_close >= self.position.tp_price:
                         tp_hit = True
-                    if last_close <= self.position.sl_price:
+                    if self.position.sl_price is not None and last_close <= self.position.sl_price:
                         sl_hit = True
+
+                spot_price = last_close
+                try:
+                    spot_price = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
+                except Exception as e:
+                    self._emit("log", {"msg": f"[AVISO] No pude leer precio actual: {e}"})
+
+                wallet = None
+                try:
+                    wallet = get_spot_balances(self.client)
+                except Exception as e:
+                    self._emit("log", {"msg": f"[AVISO] No pude leer billetera spot: {e}"})
+
+                recent_candles = [
+                    {
+                        "time_utc": datetime.fromtimestamp(c["close_time"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+                        "close": c["close"],
+                    }
+                    for c in candles[-5:]
+                ]
 
                 self._emit("tick", {
                     "time_utc": self._now_utc(),
                     "close": last_close,
+                    "spot_price": spot_price,
                     "buyScore": bScore,
                     "sellScore": sScore,
                     "buyCond": buy_cond,
                     "sellCond": sell_cond,
                     "tp_hit": tp_hit,
-                    "sl_hit": sl_hit
+                    "sl_hit": sl_hit,
+                    "wallet": wallet,
+                    "ops_count": len(self.closed_trades) + len(self.open_trades),
+                    "recent_candles": recent_candles,
                 })
 
                 # Ejecutar
@@ -709,7 +1119,7 @@ class SpotBot:
                         last_trade = t
 
                         fill_ratio = spent_total / target if target > 0 else 0.0
-                        self._emit("log", {"msg": f"[BUY] attempt {attempt} spent={spent_total:.4f}/{target:.4f} ({fill_ratio*100:.1f}%) qty={t.qty:.6f} avg={t.price:.4f}"})
+                        self._emit("log", {"msg": f"[BUY] intento {attempt} gastado={spent_total:.4f}/{target:.4f} ({fill_ratio*100:.1f}%) qty={t.qty:.6f} avg={t.price:.4f}"})
 
                         if fill_ratio >= MIN_FILL_RATIO:
                             break
@@ -717,16 +1127,19 @@ class SpotBot:
                         time.sleep(RETRY_SLEEP_SEC)
 
                     if last_trade:
-                        # Consolidar posición por “precio” usando último trade (simple). En real podrías promediar.
-                        self._open_position_from_trade(last_trade, close_time)
+                        if spent_total >= (MIN_FILL_RATIO * target):
+                            # Consolidar posición por “precio” usando último trade (simple). En real podrías promediar.
+                            self._open_position_from_trade(last_trade, close_time)
+                        else:
+                            self._emit("log", {"msg": f"[BUY] Fill insuficiente: spent={spent_total:.4f} < {MIN_FILL_RATIO*100:.0f}% target={target:.4f}. No abro posición."})
 
                 # Cierre por TP/SL primero
                 if in_pos and tp_hit:
-                    self._emit("log", {"msg": "[TP] Take Profit hit -> cierro"})
+                    self._emit("log", {"msg": "[TP] Take Profit alcanzado -> cierro"})
                     self._close_position(reason="TP", last_close_time_ms=close_time)
                     continue
                 if in_pos and sl_hit:
-                    self._emit("log", {"msg": "[SL] Stop Loss hit -> cierro"})
+                    self._emit("log", {"msg": "[SL] Stop Loss alcanzado -> cierro"})
                     self._close_position(reason="SL", last_close_time_ms=close_time)
                     continue
 
@@ -737,10 +1150,12 @@ class SpotBot:
                     continue
 
             except Exception as e:
-                self._emit("log", {"msg": f"[ERR] {e}"})
+                self._emit("log", {"msg": f"[ERROR] {e}"})
+                if self.client and self._retry_connection():
+                    continue
                 time.sleep(2)
 
-        self._emit("log", {"msg": "[BOT] Stop"})
+        self._emit("log", {"msg": "[BOT] Detenido"})
 
 
 # =========================
@@ -770,14 +1185,32 @@ class BotGUI:
         self.var_last = tk.StringVar(value="-")
         self.var_scores = tk.StringVar(value="bScore=- sScore=-")
         self.var_price = tk.StringVar(value="close=-")
+        self.var_spot_price = tk.StringVar(value="spot=-")
         self.var_flags = tk.StringVar(value="buyCond=- sellCond=- tp=- sl=-")
         self.var_pos = tk.StringVar(value="pos: NONE")
+        self.var_wallet_summary = tk.StringVar(value="wallet: -")
+        self.var_ops = tk.StringVar(value="ops: -")
+        self.var_recent_candles = tk.StringVar(value="velas: -")
+        self.var_manual_pct = tk.DoubleVar(value=10.0)
+        self.var_connection = tk.StringVar(value="offline")
+        self._connect_stop = threading.Event()
+        self._connect_thread: Optional[threading.Thread] = None
 
         self._build()
+        self._start_auto_connect()
 
     def _build(self):
-        frm = ttk.Frame(self.root, padding=10)
-        frm.pack(fill="both", expand=True)
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill="both", expand=True)
+
+        bot_tab = ttk.Frame(nb, padding=10)
+        wallet_tab = ttk.Frame(nb, padding=10)
+        manual_tab = ttk.Frame(nb, padding=10)
+        nb.add(bot_tab, text="Bot")
+        nb.add(wallet_tab, text="Billetera SPOT")
+        nb.add(manual_tab, text="Manual")
+
+        frm = bot_tab
 
         top = ttk.Frame(frm)
         top.pack(fill="x")
@@ -785,14 +1218,22 @@ class BotGUI:
         ttk.Label(top, text="Estado:").grid(row=0, column=0, sticky="w")
         ttk.Label(top, textvariable=self.var_status).grid(row=0, column=1, sticky="w", padx=5)
 
-        ttk.Label(top, text="Último:").grid(row=1, column=0, sticky="w")
-        ttk.Label(top, textvariable=self.var_last).grid(row=1, column=1, sticky="w", padx=5)
+        ttk.Label(top, text="Conexión:").grid(row=1, column=0, sticky="w")
+        ttk.Label(top, textvariable=self.var_connection).grid(row=1, column=1, sticky="w", padx=5)
+
+        ttk.Label(top, text="Último:").grid(row=2, column=0, sticky="w")
+        ttk.Label(top, textvariable=self.var_last).grid(row=2, column=1, sticky="w", padx=5)
 
         ttk.Label(top, textvariable=self.var_price).grid(row=0, column=2, sticky="w", padx=10)
         ttk.Label(top, textvariable=self.var_scores).grid(row=1, column=2, sticky="w", padx=10)
         ttk.Label(top, textvariable=self.var_flags).grid(row=2, column=2, sticky="w", padx=10)
+        ttk.Label(top, textvariable=self.var_spot_price).grid(row=0, column=3, sticky="w", padx=10)
+        ttk.Label(top, textvariable=self.var_wallet_summary).grid(row=1, column=3, sticky="w", padx=10)
+        ttk.Label(top, textvariable=self.var_ops).grid(row=2, column=3, sticky="w", padx=10)
 
-        ttk.Label(top, textvariable=self.var_pos).grid(row=2, column=0, columnspan=2, sticky="w", pady=5)
+        ttk.Label(top, textvariable=self.var_pos).grid(row=3, column=0, columnspan=2, sticky="w", pady=5)
+
+        ttk.Label(top, textvariable=self.var_recent_candles).grid(row=4, column=0, columnspan=4, sticky="w", pady=5)
 
         # Buttons
         btns = ttk.Frame(frm)
@@ -816,7 +1257,21 @@ class BotGUI:
         tfrm = ttk.LabelFrame(frm, text="Trades (cerradas)")
         tfrm.pack(fill="both", expand=True, pady=8)
 
-        cols = ("time_utc", "side", "qty", "price", "quote_spent", "reason")
+        cols = (
+            "time_utc",
+            "side",
+            "qty",
+            "price",
+            "quote_spent",
+            "reason",
+            "entry_price",
+            "tp_pct",
+            "sl_pct",
+            "tp_price",
+            "sl_price",
+            "pnl_pct_real",
+            "pnl_usdt_real",
+        )
         self.tree = ttk.Treeview(tfrm, columns=cols, show="headings", height=10)
         for c in cols:
             self.tree.heading(c, text=c)
@@ -827,8 +1282,43 @@ class BotGUI:
         lfrm = ttk.LabelFrame(frm, text="Log")
         lfrm.pack(fill="both", expand=True)
 
-        self.txt_log = tk.Text(lfrm, height=8, width=90)
-        self.txt_log.pack(fill="both", expand=True)
+        log_frame = ttk.Frame(lfrm)
+        log_frame.pack(fill="both", expand=True)
+        self.txt_log = tk.Text(log_frame, height=8, width=90, wrap="word")
+        log_scroll = ttk.Scrollbar(log_frame, orient="vertical", command=self.txt_log.yview)
+        self.txt_log.configure(yscrollcommand=log_scroll.set)
+        self.txt_log.pack(side="left", fill="both", expand=True)
+        log_scroll.pack(side="right", fill="y")
+
+        wallet_controls = ttk.Frame(wallet_tab)
+        wallet_controls.pack(fill="x")
+
+        ttk.Button(wallet_controls, text="Actualizar billetera", command=self.refresh_wallet).pack(side="left")
+
+        self.wallet_tree = ttk.Treeview(wallet_tab, columns=("asset", "free", "locked", "total"), show="headings", height=16)
+        for col in ("asset", "free", "locked", "total"):
+            self.wallet_tree.heading(col, text=col)
+            self.wallet_tree.column(col, width=120, anchor="center")
+        self.wallet_tree.pack(fill="both", expand=True, pady=8)
+
+        manual_info = ttk.LabelFrame(manual_tab, text="Operaciones manuales (spot)")
+        manual_info.pack(fill="x", pady=8)
+
+        pct_row = ttk.Frame(manual_info)
+        pct_row.pack(fill="x", padx=6, pady=6)
+        ttk.Label(pct_row, text="Porcentaje USDT libre (%):").pack(side="left")
+        ttk.Entry(pct_row, textvariable=self.var_manual_pct, width=8).pack(side="left", padx=6)
+        ttk.Button(pct_row, text="Comprar % USDT (market)", command=self.manual_buy_pct).pack(side="left", padx=6)
+
+        sell_row = ttk.Frame(manual_info)
+        sell_row.pack(fill="x", padx=6, pady=6)
+        ttk.Button(sell_row, text="Vender TODO SOL (market)", command=self.manual_sell_all).pack(side="left")
+
+        manual_hint = ttk.Label(
+            manual_tab,
+            text="Nota: usa DRY_RUN=False para órdenes reales. Las operaciones manuales usan el mismo cliente SPOT.",
+        )
+        manual_hint.pack(fill="x", pady=6)
 
     def _refresh_params_box(self):
         self.txt_params.delete("1.0", "end")
@@ -846,32 +1336,170 @@ class BotGUI:
             elif kind == "tick":
                 self.var_last.set(payload["time_utc"])
                 self.var_price.set(f"close={payload['close']:.4f}")
+                self.var_spot_price.set(f"spot={payload.get('spot_price', payload['close']):.4f}")
                 self.var_scores.set(f"bScore={payload['buyScore']:.3f} sScore={payload['sellScore']:.3f}")
                 self.var_flags.set(f"buyCond={payload['buyCond']} sellCond={payload['sellCond']} tp={payload['tp_hit']} sl={payload['sl_hit']}")
+                self.var_ops.set(f"ops={payload.get('ops_count', 0)}")
+                recent = payload.get("recent_candles", [])
+                if recent:
+                    candles_txt = " | ".join(f"{c['time_utc']}={c['close']:.4f}" for c in recent)
+                    self.var_recent_candles.set(f"velas: {candles_txt}")
+                wallet = payload.get("wallet")
+                if wallet is not None:
+                    self._update_wallet_table(wallet)
+                    summary = ", ".join(
+                        f"{item['asset']} {item['total']:.6f}" for item in wallet if item["total"] > 0
+                    )
+                    self.var_wallet_summary.set(f"wallet: {summary}" if summary else "wallet: -")
             elif kind == "position":
                 if payload["pos"] is None:
                     self.var_pos.set("pos: NONE")
                 else:
                     pos = payload["pos"]
-                    self.var_pos.set(f"pos: qty={pos['qty']:.6f} entry={pos['entry_price']:.4f} tp={pos['tp_price']:.4f} sl={pos['sl_price']:.4f}")
+                    tp_disp = f"{pos['tp_price']:.4f}" if pos["tp_price"] is not None else "OFF"
+                    sl_disp = f"{pos['sl_price']:.4f}" if pos["sl_price"] is not None else "OFF"
+                    self.var_pos.set(
+                        f"pos: qty={pos['qty']:.6f} entry={pos['entry_price']:.4f} "
+                        f"TP={pos['tp_pct']*100:.2f}%({tp_disp}) SL={pos['sl_pct']*100:.2f}%({sl_disp})"
+                    )
+            elif kind == "net":
+                self.var_connection.set(payload["status"])
             # refresh table
             if self.bot:
                 # render last 200 closed trades
                 self.tree.delete(*self.tree.get_children())
                 for tr in self.bot.closed_trades[-200:]:
-                    self.tree.insert("", "end", values=(tr.time_utc, tr.side, f"{tr.qty:.6f}", f"{tr.price:.4f}", f"{tr.quote_spent:.4f}", tr.reason))
+                    self.tree.insert(
+                        "",
+                        "end",
+                        values=(
+                            tr.time_utc,
+                            tr.side,
+                            f"{tr.qty:.6f}",
+                            f"{tr.price:.4f}",
+                            f"{tr.quote_spent:.4f}",
+                            tr.reason,
+                            f"{tr.entry_price:.4f}",
+                            f"{tr.tp_pct*100:.2f}%",
+                            f"{tr.sl_pct*100:.2f}%",
+                            f"{tr.tp_price:.4f}",
+                            f"{tr.sl_price:.4f}",
+                            f"{tr.pnl_pct_real:+.4f}",
+                            f"{tr.pnl_usdt_real:+.4f}",
+                        ),
+                    )
 
         self.root.after(0, _upd)
 
-    def connect(self):
+    def _update_wallet_table(self, wallet: list[dict]):
+        if not hasattr(self, "wallet_tree"):
+            return
+        self.wallet_tree.delete(*self.wallet_tree.get_children())
+        for item in wallet:
+            self.wallet_tree.insert(
+                "",
+                "end",
+                values=(
+                    item["asset"],
+                    f"{item['free']:.6f}",
+                    f"{item['locked']:.6f}",
+                    f"{item['total']:.6f}",
+                ),
+            )
+
+    def refresh_wallet(self):
+        if not self.client:
+            messagebox.showwarning("Aviso", "Primero conecta.")
+            return
+        try:
+            wallet = get_spot_balances(self.client)
+            self._update_wallet_table(wallet)
+            summary = ", ".join(
+                f"{item['asset']} {item['total']:.6f}" for item in wallet if item["total"] > 0
+            )
+            self.var_wallet_summary.set(f"wallet: {summary}" if summary else "wallet: -")
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+
+    def manual_buy_pct(self):
+        if not self.client:
+            messagebox.showwarning("Aviso", "Primero conecta.")
+            return
+        try:
+            pct = float(self.var_manual_pct.get())
+        except (TypeError, ValueError):
+            messagebox.showwarning("Aviso", "Porcentaje inválido.")
+            return
+        if pct <= 0:
+            messagebox.showwarning("Aviso", "Porcentaje inválido.")
+            return
+        if not self.bot:
+            try:
+                self.bot = SpotBot(self.client, SYMBOL, INTERVAL, self.params, ui_cb=self.ui_callback)
+            except ValueError as e:
+                messagebox.showerror("Parámetros", str(e))
+                return
+        trade = self.bot.manual_buy_by_quote_pct(pct)
+        if trade:
+            self.log(f"[MANUAL BUY] qty={trade.qty:.6f} price={trade.price:.4f} spent={trade.quote_spent:.4f}")
+            self.refresh_wallet()
+        else:
+            self.log("[MANUAL BUY] No se pudo ejecutar la compra. Revisa minNotional/minQty y saldo USDT.")
+
+    def manual_sell_all(self):
+        if not self.client:
+            messagebox.showwarning("Aviso", "Primero conecta.")
+            return
+        if not self.bot:
+            try:
+                self.bot = SpotBot(self.client, SYMBOL, INTERVAL, self.params, ui_cb=self.ui_callback)
+            except ValueError as e:
+                messagebox.showerror("Parámetros", str(e))
+                return
+        trade = self.bot.manual_sell_all_base()
+        if trade:
+            self.log(f"[MANUAL SELL] qty={trade.qty:.6f} price={trade.price:.4f} got={trade.quote_spent:.4f}")
+            self.refresh_wallet()
+        else:
+            self.log("[MANUAL SELL] No se pudo ejecutar la venta. Revisa saldo SOL disponible.")
+
+    def _start_auto_connect(self):
+        if self._connect_thread and self._connect_thread.is_alive():
+            return
+        self._connect_stop.clear()
+        self._connect_thread = threading.Thread(target=self._connect_loop, daemon=True)
+        self._connect_thread.start()
+
+    def _connect_loop(self):
+        while not self._connect_stop.is_set():
+            if self.client is None:
+                if self.connect(show_errors=False):
+                    if not self.bot or not self.bot.running:
+                        self.start()
+            time.sleep(GUI_CONNECT_RETRY_SEC)
+
+    def connect(self, *, show_errors: bool = True) -> bool:
         try:
             key = read_key(API_KEY_PATH)
             sec = read_key(API_SECRET_PATH)
-            self.client = Client(key, sec)
+            self.client = Client(
+                key,
+                sec,
+                requests_params={"timeout": BINANCE_TIMEOUT_SEC},
+            )
             self.client.ping()
             self.log("[OK] Conectado a Binance SPOT (ping ok).")
+            self.var_connection.set("online")
+            self.refresh_wallet()
+            return True
         except Exception as e:
-            messagebox.showerror("Error", str(e))
+            self.client = None
+            self.var_connection.set("offline")
+            if show_errors:
+                messagebox.showerror("Error", str(e))
+            else:
+                self.log(f"[NET] Error de conexion: {e}")
+            return False
 
     def load_gen235(self):
         self.params = DEFAULT_GEN.copy()
@@ -888,6 +1516,10 @@ class BotGUI:
         if not self.client:
             messagebox.showwarning("Aviso", "Primero conecta.")
             return
+        if self.bot and self.bot.running:
+            self.var_status.set("RUN")
+            self.log("[BOT] Ya estaba iniciado.")
+            return
 
         # leer params desde caja (por si editaste)
         try:
@@ -897,7 +1529,11 @@ class BotGUI:
             messagebox.showerror("Parámetros", f"JSON inválido: {e}")
             return
 
-        self.bot = SpotBot(self.client, SYMBOL, INTERVAL, self.params, ui_cb=self.ui_callback)
+        try:
+            self.bot = SpotBot(self.client, SYMBOL, INTERVAL, self.params, ui_cb=self.ui_callback)
+        except ValueError as e:
+            messagebox.showerror("Parámetros", str(e))
+            return
         self.bot.start()
         self.var_status.set("RUN")
         self.log("[BOT] Iniciado.")
@@ -958,9 +1594,28 @@ def fetch_klines_public(symbol: str, interval: str, limit: int):
         if end_time is not None:
             params["endTime"] = end_time
 
-        r = requests.get(BINANCE_BASE + "/api/v3/klines", params=params, timeout=20)
-        r.raise_for_status()
-        data = r.json()
+        data = None
+        last_err = None
+        for attempt in range(1, BINANCE_MAX_RETRIES + 1):
+            try:
+                r = requests.get(
+                    BINANCE_BASE + "/api/v3/klines",
+                    params=params,
+                    timeout=BINANCE_TIMEOUT_SEC,
+                )
+                r.raise_for_status()
+                data = r.json()
+                break
+            except requests.exceptions.RequestException as exc:
+                last_err = exc
+                if attempt == BINANCE_MAX_RETRIES:
+                    raise
+                time.sleep(BINANCE_RETRY_BACKOFF_SEC * attempt)
+
+        if data is None:
+            if last_err:
+                raise last_err
+            raise RuntimeError("Sin respuesta de Binance en klines.")
         if not data:
             break
 
@@ -1048,12 +1703,7 @@ class ParamSpace:
                 g[k] = lo + (hi - lo) * random.random()
                 g[k] = self.quantize(k, g[k])
 
-        g["w_buy_rsi"], g["w_buy_macd"], g["w_buy_consec"] = normalize3(
-            g["w_buy_rsi"], g["w_buy_macd"], g["w_buy_consec"]
-        )
-        g["w_sell_rsi"], g["w_sell_macd"], g["w_sell_consec"] = normalize3(
-            g["w_sell_rsi"], g["w_sell_macd"], g["w_sell_consec"]
-        )
+        apply_weight_constraints(g)
         if g["macd_slow"] <= g["macd_fast"]:
             g["macd_slow"] = min(self.spec["macd_slow"]["max"], g["macd_fast"] + 5)
         return Genome(**g)
@@ -1063,12 +1713,7 @@ class ParamSpace:
         for k in d:
             d[k] = self.quantize(k, d[k])
 
-        d["w_buy_rsi"], d["w_buy_macd"], d["w_buy_consec"] = normalize3(
-            d["w_buy_rsi"], d["w_buy_macd"], d["w_buy_consec"]
-        )
-        d["w_sell_rsi"], d["w_sell_macd"], d["w_sell_consec"] = normalize3(
-            d["w_sell_rsi"], d["w_sell_macd"], d["w_sell_consec"]
-        )
+        apply_weight_constraints(d)
         if d["macd_slow"] <= d["macd_fast"]:
             d["macd_slow"] = min(self.spec["macd_slow"]["max"], d["macd_fast"] + 5)
         return Genome(**d)
@@ -1078,6 +1723,10 @@ class ParamSpace:
 class Metrics:
     score: float
     net: float
+    balance: float
+    profit: float
+    gross_profit: float
+    gross_loss: float
     max_dd: float
     dd_pct: float
     trades: int
@@ -1085,38 +1734,40 @@ class Metrics:
     losses: int
     winrate: float
     pf: float
+    years: float
+    trades_per_year: float
+    buy_signal_rate: float
+    sell_signal_rate: float
 
 
-def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float):
+def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float, trace: bool = False):
     if len(candles) < 200:
-        return Metrics(score=-1e9, net=-1.0, max_dd=1.0, dd_pct=100.0,
-                       trades=0, wins=0, losses=0, winrate=0.0, pf=0.0)
+        metrics = Metrics(
+            score=-1e9,
+            net=-1.0,
+            balance=0.0,
+            profit=0.0,
+            gross_profit=0.0,
+            gross_loss=0.0,
+            max_dd=1.0,
+            dd_pct=100.0,
+            trades=0,
+            wins=0,
+            losses=0,
+            winrate=0.0,
+            pf=0.0,
+            years=0.0,
+            trades_per_year=0.0,
+            buy_signal_rate=0.0,
+            sell_signal_rate=0.0,
+        )
+        return (metrics, {"events": [], "equity_curve": [], "dd_curve": [], "returns": []}) if trace else metrics
 
     data = heikin_ashi(candles) if ge.use_ha == 1 else candles
     close = [c["close"] for c in data]
 
     rsi_arr = rsi(close, ge.rsi_period)
     mh_arr = macd_hist(close, ge.macd_fast, ge.macd_slow, ge.macd_signal)
-
-    def buy_score(i: int) -> float:
-        rsi_val = rsi_arr[i]
-        mh = mh_arr[i]
-        mh_prev = mh_arr[i - 1] if i > 0 else mh
-        rsi_sig = buy_rsi_signal(rsi_val, ge.rsi_oversold, ge.rsi_overbought)
-        macd_sig = buy_macd_signal(mh, mh_prev, ge.edge_trigger)
-        cons_sig = consec_up(close[: i + 1], ge.consec_green)
-        wbr, wbm, wbc = normalize3(ge.w_buy_rsi, ge.w_buy_macd, ge.w_buy_consec)
-        return wbr * rsi_sig + wbm * macd_sig + wbc * cons_sig
-
-    def sell_score(i: int) -> float:
-        rsi_val = rsi_arr[i]
-        mh = mh_arr[i]
-        mh_prev = mh_arr[i - 1] if i > 0 else mh
-        rsi_sig = sell_rsi_signal(rsi_val, ge.rsi_oversold, ge.rsi_overbought)
-        macd_sig = sell_macd_signal(mh, mh_prev, ge.edge_trigger)
-        cons_sig = consec_down(close[: i + 1], ge.consec_red)
-        wsr, wsm, wsc = normalize3(ge.w_sell_rsi, ge.w_sell_macd, ge.w_sell_consec)
-        return wsr * rsi_sig + wsm * macd_sig + wsc * cons_sig
 
     equity = 1.0
     peak = equity
@@ -1126,6 +1777,10 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
     entry = 0.0
     entry_i = -10_000
     last_trade_i = -10_000
+    entry_buy_score = 0.0
+    entry_rsi = 0.0
+    entry_macd = 0.0
+    entry_close = 0.0
 
     gross_profit = 0.0
     gross_loss = 0.0
@@ -1133,17 +1788,68 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
     losses = 0
     trades = 0
 
-    for i in range(2, len(close)):
+    # [TP/SL ABS NORMALIZATION] magnitudes only (no signo)
+    tp_pct = abs(float(ge.take_profit))
+    sl_pct = abs(float(ge.stop_loss))
+    if tp_pct >= 1.0 or sl_pct >= 1.0:
+        metrics = Metrics(
+            score=-1e9,
+            net=-1.0,
+            balance=0.0,
+            profit=0.0,
+            gross_profit=0.0,
+            gross_loss=0.0,
+            max_dd=1.0,
+            dd_pct=100.0,
+            trades=0,
+            wins=0,
+            losses=0,
+            winrate=0.0,
+            pf=0.0,
+            years=0.0,
+            trades_per_year=0.0,
+            buy_signal_rate=0.0,
+            sell_signal_rate=0.0,
+        )
+        return (metrics, {"events": [], "equity_curve": [], "dd_curve": [], "returns": []}) if trace else metrics
+
+    events = []
+    equity_curve = []
+    dd_curve = []
+    returns = []
+    buy_signal_hits = 0
+    sell_signal_hits = 0
+
+    for i in range(1, len(close)):
         peak = max(peak, equity)
         dd = peak - equity
         if dd > max_dd:
             max_dd = dd
 
-        sig_i = i - 1
         exec_px = close[i]
-
-        bs = buy_score(sig_i)
-        ss = sell_score(sig_i)
+        score_payload = score_components_at_index(
+            close,
+            rsi_arr,
+            mh_arr,
+            i,
+            rsi_oversold=ge.rsi_oversold,
+            rsi_overbought=ge.rsi_overbought,
+            consec_red=ge.consec_red,
+            consec_green=ge.consec_green,
+            edge_trigger=ge.edge_trigger,
+            w_buy_rsi=ge.w_buy_rsi,
+            w_buy_macd=ge.w_buy_macd,
+            w_buy_consec=ge.w_buy_consec,
+            w_sell_rsi=ge.w_sell_rsi,
+            w_sell_macd=ge.w_sell_macd,
+            w_sell_consec=ge.w_sell_consec,
+        )
+        bs = score_payload["buy_score"]
+        ss = score_payload["sell_score"]
+        if bs >= ge.buy_th:
+            buy_signal_hits += 1
+        if ss >= ge.sell_th:
+            sell_signal_hits += 1
 
         if i - last_trade_i < int(ge.cooldown):
             continue
@@ -1156,18 +1862,23 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
                 in_pos = True
                 entry_i = i
                 last_trade_i = i
+                entry_buy_score = bs
+                entry_rsi = rsi_arr[i]
+                entry_macd = mh_arr[i]
+                entry_close = close[i]
         else:
             if i <= entry_i:
                 continue
 
             px = exec_px
-            tp_px = entry * (1.0 + float(ge.take_profit))
-            sl_px = entry * (1.0 - float(ge.stop_loss))
+            # [TP/SL PRICE CALCULATION] usando magnitudes abs
+            tp_px = entry * (1.0 + tp_pct) if tp_pct > 0 else None
+            sl_px = entry * (1.0 - sl_pct) if sl_pct > 0 else None
 
             exit_reason = None
-            if px >= tp_px:
+            if tp_px is not None and px >= tp_px:
                 exit_reason = "TP"
-            elif px <= sl_px:
+            elif sl_px is not None and px <= sl_px:
                 exit_reason = "SL"
             elif ss >= ge.sell_th:
                 exit_reason = "SIG"
@@ -1179,6 +1890,25 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
                 trade_ret = trade_ratio - 1.0
 
                 equity *= trade_ratio
+                if trace:
+                    candle_time = candles[i].get("close_time", candles[i].get("t"))
+                    events.append({
+                        "i": i,
+                        "time": candle_time,
+                        "side": "SELL",
+                        "reason": exit_reason,
+                        "entry": entry,
+                        "exit": px,
+                        "ret": trade_ret,
+                        "equity": equity,
+                        "dd": (peak - equity) / peak if peak > 0 else 0.0,
+                        "buyScore": entry_buy_score,
+                        "sellScore": ss,
+                        "RSI": entry_rsi,
+                        "MACD_hist": entry_macd,
+                        "close": entry_close,
+                    })
+                    returns.append(trade_ret)
 
                 trades += 1
                 if trade_ret >= 0:
@@ -1193,17 +1923,56 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
                 entry_i = -10_000
                 last_trade_i = i
 
+        if trace:
+            equity_curve.append(equity)
+            dd_curve.append((peak - equity) / peak if peak > 0 else 0.0)
+
     net = equity - 1.0
+    balance = START_CAPITAL * equity
+    profit = balance - START_CAPITAL
     dd_pct = (max_dd / (peak + 1e-12)) * 100.0
 
     pf_raw = gross_profit / (gross_loss + 1e-6)
-    pf = max(0.0, min(pf_raw, 10.0))
+    pf = max(0.0, min(pf_raw, 50.0))
     winrate = (wins / trades * 100.0) if trades > 0 else 0.0
 
-    score = math.log1p(max(0.0, pf)) + net - (max_dd * 1.0)
+    first_ts = candles[0].get("open_time", candles[0].get("t"))
+    last_ts = candles[-1].get("close_time", candles[-1].get("t"))
+    years = max((last_ts - first_ts) / (1000 * 60 * 60 * 24 * 365), 1e-9)
+    trades_per_year = trades / years
+    buy_signal_rate = buy_signal_hits / len(close)
+    sell_signal_rate = sell_signal_hits / len(close)
 
-    return Metrics(score=score, net=net, max_dd=max_dd, dd_pct=dd_pct,
-                   trades=trades, wins=wins, losses=losses, winrate=winrate, pf=pf)
+    score = pf
+
+    metrics = Metrics(
+        score=score,
+        net=net,
+        balance=balance,
+        profit=profit,
+        gross_profit=gross_profit,
+        gross_loss=gross_loss,
+        max_dd=max_dd,
+        dd_pct=dd_pct,
+        trades=trades,
+        wins=wins,
+        losses=losses,
+        winrate=winrate,
+        pf=pf,
+        years=years,
+        trades_per_year=trades_per_year,
+        buy_signal_rate=buy_signal_rate,
+        sell_signal_rate=sell_signal_rate,
+    )
+
+    if trace:
+        return metrics, {
+            "events": events,
+            "equity_curve": equity_curve,
+            "dd_curve": dd_curve,
+            "returns": returns,
+        }
+    return metrics
 
 
 @dataclass
@@ -1224,16 +1993,76 @@ class GAConfig:
     pen_per_missing_trade: float
 
 
+def fitness_from_metrics(m: Metrics, cfg: GAConfig) -> float:
+    if m.trades == 0:
+        return -1e9
+
+    pf_cap = min(m.pf, 50.0)
+    pf_term = math.log1p(pf_cap)
+    dd_pen = cfg.dd_weight * (m.dd_pct / 100.0)
+    missing = max(0, cfg.trade_floor - m.trades)
+    trade_pen = missing * cfg.pen_per_missing_trade
+    bonus = max(0.0, m.net) * 0.2
+    return pf_term - dd_pen - trade_pen + bonus
+
+
+PARAM_GENES = [
+    "rsi_period",
+    "rsi_oversold",
+    "rsi_overbought",
+    "macd_fast",
+    "macd_slow",
+    "macd_signal",
+    "consec_red",
+    "consec_green",
+    "buy_th",
+    "sell_th",
+    "take_profit",
+    "stop_loss",
+    "cooldown",
+    "edge_trigger",
+    "use_ha",
+]
+
+PARAM_BLOCKS = ["RSI", "MACD", "CONSEC", "RISK", "CONF"]
+WEIGHT_KEYS = [
+    "w_buy_rsi", "w_buy_macd", "w_buy_consec",
+    "w_sell_rsi", "w_sell_macd", "w_sell_consec",
+]
+
+WEIGHT_MUT_RATE = 0.35
+PARAM_MUT_RATE = 0.08
+WEIGHT_MUT_SIGMA = 0.06
+BLOCK_SELECTION_WEIGHTS = {
+    "RSI": 1.0,
+    "MACD": 1.4,
+    "CONSEC": 1.0,
+    "RISK": 1.0,
+    "CONF": 0.8,
+}
+BLOCK_COUNT_WEIGHTS = {
+    1: 0.35,
+    2: 0.45,
+    3: 0.20,
+}
+
 BLOCKS = {
     "RSI": ["rsi_period", "rsi_oversold", "rsi_overbought"],
     "MACD": ["macd_fast", "macd_slow", "macd_signal"],
     "CONSEC": ["consec_red", "consec_green"],
     "RISK": ["take_profit", "stop_loss", "cooldown", "edge_trigger", "use_ha"],
-    "CONF": [
-        "w_buy_rsi", "w_buy_macd", "w_buy_consec", "buy_th",
-        "w_sell_rsi", "w_sell_macd", "w_sell_consec", "sell_th",
+    "WEIGHTS": [
+        "w_buy_rsi", "w_buy_macd", "w_buy_consec",
+        "w_sell_rsi", "w_sell_macd", "w_sell_consec",
     ],
+    "CONF": ["buy_th", "sell_th"],
 }
+
+def mutate_weights(child: dict, *, sigma: float = WEIGHT_MUT_SIGMA):
+    chosen = random.sample(WEIGHT_KEYS, k=random.choice([1, 2]))
+    for key in chosen:
+        child[key] = clamp_weight(child[key] + random.gauss(0, sigma))
+    apply_weight_constraints(child)
 
 
 def mutate_block(child, space: ParamSpace, block_name: str, strength: float):
@@ -1262,13 +2091,8 @@ def mutate_block(child, space: ParamSpace, block_name: str, strength: float):
 
         child[gk] = space.quantize(gk, child[gk])
 
-    if block_name == "CONF":
-        child["w_buy_rsi"], child["w_buy_macd"], child["w_buy_consec"] = normalize3(
-            child["w_buy_rsi"], child["w_buy_macd"], child["w_buy_consec"]
-        )
-        child["w_sell_rsi"], child["w_sell_macd"], child["w_sell_consec"] = normalize3(
-            child["w_sell_rsi"], child["w_sell_macd"], child["w_sell_consec"]
-        )
+    if block_name == "WEIGHTS":
+        apply_weight_constraints(child)
 
     if block_name == "MACD":
         if child["macd_slow"] <= child["macd_fast"]:
@@ -1280,39 +2104,75 @@ def make_child_blocky(
     space: ParamSpace,
     p1: Genome,
     p2: Genome,
-    mut_rate: float,
-    max_blocks_per_child: int,
-    forced_block: Optional[str] = None,
-    strength: float = 0.8,
+    param_blocks: Optional[list[str]],
+    *,
+    param_mut_rate: float = PARAM_MUT_RATE,
+    weight_mut_rate: float = WEIGHT_MUT_RATE,
+    weight_sigma: float = WEIGHT_MUT_SIGMA,
+    strength: float = 0.55,
+    return_meta: bool = False,
 ):
     d1 = asdict(p1)
     d2 = asdict(p2)
-    child = {}
+    child = {k: d1[k] if random.random() < 0.5 else d2[k] for k in d1}
 
-    for k in d1:
-        child[k] = d1[k] if random.random() < 0.5 else d2[k]
+    mutated_blocks = []
+    mutated_genes = []
+    mutation_type = "copiado"
 
-    if random.random() < mut_rate:
-        block_names = list(BLOCKS.keys())
-        random.shuffle(block_names)
+    pre_mutation = child.copy()
 
-        chosen = []
-        if forced_block and forced_block in BLOCKS:
-            chosen.append(forced_block)
+    if random.random() < weight_mut_rate:
+        mutate_weights(child, sigma=weight_sigma)
+        mutated_weight_genes = [k for k in WEIGHT_KEYS if child[k] != pre_mutation[k]]
+        if mutated_weight_genes:
+            mutated_blocks.append("WEIGHTS")
+            mutated_genes.extend(mutated_weight_genes)
 
-        need = random.randint(1, max_blocks_per_child)
-        for bn in block_names:
-            if bn in chosen:
+    if param_blocks:
+        for param_block in param_blocks:
+            if random.random() >= param_mut_rate:
                 continue
-            chosen.append(bn)
-            if len(chosen) >= need:
-                break
+            before = child.copy()
+            mutate_block(child, space, param_block, strength=strength)
+            if not any(child[g] != before[g] for g in BLOCKS[param_block]):
+                gk = random.choice(BLOCKS[param_block])
+                spec = space.spec[gk]
+                lo, hi, tp = spec["min"], spec["max"], spec["type"]
+                if tp == "int":
+                    current = int(child[gk])
+                    options = [v for v in range(int(lo), int(hi) + 1, int(spec["step"])) if v != current]
+                    if options:
+                        child[gk] = random.choice(options)
+                else:
+                    current = float(child[gk])
+                    new_val = lo + (hi - lo) * random.random()
+                    if abs(new_val - current) < 1e-9:
+                        new_val = lo if abs(lo - current) > abs(hi - current) else hi
+                    child[gk] = space.quantize(gk, new_val)
+            mutated_param_genes = [g for g in BLOCKS[param_block] if child[g] != before[g]]
+            if mutated_param_genes:
+                mutated_blocks.append(param_block)
+                mutated_genes.extend(mutated_param_genes)
 
-        for bn in chosen:
-            mutate_block(child, space, bn, strength=strength)
+    mutated = len(mutated_genes) > 0
+    if mutated:
+        mutation_type = "mutado"
 
-    ge = Genome(**child)
-    return space.clamp_genome(ge)
+    ge = space.clamp_genome(Genome(**child))
+    if return_meta:
+        all_genes = set(space.spec.keys())
+        mutated_genes_set = set(mutated_genes)
+        untouched = sorted(all_genes - mutated_genes_set)
+        meta = {
+            "mutated": mutated,
+            "mutation_type": mutation_type,
+            "mutated_blocks": sorted(set(mutated_blocks)),
+            "mutated_genes": sorted(mutated_genes_set),
+            "untouched_genes": untouched,
+        }
+        return ge, meta
+    return ge
 
 
 def force_coverage(space: ParamSpace, n: int):
@@ -1331,115 +2191,444 @@ def force_coverage(space: ParamSpace, n: int):
     return out
 
 
-def run_ga(candles, space: ParamSpace, cfg: GAConfig, stop_flag, log_fn):
+def make_base_genome(space: ParamSpace, base_params: Optional[dict] = None) -> Genome:
+    payload = DEFAULT_GEN.copy()
+    if base_params:
+        payload.update(base_params)
+    ge = Genome(**payload)
+    return space.clamp_genome(ge)
+
+
+def make_freeze_fn(space: ParamSpace, base_genome: Genome, optimize_genes: list[str]):
+    optimize_set = set(optimize_genes)
+    frozen_genes = [k for k in asdict(base_genome).keys() if k not in optimize_set]
+
+    def _freeze(ge: Genome) -> Genome:
+        d = asdict(ge)
+        for k in frozen_genes:
+            d[k] = getattr(base_genome, k)
+        return space.clamp_genome(Genome(**d))
+
+    return _freeze
+
+
+def run_ga(
+    candles,
+    space: ParamSpace,
+    cfg: GAConfig,
+    stop_flag,
+    log_fn,
+    sample_fn=None,
+    postprocess_fn=None,
+    allowed_blocks: Optional[list[str]] = None,
+    initial_population=None,
+    gen_offset: int = 0,
+    return_population: bool = False,
+):
+    GA_DASHBOARD_MODE = False
+    is_weight_opt = False  # compat: modo de pesos separado eliminado
     fee_per_side = cfg.fee_side * cfg.fee_mult
     slip_per_side = cfg.slip_side
 
-    log_fn(f"[COSTOS] SPOT | fee_lado={fee_per_side:.6f} (incluye mult) | slip_lado={slip_per_side:.6f}")
+    # logging mínimo: evitar logs internos del GA
 
-    pop = [space.sample() for _ in range(cfg.population)]
-    cov = force_coverage(space, max(12, cfg.population // 6))
-    pop[:len(cov)] = cov
-    log_fn(f"[COBERTURA] forcé {len(cov)} individuos para cubrir rangos completos (inicio)")
+    if sample_fn is None:
+        sample_fn = space.sample
+    if postprocess_fn is None:
+        postprocess_fn = lambda ge: ge
+
+    pop = []
+    if initial_population:
+        pop = [postprocess_fn(ge) for ge in initial_population]
+    if len(pop) < cfg.population:
+        pop.extend(postprocess_fn(sample_fn()) for _ in range(cfg.population - len(pop)))
+    if len(pop) > cfg.population:
+        pop = pop[:cfg.population]
+
+    if not initial_population:
+        cov = force_coverage(space, max(12, cfg.population // 6))
+        pop[:len(cov)] = [postprocess_fn(ge) for ge in cov]
 
     best_global = None
     best_metrics = None
     stuck = 0
+    prev_best_hash = None
+    active_param_blocks = None
+    recent_blocks = deque(maxlen=7)
+    param_blocks = [b for b in (allowed_blocks or PARAM_BLOCKS) if b in PARAM_BLOCKS]
+    if not param_blocks:
+        param_blocks = PARAM_BLOCKS[:]
+    print(f"[GA] bloques_disponibles={param_blocks}", flush=True)
 
-    for gen in range(1, cfg.generations + 1):
+    def strength_for_combo(count: int) -> float:
+        if count <= 1:
+            return 0.55
+        if count == 2:
+            return 0.85
+        return 1.15
+
+    def format_gene(value, mutated: bool, fmt: str) -> str:
+        out = format(value, fmt)
+        return f"{out}*" if mutated else out
+
+    def format_genome(ge: Genome, mutated_genes: Optional[set] = None) -> str:
+        mutated_genes = mutated_genes or set()
+        ha = format_gene(ge.use_ha, "use_ha" in mutated_genes, "d")
+        rsi_p = format_gene(ge.rsi_period, "rsi_period" in mutated_genes, "d")
+        rsi_os = format_gene(ge.rsi_oversold, "rsi_oversold" in mutated_genes, ".0f")
+        rsi_ob = format_gene(ge.rsi_overbought, "rsi_overbought" in mutated_genes, ".0f")
+        macd_f = format_gene(ge.macd_fast, "macd_fast" in mutated_genes, "d")
+        macd_s = format_gene(ge.macd_slow, "macd_slow" in mutated_genes, "d")
+        macd_sig = format_gene(ge.macd_signal, "macd_signal" in mutated_genes, "d")
+        consec_r = format_gene(ge.consec_red, "consec_red" in mutated_genes, "d")
+        consec_g = format_gene(ge.consec_green, "consec_green" in mutated_genes, "d")
+        tp = format_gene(ge.take_profit, "take_profit" in mutated_genes, ".3f")
+        sl = format_gene(ge.stop_loss, "stop_loss" in mutated_genes, ".3f")
+        cd = format_gene(ge.cooldown, "cooldown" in mutated_genes, "d")
+        edge = format_gene(ge.edge_trigger, "edge_trigger" in mutated_genes, "d")
+        wbr = format_gene(ge.w_buy_rsi, "w_buy_rsi" in mutated_genes, ".2f")
+        wbm = format_gene(ge.w_buy_macd, "w_buy_macd" in mutated_genes, ".2f")
+        wbc = format_gene(ge.w_buy_consec, "w_buy_consec" in mutated_genes, ".2f")
+        wsr = format_gene(ge.w_sell_rsi, "w_sell_rsi" in mutated_genes, ".2f")
+        wsm = format_gene(ge.w_sell_macd, "w_sell_macd" in mutated_genes, ".2f")
+        wsc = format_gene(ge.w_sell_consec, "w_sell_consec" in mutated_genes, ".2f")
+        buy_th = format_gene(ge.buy_th, "buy_th" in mutated_genes, ".2f")
+        sell_th = format_gene(ge.sell_th, "sell_th" in mutated_genes, ".2f")
+        return (
+            f"HA={ha} "
+            f"RSI(p={rsi_p},os={rsi_os},ob={rsi_ob}) "
+            f"MACD({macd_f},{macd_s},{macd_sig}) "
+            f"consec(R={consec_r},G={consec_g}) "
+            f"TP={tp} SL={sl} cd={cd} edge={edge} "
+            f"Wbuy=({wbr},{wbm},{wbc}) Wsell=({wsr},{wsm},{wsc}) "
+            f"umbrales(buy={buy_th},sell={sell_th})"
+        )
+
+    mutation_counter = {gene: 0 for gene in space.spec.keys()}
+
+    def print_mutation_counter(reason: str):
+        print(f"[MUTATION COUNTER] {reason}")
+        for gene in sorted(mutation_counter.keys()):
+            print(f"{gene}={mutation_counter[gene]}")
+
+    def pick_random_block_combo() -> Optional[list[str]]:
+        if not param_blocks:
+            return None
+        weights = [BLOCK_SELECTION_WEIGHTS.get(b, 1.0) for b in param_blocks]
+        counts = list(BLOCK_COUNT_WEIGHTS.keys())
+        count_weights = [BLOCK_COUNT_WEIGHTS[c] for c in counts]
+        while True:
+            count = random.choices(counts, weights=count_weights, k=1)[0]
+            count = min(count, len(param_blocks))
+            chosen = set()
+            while len(chosen) < count:
+                block = random.choices(param_blocks, weights=weights, k=1)[0]
+                chosen.add(block)
+            combo = tuple(sorted(chosen))
+            if combo not in recent_blocks:
+                recent_blocks.append(combo)
+                return list(combo)
+
+    total_gens = cfg.generations
+    for gen in range(1, total_gens + 1):
         if stop_flag():
-            log_fn("[STOP] detenido por el usuario.")
             return best_global, best_metrics
 
+        gen_display = gen + gen_offset
+        gen_start = time.perf_counter()
+        last_heartbeat = gen_start
         scored = []
-        for ge in pop:
+        for idx, ge in enumerate(pop, start=1):
+            indiv_start = time.perf_counter()
+            if DEBUG_GA_PROGRESS and idx % GA_PROGRESS_EVERY == 0:
+                elapsed = time.perf_counter() - gen_start
+                print(
+                    f"[GA] GEN {gen_display} progreso {idx}/{len(pop)} | elapsed={elapsed:.1f}s",
+                    flush=True,
+                )
+                last_heartbeat = time.perf_counter()
             m = simulate_spot(candles, ge, fee_per_side, slip_per_side)
-
-            missing = max(0, cfg.trade_floor - m.trades)
-            penalty_trades = missing * cfg.pen_per_missing_trade
-            score = (math.log1p(max(0.0, m.pf)) + m.net) - (cfg.dd_weight * m.max_dd) - penalty_trades
-
+            indiv_elapsed = time.perf_counter() - indiv_start
+            if DEBUG_GA_PROGRESS and indiv_elapsed >= GA_INDIVIDUAL_WARN_S:
+                print(
+                    f"[GA][WARN] GEN {gen_display} individuo {idx}/{len(pop)} lento "
+                    f"({indiv_elapsed:.1f}s) | bloques={active_param_blocks} | {format_genome(ge)}",
+                    flush=True,
+                )
+                last_heartbeat = time.perf_counter()
+            score = fitness_from_metrics(m, cfg)
             scored.append((score, ge, m))
 
+        eval_elapsed = time.perf_counter() - gen_start
         scored.sort(key=lambda x: x[0], reverse=True)
         best_score, best_ge, best_m = scored[0]
+        best_hash = hash(tuple(asdict(best_ge).items()))
+        unique_hashes = {hash(tuple(asdict(ge).items())) for _, ge, _ in scored}
+        elite_hashes = [hash(tuple(asdict(ge).items())) for ge in [x[1] for x in scored[:cfg.elite]]]
+        elite_unique = len(set(elite_hashes))
 
         if best_global is None or best_score > best_global[0] + 1e-9:
-            best_global = (best_score, best_ge)
+            prev_best_global_score = best_global[0] if best_global else None
+            best_global = (best_score, copy.deepcopy(best_ge))
             best_metrics = best_m
             stuck = 0
+            active_param_blocks = None
         else:
             stuck += 1
 
-        log_fn(
-            f"[GEN {gen}] score={best_score:.4f} | net={best_m.net:.4f} | "
-            f"DD={best_m.max_dd:.4f} ({best_m.dd_pct:.2f}%) | trades={best_m.trades} "
-            f"wr={best_m.winrate:.1f}% PF={best_m.pf:.2f} | "
-            f"HA={best_ge.use_ha} RSI(p={best_ge.rsi_period},os={best_ge.rsi_oversold:.0f},ob={best_ge.rsi_overbought:.0f}) | "
-            f"MACD({best_ge.macd_fast},{best_ge.macd_slow},{best_ge.macd_signal}) | "
-            f"consec(R={best_ge.consec_red},G={best_ge.consec_green}) | "
-            f"TP={best_ge.take_profit:.3f} SL={best_ge.stop_loss:.3f} cd={best_ge.cooldown} edge={best_ge.edge_trigger} | "
-            f"buy_th={best_ge.buy_th:.2f} sell_th={best_ge.sell_th:.2f} | "
-            f"Wbuy({best_ge.w_buy_rsi:.2f},{best_ge.w_buy_macd:.2f},{best_ge.w_buy_consec:.2f}) "
-            f"Wsell({best_ge.w_sell_rsi:.2f},{best_ge.w_sell_macd:.2f},{best_ge.w_sell_consec:.2f})"
+        print(
+            f"GEN {gen_display} | best_score={best_score:.4f} | net={best_m.net:.4f} | "
+            f"PF={best_m.pf:.2f} | DD={best_m.dd_pct:.1f} | unique={len(unique_hashes)}",
+            flush=True,
         )
+        if DEBUG_GA_PROGRESS:
+            print(f"[GA] GEN {gen_display} eval_time={eval_elapsed:.1f}s", flush=True)
+        prev_best_hash = best_hash
+        mask_saturated = False
+        if stuck >= BLOCK_STUCK_LIMIT:
+            mask_saturated = True
 
-        if stuck >= 15:
+        if active_param_blocks is None:
+            active_param_blocks = pick_random_block_combo()
+            print(
+                f"[BLOQUE] activos: {active_param_blocks} | pesos siempre mutan | gens={BLOCK_STUCK_LIMIT}",
+                flush=True,
+            )
+        elif mask_saturated:
+            print("[INFO] Bloque sin mejora -> cambiando bloque", flush=True)
+            before_switch = time.perf_counter()
+            active_param_blocks = pick_random_block_combo()
+            switch_elapsed = time.perf_counter() - before_switch
+            print(
+                f"[BLOQUE] activos: {active_param_blocks} | pesos siempre mutan | "
+                f"gens={BLOCK_STUCK_LIMIT} | cambio_en={switch_elapsed:.3f}s",
+                flush=True,
+            )
             stuck = 0
-            log_fn("[ANTI-PEGADO] se pegó -> meto más wild + más cobertura")
-            cfg.n_wild = min(cfg.population - cfg.elite, cfg.n_wild + 20)
-            extra_cov = force_coverage(space, max(10, cfg.population // 8))
-        else:
-            extra_cov = []
 
-        elite = [x[1] for x in scored[:cfg.elite]]
+        if DEBUG_FULL_POPULATION:
+            print(
+                f"===== GENERACION {gen_display} | POP_SIZE={len(pop)} | "
+                f"BLOQUE(S) ACTIVOS: {active_param_blocks} (pesos siempre mutan) ====="
+            )
+
+        extra_cov = []
+
+        elite = [best_global[1]] if best_global else [scored[0][1]]
         pool = [x[1] for x in scored[:max(cfg.elite * 6, cfg.population // 2)]]
 
         children = []
+        child_meta = [] if DEBUG_MUTATION else None
 
-        block_cycle = ["RSI", "MACD", "CONSEC", "RISK", "CONF"]
-        bc_i = 0
+        forced_strength = strength_for_combo(len(active_param_blocks or [])) if active_param_blocks else None
 
         for _ in range(cfg.n_cons):
             p1 = random.choice(pool)
             p2 = random.choice(pool)
-            forced = block_cycle[bc_i % len(block_cycle)]
-            bc_i += 1
-            children.append(make_child_blocky(space, p1, p2, mut_rate=0.28, max_blocks_per_child=1,
-                                              forced_block=forced, strength=0.55))
+            child_result = make_child_blocky(
+                space,
+                p1,
+                p2,
+                param_blocks=active_param_blocks,
+                strength=forced_strength if active_param_blocks else 0.55,
+                return_meta=DEBUG_MUTATION,
+            )
+            if DEBUG_MUTATION:
+                child, meta = child_result
+                child_meta.append(meta)
+            else:
+                child = child_result
+            children.append(postprocess_fn(child))
 
         for _ in range(cfg.n_exp):
             p1 = random.choice(pool)
             p2 = random.choice(pool)
-            forced = block_cycle[bc_i % len(block_cycle)]
-            bc_i += 1
-            children.append(make_child_blocky(space, p1, p2, mut_rate=0.60, max_blocks_per_child=2,
-                                              forced_block=forced, strength=0.80))
+            child_result = make_child_blocky(
+                space,
+                p1,
+                p2,
+                param_blocks=active_param_blocks,
+                strength=forced_strength if active_param_blocks else 0.80,
+                return_meta=DEBUG_MUTATION,
+            )
+            if DEBUG_MUTATION:
+                child, meta = child_result
+                child_meta.append(meta)
+            else:
+                child = child_result
+            children.append(postprocess_fn(child))
 
         for _ in range(cfg.n_wild):
-            if random.random() < 0.35:
-                children.append(space.sample())
+            p1 = random.choice(pool)
+            p2 = random.choice(pool)
+            child_result = make_child_blocky(
+                space,
+                p1,
+                p2,
+                param_blocks=active_param_blocks,
+                strength=forced_strength if active_param_blocks else 1.00,
+                return_meta=DEBUG_MUTATION,
+            )
+            if DEBUG_MUTATION:
+                child, meta = child_result
+                child_meta.append(meta)
             else:
-                p1 = random.choice(pool)
-                p2 = random.choice(pool)
-                forced = block_cycle[bc_i % len(block_cycle)]
-                bc_i += 1
-                children.append(make_child_blocky(space, p1, p2, mut_rate=0.90, max_blocks_per_child=3,
-                                                  forced_block=forced, strength=1.00))
+                child = child_result
+            children.append(postprocess_fn(child))
+
+        if DEBUG_MUTATION:
+            all_genes = sorted(space.spec.keys())
+            block_counts = {bn: 0 for bn in BLOCKS.keys()}
+            mutated_count = 0
+            for meta in child_meta:
+                if meta["mutated"]:
+                    mutated_count += 1
+                    for bn in meta["mutated_blocks"]:
+                        block_counts[bn] += 1
+                    for gene in meta["mutated_genes"]:
+                        mutation_counter[gene] += 1
+
+            structural_blocks = {"RSI", "MACD", "CONSEC", "RISK"}
+            structural_mutated = any(block_counts[bn] > 0 for bn in structural_blocks)
+
+            def log_individual(label: str, ge: Genome, meta: Optional[dict] = None):
+                if meta is None:
+                    meta = {
+                        "mutation_type": "copiado",
+                        "mutated_genes": [],
+                        "untouched_genes": all_genes,
+                    }
+                elif not meta.get("untouched_genes"):
+                    meta["untouched_genes"] = all_genes
+                if "mutated_genes" not in meta:
+                    meta["mutated_genes"] = []
+                mutated_set = set(meta.get("mutated_genes", []))
+                print(
+                    f"[{label.upper()}] tipo={meta['mutation_type']} "
+                    f"mutados={meta['mutated_genes']} no_tocados={meta['untouched_genes']} | "
+                    f"{format_genome(ge, mutated_set)}"
+                )
+
+            if gen_display % 10 == 0:
+                print_mutation_counter("cada_10_gen")
+            if stuck > 0:
+                print_mutation_counter("sin_mejora")
 
         new_pop = elite + children
+        population_entries = []
+        population_entries.append(
+            {"genome": elite[0], "meta": None, "type": "elite", "blocks": []}
+        )
+        for idx, child in enumerate(children):
+            meta = child_meta[idx] if child_meta else None
+            if meta and meta.get("mutation_type") == "aleatorio":
+                tipo = "aleatorio"
+            elif meta and meta.get("mutated"):
+                tipo = "mutado"
+            else:
+                tipo = "clonado"
+            blocks = meta.get("mutated_blocks", []) if meta else []
+            population_entries.append(
+                {"genome": child, "meta": meta, "type": tipo, "blocks": blocks}
+            )
+
         if extra_cov:
             k = min(len(extra_cov), max(5, cfg.population // 10))
-            new_pop[-k:] = extra_cov[:k]
+            mutated_extra = []
+            for ge in extra_cov[:k]:
+                child_result = make_child_blocky(
+                    space,
+                    ge,
+                    ge,
+                    param_blocks=active_param_blocks,
+                    strength=forced_strength if active_param_blocks else 0.80,
+                    return_meta=DEBUG_MUTATION,
+                )
+                if DEBUG_MUTATION:
+                    child, meta = child_result
+                else:
+                    child = child_result
+                    meta = None
+                mutated_extra.append((child, meta))
+            new_pop[-k:] = [entry[0] for entry in mutated_extra]
+            for idx, (child, meta) in enumerate(mutated_extra):
+                pop_idx = len(new_pop) - k + idx
+                tipo = "mutado" if meta and meta.get("mutated") else "clonado"
+                blocks = meta.get("mutated_blocks", []) if meta else []
+                population_entries[pop_idx] = {
+                    "genome": child,
+                    "meta": meta,
+                    "type": tipo,
+                    "blocks": blocks,
+                }
 
         if len(new_pop) > cfg.population:
             new_pop = new_pop[:cfg.population]
+            population_entries = population_entries[:cfg.population]
         while len(new_pop) < cfg.population:
-            new_pop.append(space.sample())
+            seed = postprocess_fn(sample_fn())
+            child_result = make_child_blocky(
+                space,
+                seed,
+                seed,
+                param_blocks=active_param_blocks,
+                strength=forced_strength if active_param_blocks else 0.80,
+                return_meta=DEBUG_MUTATION,
+            )
+            if DEBUG_MUTATION:
+                child, meta = child_result
+            else:
+                child = child_result
+                meta = None
+            new_pop.append(child)
+            population_entries.append(
+                {
+                    "genome": child,
+                    "meta": meta,
+                    "type": "mutado" if meta and meta.get("mutated") else "clonado",
+                    "blocks": meta.get("mutated_blocks", []) if meta else [],
+                }
+            )
 
         pop = new_pop
 
+        evaluated = len(scored)
+        pop_size = len(pop)
+        sim_ok = evaluated == pop_size
+        if not sim_ok:
+            print(f"[ERROR] GEN {gen_display}: simulación incompleta (evaluated={evaluated}, expected={pop_size})", flush=True)
+            return best_global, best_metrics
+
+    if return_population:
+        return best_global, best_metrics, pop
     return best_global, best_metrics
+
+
+def run_ga_params_only(
+    candles,
+    space: ParamSpace,
+    cfg: GAConfig,
+    stop_flag,
+    log_fn,
+    base_params=None,
+    initial_population=None,
+    gen_offset: int = 0,
+    return_population: bool = False,
+):
+    base = make_base_genome(space, base_params)
+    freeze_fn = make_freeze_fn(space, base, PARAM_GENES)
+    return run_ga(
+        candles=candles,
+        space=space,
+        cfg=cfg,
+        stop_flag=stop_flag,
+        log_fn=log_fn,
+        postprocess_fn=freeze_fn,
+        allowed_blocks=PARAM_BLOCKS,
+        initial_population=initial_population,
+        gen_offset=gen_offset,
+        return_population=return_population,
+    )
 
 
 class OptimizerGUI:
@@ -1452,6 +2641,8 @@ class OptimizerGUI:
         self.best_genome = None
         self.best_metrics = None
         self.cached_candles = None
+        self.last_trace = None
+        self.last_trace_metrics = None
 
         self.var_symbol = tk.StringVar(value=SYMBOL)
         self.var_tf = tk.StringVar(value=INTERVAL)
@@ -1510,7 +2701,15 @@ class OptimizerGUI:
 
     def build_ui(self):
         pad = 6
-        frm = ttk.Frame(self.root, padding=10)
+        nb = ttk.Notebook(self.root)
+        nb.pack(fill="both", expand=True)
+
+        opt_tab = ttk.Frame(nb)
+        insp_tab = ttk.Frame(nb)
+        nb.add(opt_tab, text="Optimización")
+        nb.add(insp_tab, text="Inspector")
+
+        frm = ttk.Frame(opt_tab, padding=10)
         frm.pack(fill="both", expand=True)
 
         top = ttk.Frame(frm)
@@ -1597,6 +2796,7 @@ class OptimizerGUI:
         self.txt.pack(fill="both", expand=True, padx=pad, pady=pad)
 
         self.log("Listo. Defaults cargados (recomendados).")
+        self.build_inspector(insp_tab)
 
     def pretty_name(self, key: str) -> str:
         m = {
@@ -1623,6 +2823,110 @@ class OptimizerGUI:
             "edge_trigger": "EdgeTrigger (0/1)",
         }
         return m.get(key, key)
+
+    def build_inspector(self, parent: tk.Widget):
+        pad = 6
+        top = ttk.Frame(parent)
+        top.pack(fill="x", padx=pad, pady=pad)
+
+        self.inspector_warn = tk.StringVar(value="Sin datos todavía.")
+        ttk.Label(top, textvariable=self.inspector_warn, foreground="#b00020").pack(side="left")
+
+        summary = ttk.LabelFrame(parent, text="Resumen")
+        summary.pack(fill="x", padx=pad, pady=pad)
+        self.inspector_summary = tk.Text(summary, height=6, wrap="word")
+        self.inspector_summary.pack(fill="both", expand=True, padx=pad, pady=pad)
+
+        table = ttk.LabelFrame(parent, text="Trades")
+        table.pack(fill="both", expand=True, padx=pad, pady=pad)
+        cols = ("time", "reason", "ret", "equity", "dd", "buyScore", "sellScore")
+        self.inspector_tree = ttk.Treeview(table, columns=cols, show="headings", height=10)
+        for c in cols:
+            self.inspector_tree.heading(c, text=c)
+            self.inspector_tree.column(c, width=100, anchor="center")
+        self.inspector_tree.pack(fill="both", expand=True, padx=pad, pady=pad)
+
+        charts = ttk.LabelFrame(parent, text="Charts")
+        charts.pack(fill="both", expand=True, padx=pad, pady=pad)
+
+        fig = Figure(figsize=(7, 4), dpi=100)
+        self.ax_equity = fig.add_subplot(311)
+        self.ax_dd = fig.add_subplot(312)
+        self.ax_hist = fig.add_subplot(313)
+        fig.tight_layout(pad=1.0)
+        self.inspector_canvas = FigureCanvasTkAgg(fig, master=charts)
+        self.inspector_canvas.get_tk_widget().pack(fill="both", expand=True)
+
+    def update_inspector(self, metrics: Metrics, trace_payload: dict, cfg: GAConfig):
+        if not metrics:
+            return
+
+        warnings = []
+        if metrics.trades < cfg.trade_floor * 0.25:
+            warnings.append("WARNING: Estrategia muerta (muy pocos trades)")
+        if metrics.gross_loss < 1e-6 and metrics.trades <= 10:
+            warnings.append("WARNING: PF inflado por ausencia de pérdidas")
+        if metrics.pf > 30 and metrics.trades < 20:
+            warnings.append("WARNING: Probable overfitting")
+        if metrics.buy_signal_rate < 0.01:
+            warnings.append("WARNING: Señales excesivamente restrictivas")
+
+        self.inspector_warn.set(" | ".join(warnings) if warnings else "Sin warnings críticos.")
+
+        returns = trace_payload.get("returns", [])
+        avg_ret = statistics.mean(returns) if returns else 0.0
+        med_ret = statistics.median(returns) if returns else 0.0
+        max_win = max(returns) if returns else 0.0
+        max_loss = min(returns) if returns else 0.0
+
+        summary_lines = [
+            f"trades={metrics.trades} | tpy={metrics.trades_per_year:.1f} | winrate={metrics.winrate:.1f}%",
+            f"gross_profit={metrics.gross_profit:.4f} gross_loss={metrics.gross_loss:.4f} PF={metrics.pf:.2f}",
+            f"net={metrics.net:.4f} balance={metrics.balance:.2f} ganancia={metrics.profit:.2f} DD%={metrics.dd_pct:.2f}",
+            f"avg_ret={avg_ret:.4f} median_ret={med_ret:.4f} max_win={max_win:.4f} max_loss={max_loss:.4f}",
+            f"buy_signal_rate={metrics.buy_signal_rate:.3f} sell_signal_rate={metrics.sell_signal_rate:.3f}",
+        ]
+        self.inspector_summary.delete("1.0", "end")
+        self.inspector_summary.insert("end", "\n".join(summary_lines))
+
+        for row in self.inspector_tree.get_children():
+            self.inspector_tree.delete(row)
+        for ev in trace_payload.get("events", []):
+            time_str = datetime.utcfromtimestamp(ev["time"] / 1000).strftime("%Y-%m-%d %H:%M")
+            self.inspector_tree.insert(
+                "",
+                "end",
+                values=(
+                    time_str,
+                    ev["reason"],
+                    f"{ev['ret']:.4f}",
+                    f"{ev['equity']:.3f}",
+                    f"{ev['dd']*100:.2f}%",
+                    f"{ev['buyScore']:.2f}",
+                    f"{ev['sellScore']:.2f}",
+                ),
+            )
+
+        equity_curve = trace_payload.get("equity_curve", [])
+        dd_curve = trace_payload.get("dd_curve", [])
+
+        self.ax_equity.clear()
+        self.ax_equity.plot(equity_curve, color="#1976d2")
+        self.ax_equity.set_title("Equity curve")
+        self.ax_equity.set_ylabel("Equity")
+
+        self.ax_dd.clear()
+        self.ax_dd.plot([d * 100 for d in dd_curve], color="#d32f2f")
+        self.ax_dd.set_title("Drawdown %")
+        self.ax_dd.set_ylabel("DD %")
+
+        self.ax_hist.clear()
+        if returns:
+            self.ax_hist.hist(returns, bins=20, color="#455a64")
+        self.ax_hist.set_title("Histograma retornos por trade")
+        self.ax_hist.set_xlabel("Retorno")
+
+        self.inspector_canvas.draw()
 
     def log(self, s: str):
         print(s, flush=True)
@@ -1765,6 +3069,7 @@ class OptimizerGUI:
 
             self.log(f"[OK] Temporalidad objetivo: {tf} -> {n} velas")
             self.log(f"[GA] pop={cfg.population} gens={cfg.generations} elite={cfg.elite} | cons={cfg.n_cons} exp={cfg.n_exp} wild={cfg.n_wild}")
+            self.log(f"[INFO] Ejecutando archivo: {os.path.abspath(__file__)}")
             self.log("[DESCARGA] Bajando datos desde Binance...")
 
             def job():
@@ -1772,19 +3077,39 @@ class OptimizerGUI:
                     candles = fetch_klines_public(symbol, tf, n)
                     self.cached_candles = candles
                     self.log(f"[OK] {symbol} cargado: {len(candles)} velas ({tf})")
+                    log_fn = lambda s: self.root.after(0, self.log, s)
+                    fee_per_side = self.var_fee.get() * self.var_fee_mult.get()
+                    slip_per_side = self.var_slip.get()
+
+                    def refresh_inspector(ge: Genome):
+                        metrics, trace_payload = simulate_spot(
+                            candles, ge, fee_per_side, slip_per_side, trace=True
+                        )
+                        self.last_trace = trace_payload
+                        self.last_trace_metrics = metrics
+                        self.root.after(
+                            0,
+                            lambda: self.update_inspector(metrics, trace_payload, cfg),
+                        )
+
                     best_global, best_metrics = run_ga(
                         candles=candles,
                         space=self.space,
                         cfg=cfg,
                         stop_flag=lambda: self._stop,
-                        log_fn=lambda s: self.root.after(0, self.log, s),
+                        log_fn=log_fn,
                     )
                     self.best_genome = best_global[1] if best_global else None
                     self.best_metrics = best_metrics
                     if self.best_genome:
+                        refresh_inspector(self.best_genome)
+
+                    if self.best_genome:
                         self.root.after(0, self.log, "[FIN] Mejor encontrado:")
                         self.root.after(0, self.log, json.dumps(asdict(self.best_genome), indent=2, ensure_ascii=False))
                 except Exception as e:
+                    print("[ERROR] OptimizerGUI.start failure:", flush=True)
+                    print(traceback.format_exc(), flush=True)
                     self.root.after(0, lambda err=e: messagebox.showerror("Error", str(err)))
 
             self.worker = threading.Thread(target=job, daemon=True)
@@ -1809,8 +3134,11 @@ class OptimizerGUI:
             ge = self.space.sample()
             metrics = simulate_spot(self.cached_candles, ge, self.var_fee.get() * self.var_fee_mult.get(), self.var_slip.get())
             self.log(
-                f"[BACKTEST] net={metrics.net:.4f} DD={metrics.max_dd:.4f} ({metrics.dd_pct:.2f}%) "
-                f"trades={metrics.trades} wr={metrics.winrate:.1f}% PF={metrics.pf:.2f}"
+                f"[BACKTEST] score={fitness_from_metrics(metrics, self.build_cfg()):.4f} "
+                f"PF={metrics.pf:.2f} trades={metrics.trades} tpy={metrics.trades_per_year:.1f} "
+                f"DD={metrics.dd_pct:.2f}% net={metrics.net:.4f} "
+                f"ganancia={metrics.profit:.2f} balance={metrics.balance:.2f} "
+                f"wr={metrics.winrate:.1f}%"
             )
         except Exception as e:
             messagebox.showerror("Error", str(e))
