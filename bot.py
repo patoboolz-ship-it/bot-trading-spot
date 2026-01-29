@@ -912,6 +912,7 @@ class SpotBot:
         except BinanceAPIException as e:
             self._emit("log", {"msg": f"[ERROR] Error de Binance al vender: {e}"})
             return None
+        return self._place_market_sell_qty(qty, reason="MANUAL_SELL")
 
     def manual_buy_by_quote_pct(self, pct: float) -> Optional[Trade]:
         usdt_free = get_free_balance(self.client, QUOTE_ASSET)
@@ -2027,7 +2028,7 @@ PARAM_GENES = [
     "use_ha",
 ]
 
-PARAM_BLOCKS = ["RSI", "MACD", "CONSEC"]
+PARAM_BLOCKS = ["RSI", "MACD", "CONSEC", "RISK", "CONF"]
 WEIGHT_KEYS = [
     "w_buy_rsi", "w_buy_macd", "w_buy_consec",
     "w_sell_rsi", "w_sell_macd", "w_sell_consec",
@@ -2036,6 +2037,18 @@ WEIGHT_KEYS = [
 WEIGHT_MUT_RATE = 0.35
 PARAM_MUT_RATE = 0.08
 WEIGHT_MUT_SIGMA = 0.06
+BLOCK_SELECTION_WEIGHTS = {
+    "RSI": 1.0,
+    "MACD": 1.4,
+    "CONSEC": 1.0,
+    "RISK": 1.0,
+    "CONF": 0.8,
+}
+BLOCK_COUNT_WEIGHTS = {
+    1: 0.35,
+    2: 0.45,
+    3: 0.20,
+}
 
 BLOCKS = {
     "RSI": ["rsi_period", "rsi_oversold", "rsi_overbought"],
@@ -2095,7 +2108,7 @@ def make_child_blocky(
     space: ParamSpace,
     p1: Genome,
     p2: Genome,
-    param_block: Optional[str],
+    param_blocks: Optional[list[str]],
     *,
     param_mut_rate: float = PARAM_MUT_RATE,
     weight_mut_rate: float = WEIGHT_MUT_RATE,
@@ -2120,28 +2133,31 @@ def make_child_blocky(
             mutated_blocks.append("WEIGHTS")
             mutated_genes.extend(mutated_weight_genes)
 
-    if param_block and random.random() < param_mut_rate:
-        before = child.copy()
-        mutate_block(child, space, param_block, strength=strength)
-        if not any(child[g] != before[g] for g in BLOCKS[param_block]):
-            gk = random.choice(BLOCKS[param_block])
-            spec = space.spec[gk]
-            lo, hi, tp = spec["min"], spec["max"], spec["type"]
-            if tp == "int":
-                current = int(child[gk])
-                options = [v for v in range(int(lo), int(hi) + 1, int(spec["step"])) if v != current]
-                if options:
-                    child[gk] = random.choice(options)
-            else:
-                current = float(child[gk])
-                new_val = lo + (hi - lo) * random.random()
-                if abs(new_val - current) < 1e-9:
-                    new_val = lo if abs(lo - current) > abs(hi - current) else hi
-                child[gk] = space.quantize(gk, new_val)
-        mutated_param_genes = [g for g in BLOCKS[param_block] if child[g] != before[g]]
-        if mutated_param_genes:
-            mutated_blocks.append(param_block)
-            mutated_genes.extend(mutated_param_genes)
+    if param_blocks:
+        for param_block in param_blocks:
+            if random.random() >= param_mut_rate:
+                continue
+            before = child.copy()
+            mutate_block(child, space, param_block, strength=strength)
+            if not any(child[g] != before[g] for g in BLOCKS[param_block]):
+                gk = random.choice(BLOCKS[param_block])
+                spec = space.spec[gk]
+                lo, hi, tp = spec["min"], spec["max"], spec["type"]
+                if tp == "int":
+                    current = int(child[gk])
+                    options = [v for v in range(int(lo), int(hi) + 1, int(spec["step"])) if v != current]
+                    if options:
+                        child[gk] = random.choice(options)
+                else:
+                    current = float(child[gk])
+                    new_val = lo + (hi - lo) * random.random()
+                    if abs(new_val - current) < 1e-9:
+                        new_val = lo if abs(lo - current) > abs(hi - current) else hi
+                    child[gk] = space.quantize(gk, new_val)
+            mutated_param_genes = [g for g in BLOCKS[param_block] if child[g] != before[g]]
+            if mutated_param_genes:
+                mutated_blocks.append(param_block)
+                mutated_genes.extend(mutated_param_genes)
 
     mutated = len(mutated_genes) > 0
     if mutated:
@@ -2242,11 +2258,12 @@ def run_ga(
     prev_best_hash = None
     stuck = 0
     prev_best_hash = None
-    active_param_block = None
+    active_param_blocks = None
     recent_blocks = deque(maxlen=7)
     param_blocks = [b for b in (allowed_blocks or PARAM_BLOCKS) if b in PARAM_BLOCKS]
     if not param_blocks:
         param_blocks = PARAM_BLOCKS[:]
+    print(f"[GA] bloques_disponibles={param_blocks}", flush=True)
 
     def strength_for_combo(count: int) -> float:
         if count <= 1:
@@ -2299,14 +2316,23 @@ def run_ga(
         for gene in sorted(mutation_counter.keys()):
             print(f"{gene}={mutation_counter[gene]}")
 
-    def pick_random_block() -> Optional[str]:
+    def pick_random_block_combo() -> Optional[list[str]]:
         if not param_blocks:
             return None
+        weights = [BLOCK_SELECTION_WEIGHTS.get(b, 1.0) for b in param_blocks]
+        counts = list(BLOCK_COUNT_WEIGHTS.keys())
+        count_weights = [BLOCK_COUNT_WEIGHTS[c] for c in counts]
         while True:
-            block = random.choice(param_blocks)
-            if block not in recent_blocks:
-                recent_blocks.append(block)
-                return block
+            count = random.choices(counts, weights=count_weights, k=1)[0]
+            count = min(count, len(param_blocks))
+            chosen = set()
+            while len(chosen) < count:
+                block = random.choices(param_blocks, weights=weights, k=1)[0]
+                chosen.add(block)
+            combo = tuple(sorted(chosen))
+            if combo not in recent_blocks:
+                recent_blocks.append(combo)
+                return list(combo)
 
     total_gens = cfg.generations
     for gen in range(1, total_gens + 1):
@@ -2331,7 +2357,7 @@ def run_ga(
             if DEBUG_GA_PROGRESS and indiv_elapsed >= GA_INDIVIDUAL_WARN_S:
                 print(
                     f"[GA][WARN] GEN {gen_display} individuo {idx}/{len(pop)} lento "
-                    f"({indiv_elapsed:.1f}s) | {format_genome(ge)}",
+                    f"({indiv_elapsed:.1f}s) | bloques={active_param_blocks} | {format_genome(ge)}",
                     flush=True,
                 )
                 last_heartbeat = time.perf_counter()
@@ -2351,7 +2377,7 @@ def run_ga(
             best_global = (best_score, copy.deepcopy(best_ge))
             best_metrics = best_m
             stuck = 0
-            active_param_block = None
+            active_param_blocks = None
         else:
             stuck += 1
             if is_weight_opt:
@@ -2400,16 +2426,19 @@ def run_ga(
         if stuck >= BLOCK_STUCK_LIMIT:
             mask_saturated = True
 
-        if active_param_block is None:
-            active_param_block = pick_random_block()
-            print(f"[BLOQUE] activo: {active_param_block} | pesos siempre mutan | gens={BLOCK_STUCK_LIMIT}", flush=True)
+        if active_param_blocks is None:
+            active_param_blocks = pick_random_block_combo()
+            print(
+                f"[BLOQUE] activos: {active_param_blocks} | pesos siempre mutan | gens={BLOCK_STUCK_LIMIT}",
+                flush=True,
+            )
         elif mask_saturated:
             print("[INFO] Bloque sin mejora -> cambiando bloque", flush=True)
             before_switch = time.perf_counter()
-            active_param_block = pick_random_block()
+            active_param_blocks = pick_random_block_combo()
             switch_elapsed = time.perf_counter() - before_switch
             print(
-                f"[BLOQUE] activo: {active_param_block} | pesos siempre mutan | "
+                f"[BLOQUE] activos: {active_param_blocks} | pesos siempre mutan | "
                 f"gens={BLOCK_STUCK_LIMIT} | cambio_en={switch_elapsed:.3f}s",
                 flush=True,
             )
@@ -2418,7 +2447,7 @@ def run_ga(
         if DEBUG_FULL_POPULATION:
             print(
                 f"===== GENERACION {gen_display} | POP_SIZE={len(pop)} | "
-                f"BLOQUE ACTIVO: {active_param_block} (pesos siempre mutan) ====="
+                f"BLOQUE(S) ACTIVOS: {active_param_blocks} (pesos siempre mutan) ====="
             )
 
         extra_cov = []
@@ -2429,7 +2458,7 @@ def run_ga(
         children = []
         child_meta = [] if DEBUG_MUTATION else None
 
-        forced_strength = strength_for_combo(1) if active_param_block else None
+        forced_strength = strength_for_combo(len(active_param_blocks or [])) if active_param_blocks else None
 
         for _ in range(cfg.n_cons):
             p1 = random.choice(pool)
@@ -2438,8 +2467,8 @@ def run_ga(
                 space,
                 p1,
                 p2,
-                param_block=active_param_block,
-                strength=forced_strength if active_param_block else 0.55,
+                param_blocks=active_param_blocks,
+                strength=forced_strength if active_param_blocks else 0.55,
                 return_meta=DEBUG_MUTATION,
             )
             if DEBUG_MUTATION:
@@ -2456,8 +2485,8 @@ def run_ga(
                 space,
                 p1,
                 p2,
-                param_block=active_param_block,
-                strength=forced_strength if active_param_block else 0.80,
+                param_blocks=active_param_blocks,
+                strength=forced_strength if active_param_blocks else 0.80,
                 return_meta=DEBUG_MUTATION,
             )
             if DEBUG_MUTATION:
@@ -2474,8 +2503,8 @@ def run_ga(
                 space,
                 p1,
                 p2,
-                param_block=active_param_block,
-                strength=forced_strength if active_param_block else 1.00,
+                param_blocks=active_param_blocks,
+                strength=forced_strength if active_param_blocks else 1.00,
                 return_meta=DEBUG_MUTATION,
             )
             if DEBUG_MUTATION:
@@ -2549,8 +2578,8 @@ def run_ga(
                     space,
                     ge,
                     ge,
-                    param_block=active_param_block,
-                    strength=forced_strength if active_param_block else 0.80,
+                    param_blocks=active_param_blocks,
+                    strength=forced_strength if active_param_blocks else 0.80,
                     return_meta=DEBUG_MUTATION,
                 )
                 if DEBUG_MUTATION:
@@ -2580,8 +2609,8 @@ def run_ga(
                 space,
                 seed,
                 seed,
-                param_block=active_param_block,
-                strength=forced_strength if active_param_block else 0.80,
+                param_blocks=active_param_blocks,
+                strength=forced_strength if active_param_blocks else 0.80,
                 return_meta=DEBUG_MUTATION,
             )
             if DEBUG_MUTATION:
