@@ -244,6 +244,49 @@ def heikin_ashi(ohlc):
         ha_close_prev = ha_close
     return ha
 
+def ema_series(series, length: int):
+    if length <= 0:
+        return [series[0]] * len(series)
+    alpha = 2.0 / (length + 1.0)
+    out = []
+    prev = series[0]
+    out.append(prev)
+    for x in series[1:]:
+        prev = prev + alpha * (x - prev)
+        out.append(prev)
+    return out
+
+def rsi_wilder_series(close, period: int):
+    period = max(2, int(period))
+    deltas = [0.0]
+    for i in range(1, len(close)):
+        deltas.append(close[i] - close[i - 1])
+    gains = [max(d, 0.0) for d in deltas]
+    losses = [max(-d, 0.0) for d in deltas]
+    alpha = 1.0 / period
+    avg_gain = gains[0]
+    avg_loss = losses[0]
+    rsis = [50.0] * len(close)
+    for i in range(1, len(close)):
+        avg_gain = avg_gain + alpha * (gains[i] - avg_gain)
+        avg_loss = avg_loss + alpha * (losses[i] - avg_loss)
+        if avg_loss <= 1e-12:
+            rsis[i] = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsis[i] = 100 - (100 / (1 + rs))
+    return rsis
+
+def macd_hist_series(close, fast: int, slow: int, signal: int):
+    fast = max(2, int(fast))
+    slow = max(fast + 1, int(slow))
+    signal = max(2, int(signal))
+    ema_fast = ema_series(close, fast)
+    ema_slow = ema_series(close, slow)
+    macd_line = [a - b for a, b in zip(ema_fast, ema_slow)]
+    macd_signal = ema_series(macd_line, signal)
+    return [a - b for a, b in zip(macd_line, macd_signal)]
+
 def macd_hist(close, fast: int, slow: int, signal: int):
     fast = max(2, int(fast))
     slow = max(fast + 1, int(slow))
@@ -912,7 +955,6 @@ class SpotBot:
         except BinanceAPIException as e:
             self._emit("log", {"msg": f"[ERROR] Error de Binance al vender: {e}"})
             return None
-        return self._place_market_sell_qty(qty, reason="MANUAL_SELL")
 
     def manual_buy_by_quote_pct(self, pct: float) -> Optional[Trade]:
         usdt_free = get_free_balance(self.client, QUOTE_ASSET)
@@ -1768,10 +1810,10 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
         return (metrics, {"events": [], "equity_curve": [], "dd_curve": [], "returns": []}) if trace else metrics
 
     data = heikin_ashi(candles) if ge.use_ha == 1 else candles
-    close = [c["close"] for c in data]
+    close_sig = [c["close"] for c in data]
 
-    rsi_arr = rsi(close, ge.rsi_period)
-    mh_arr = macd_hist(close, ge.macd_fast, ge.macd_slow, ge.macd_signal)
+    rsi_arr = rsi_wilder_series(close_sig, ge.rsi_period)
+    mh_arr = macd_hist_series(close_sig, ge.macd_fast, ge.macd_slow, ge.macd_signal)
 
     equity = 1.0
     peak = equity
@@ -1824,32 +1866,30 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
     buy_signal_hits = 0
     sell_signal_hits = 0
 
-    for i in range(1, len(close)):
+    for i in range(1, len(candles) - 1):
         peak = max(peak, equity)
         dd = peak - equity
         if dd > max_dd:
             max_dd = dd
 
-        exec_px = close[i]
-        score_payload = score_components_at_index(
-            close,
-            rsi_arr,
-            mh_arr,
-            i,
-            rsi_oversold=ge.rsi_oversold,
-            rsi_overbought=ge.rsi_overbought,
-            consec_red=ge.consec_red,
-            consec_green=ge.consec_green,
-            edge_trigger=ge.edge_trigger,
-            w_buy_rsi=ge.w_buy_rsi,
-            w_buy_macd=ge.w_buy_macd,
-            w_buy_consec=ge.w_buy_consec,
-            w_sell_rsi=ge.w_sell_rsi,
-            w_sell_macd=ge.w_sell_macd,
-            w_sell_consec=ge.w_sell_consec,
-        )
-        bs = score_payload["buy_score"]
-        ss = score_payload["sell_score"]
+        if i <= 0:
+            prev_close = close_sig[i]
+        else:
+            prev_close = close_sig[i - 1]
+        rsi_val = rsi_arr[i]
+        mh_val = mh_arr[i]
+
+        rsi_buy = 1.0 if rsi_val <= ge.rsi_oversold else 0.0
+        rsi_sell = 1.0 if rsi_val >= ge.rsi_overbought else 0.0
+        macd_buy = 1.0 if mh_val > 0 else 0.0
+        macd_sell = 1.0 if mh_val < 0 else 0.0
+        consec_buy = 1.0 if close_sig[i] <= prev_close else 0.0
+        consec_sell = 1.0 if close_sig[i] >= prev_close else 0.0
+
+        wbr, wbm, wbc = normalize3(ge.w_buy_rsi, ge.w_buy_macd, ge.w_buy_consec)
+        wsr, wsm, wsc = normalize3(ge.w_sell_rsi, ge.w_sell_macd, ge.w_sell_consec)
+        bs = wbr * rsi_buy + wbm * macd_buy + wbc * consec_buy
+        ss = wsr * rsi_sell + wsm * macd_sell + wsc * consec_sell
         if bs >= ge.buy_th:
             buy_signal_hits += 1
         if ss >= ge.sell_th:
@@ -1858,34 +1898,38 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
         if i - last_trade_i < int(ge.cooldown):
             continue
 
+        next_candle = candles[i + 1]
+        exec_open = next_candle["open"]
         if not in_pos:
             if bs >= ge.buy_th:
-                buy_price = exec_px * (1.0 + slip_per_side)
+                buy_price = exec_open * (1.0 + slip_per_side)
                 equity *= (1.0 - fee_per_side)
                 entry = buy_price
                 in_pos = True
-                entry_i = i
-                last_trade_i = i
+                entry_i = i + 1
+                last_trade_i = i + 1
                 entry_buy_score = bs
-                entry_rsi = rsi_arr[i]
-                entry_macd = mh_arr[i]
-                entry_close = close[i]
+                entry_rsi = rsi_val
+                entry_macd = mh_val
+                entry_close = close_sig[i]
         else:
-            if i <= entry_i:
+            if i + 1 <= entry_i:
                 continue
 
-            px = exec_px
             # [TP/SL PRICE CALCULATION] usando magnitudes abs
             tp_px = entry * (1.0 + tp_pct) if tp_pct > 0 else None
             sl_px = entry * (1.0 - sl_pct) if sl_pct > 0 else None
 
             exit_reason = None
-            if tp_px is not None and px >= tp_px:
-                exit_reason = "TP"
-            elif sl_px is not None and px <= sl_px:
+            if sl_px is not None and next_candle["low"] <= sl_px:
                 exit_reason = "SL"
+                px = sl_px
+            elif tp_px is not None and next_candle["high"] >= tp_px:
+                exit_reason = "TP"
+                px = tp_px
             elif ss >= ge.sell_th:
                 exit_reason = "SIG"
+                px = exec_open
 
             if exit_reason is not None:
                 sell_price = px * (1.0 - slip_per_side)
@@ -1895,9 +1939,9 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
 
                 equity *= trade_ratio
                 if trace:
-                    candle_time = candles[i].get("close_time", candles[i].get("t"))
+                    candle_time = next_candle.get("open_time", next_candle.get("t"))
                     events.append({
-                        "i": i,
+                        "i": i + 1,
                         "time": candle_time,
                         "side": "SELL",
                         "reason": exit_reason,
@@ -1925,7 +1969,11 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
                 in_pos = False
                 entry = 0.0
                 entry_i = -10_000
-                last_trade_i = i
+                last_trade_i = i + 1
+
+        if trace:
+            equity_curve.append(equity)
+            dd_curve.append((peak - equity) / peak if peak > 0 else 0.0)
 
         if trace:
             equity_curve.append(equity)
@@ -1944,8 +1992,8 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
     last_ts = candles[-1].get("close_time", candles[-1].get("t"))
     years = max((last_ts - first_ts) / (1000 * 60 * 60 * 24 * 365), 1e-9)
     trades_per_year = trades / years
-    buy_signal_rate = buy_signal_hits / len(close)
-    sell_signal_rate = sell_signal_hits / len(close)
+    buy_signal_rate = buy_signal_hits / len(close_sig)
+    sell_signal_rate = sell_signal_hits / len(close_sig)
 
     score = pf
 
