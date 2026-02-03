@@ -71,6 +71,12 @@ RETRY_SLEEP_SEC = 2
 # Ejecutar real o simulación
 DRY_RUN = True
 
+# Rango de fechas para simulador/optimizador
+START_DATE = "2023-01-01"
+END_DATE = "2025-01-01"
+CACHE_INDICATORS = False
+OUT_DIR = r"C:\Users\EQCONF\Documents\programas python\historial de velas"
+
 # Logs / journal
 JOURNAL_CSV = "bot_journal.csv"
 
@@ -1625,6 +1631,206 @@ INTERVAL_MS = {
     "1d": 86_400_000,
 }
 
+def ensure_out_dir():
+    os.makedirs(OUT_DIR, exist_ok=True)
+
+def tv_parse_date_ms(date_str: str, *, end: bool = False) -> int:
+    base = datetime.strptime(date_str, "%Y-%m-%d")
+    if end:
+        base = base.replace(hour=23, minute=59, second=59, microsecond=999000)
+    return int(base.replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+def tv_build_json_path(symbol: str, timeframe: str, start_date: str, end_date: str) -> str:
+    safe_symbol = symbol.upper()
+    filename = f"{safe_symbol}_{timeframe}_{start_date}__{end_date}.json"
+    return os.path.join(OUT_DIR, filename)
+
+def fetch_ohlcv_by_date_range(
+    symbol: str,
+    timeframe: str,
+    start_date: str,
+    end_date: str,
+    exchange: str = "binance",
+):
+    if timeframe not in INTERVAL_MS:
+        raise ValueError(f"Intervalo no soportado: {timeframe}")
+    if exchange.lower() != "binance":
+        raise ValueError(f"Exchange no soportado: {exchange}")
+
+    tv_start_ms = tv_parse_date_ms(start_date)
+    tv_end_ms = tv_parse_date_ms(end_date, end=True)
+    tv_interval_ms = INTERVAL_MS[timeframe]
+
+    out = []
+    cursor = tv_start_ms
+    while cursor <= tv_end_ms:
+        params = {
+            "symbol": symbol.upper(),
+            "interval": timeframe,
+            "limit": 1000,
+            "startTime": cursor,
+            "endTime": tv_end_ms,
+        }
+
+        data = None
+        last_err = None
+        for attempt in range(1, BINANCE_MAX_RETRIES + 1):
+            try:
+                r = requests.get(
+                    BINANCE_BASE + "/api/v3/klines",
+                    params=params,
+                    timeout=BINANCE_TIMEOUT_SEC,
+                )
+                r.raise_for_status()
+                data = r.json()
+                break
+            except requests.exceptions.RequestException as exc:
+                last_err = exc
+                if attempt == BINANCE_MAX_RETRIES:
+                    raise
+                time.sleep(BINANCE_RETRY_BACKOFF_SEC * attempt)
+
+        if data is None:
+            if last_err:
+                raise last_err
+            raise RuntimeError("Sin respuesta de Binance en klines.")
+        if not data:
+            break
+
+        for k in data:
+            ts = int(k[0])
+            if ts > tv_end_ms:
+                break
+            out.append({
+                "datetime": datetime.fromtimestamp(ts / 1000, tz=timezone.utc).isoformat(),
+                "timestamp_ms": ts,
+                "open": float(k[1]),
+                "high": float(k[2]),
+                "low": float(k[3]),
+                "close": float(k[4]),
+                "volume": float(k[5]),
+            })
+
+        cursor = int(data[-1][0]) + tv_interval_ms
+        time.sleep(0.12)
+
+    tv_df = pd.DataFrame(out)
+    if not tv_df.empty:
+        tv_df = tv_df.sort_values("timestamp_ms").reset_index(drop=True)
+    return tv_df
+
+def save_candles_json(df, symbol: str, timeframe: str, start_date: str, end_date: str, exchange: str):
+    ensure_out_dir()
+    tv_path = tv_build_json_path(symbol, timeframe, start_date, end_date)
+    tv_records = df.to_dict("records")
+    for rec in tv_records:
+        rec["symbol"] = symbol.upper()
+        rec["timeframe"] = timeframe
+        rec["exchange"] = exchange
+    with open(tv_path, "w", encoding="utf-8") as f:
+        json.dump(tv_records, f, indent=2, ensure_ascii=False)
+    return tv_path
+
+def load_candles_json(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if isinstance(payload, dict) and "candles" in payload:
+        payload = payload["candles"]
+    tv_df = pd.DataFrame(payload)
+    if not tv_df.empty:
+        tv_df = tv_df.sort_values("timestamp_ms").reset_index(drop=True)
+    return tv_df
+
+def tv_indicator_cache_key(params: dict) -> str:
+    keys = [
+        "use_ha",
+        "rsi_period",
+        "rsi_oversold",
+        "rsi_overbought",
+        "macd_fast",
+        "macd_slow",
+        "macd_signal",
+        "consec_red",
+        "consec_green",
+        "w_buy_rsi",
+        "w_buy_macd",
+        "w_buy_consec",
+        "w_sell_rsi",
+        "w_sell_macd",
+        "w_sell_consec",
+        "buy_th",
+        "sell_th",
+    ]
+    payload = {k: params.get(k) for k in keys}
+    return json.dumps(payload, sort_keys=True)
+
+def tv_apply_indicator_cache(tv_df: pd.DataFrame, params: dict):
+    if tv_df.empty:
+        return tv_df
+    use_ha = int(params.get("use_ha", 0)) == 1
+    if use_ha:
+        ha_candles = heikin_ashi(tv_df.to_dict("records"))
+        ha_close = [c["close"] for c in ha_candles]
+        tv_df["ha_close"] = ha_close
+        src_close = ha_close
+    else:
+        src_close = tv_df["close"].tolist()
+
+    tv_df["rsi"] = rsi_wilder_series(src_close, int(params.get("rsi_period", 14)))
+    tv_df["macd_hist"] = macd_hist_series(
+        src_close,
+        int(params.get("macd_fast", 12)),
+        int(params.get("macd_slow", 26)),
+        int(params.get("macd_signal", 9)),
+    )
+    rsi_os = float(params.get("rsi_oversold", 30))
+    rsi_ob = float(params.get("rsi_overbought", 70))
+    wbr, wbm, wbc = normalize3(
+        float(params.get("w_buy_rsi", 1.0)),
+        float(params.get("w_buy_macd", 1.0)),
+        float(params.get("w_buy_consec", 1.0)),
+    )
+    wsr, wsm, wsc = normalize3(
+        float(params.get("w_sell_rsi", 1.0)),
+        float(params.get("w_sell_macd", 1.0)),
+        float(params.get("w_sell_consec", 1.0)),
+    )
+    prev_close = tv_df["close"].shift(1)
+    rsi_buy = (tv_df["rsi"] <= rsi_os).astype(float)
+    rsi_sell = (tv_df["rsi"] >= rsi_ob).astype(float)
+    macd_buy = (tv_df["macd_hist"] > 0).astype(float)
+    macd_sell = (tv_df["macd_hist"] < 0).astype(float)
+    consec_buy = (tv_df["close"] <= prev_close).astype(float)
+    consec_sell = (tv_df["close"] >= prev_close).astype(float)
+    tv_df["buy_score"] = wbr * rsi_buy + wbm * macd_buy + wbc * consec_buy
+    tv_df["sell_score"] = wsr * rsi_sell + wsm * macd_sell + wsc * consec_sell
+    cache_key = tv_indicator_cache_key(params)
+    tv_df["cache_key"] = cache_key
+    return tv_df
+
+def tv_df_to_candles(tv_df: pd.DataFrame, timeframe: str):
+    interval_ms = INTERVAL_MS[timeframe]
+    candles = []
+    for rec in tv_df.to_dict("records"):
+        ts = int(rec["timestamp_ms"])
+        candles.append(
+            {
+                "t": ts,
+                "open_time": ts,
+                "close_time": ts + interval_ms,
+                "open": float(rec["open"]),
+                "high": float(rec["high"]),
+                "low": float(rec["low"]),
+                "close": float(rec["close"]),
+                "v": float(rec.get("volume", rec.get("v", 0.0))),
+                "rsi": rec.get("rsi"),
+                "macd_hist": rec.get("macd_hist"),
+                "ha_close": rec.get("ha_close"),
+                "cache_key": rec.get("cache_key"),
+            }
+        )
+    return candles
+
 
 def fetch_klines_public(symbol: str, interval: str, limit: int):
     if interval not in INTERVAL_MS:
@@ -1809,11 +2015,26 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
         )
         return (metrics, {"events": [], "equity_curve": [], "dd_curve": [], "returns": []}) if trace else metrics
 
-    data = heikin_ashi(candles) if ge.use_ha == 1 else candles
-    close_sig = [c["close"] for c in data]
-
-    rsi_arr = rsi_wilder_series(close_sig, ge.rsi_period)
-    mh_arr = macd_hist_series(close_sig, ge.macd_fast, ge.macd_slow, ge.macd_signal)
+    cache_key = tv_indicator_cache_key(asdict(ge))
+    use_cached = all(
+        ("cache_key" in c and c.get("cache_key") == cache_key and c.get("rsi") is not None and c.get("macd_hist") is not None)
+        for c in candles
+    )
+    if use_cached:
+        if ge.use_ha == 1:
+            close_sig = [
+                c.get("ha_close") if c.get("ha_close") is not None else c["close"]
+                for c in candles
+            ]
+        else:
+            close_sig = [c["close"] for c in candles]
+        rsi_arr = [float(c["rsi"]) for c in candles]
+        mh_arr = [float(c["macd_hist"]) for c in candles]
+    else:
+        data = heikin_ashi(candles) if ge.use_ha == 1 else candles
+        close_sig = [c["close"] for c in data]
+        rsi_arr = rsi_wilder_series(close_sig, ge.rsi_period)
+        mh_arr = macd_hist_series(close_sig, ge.macd_fast, ge.macd_slow, ge.macd_signal)
 
     equity = 1.0
     peak = equity
@@ -1970,10 +2191,6 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
                 entry = 0.0
                 entry_i = -10_000
                 last_trade_i = i + 1
-
-        if trace:
-            equity_curve.append(equity)
-            dd_curve.append((peak - equity) / peak if peak > 0 else 0.0)
 
         if trace:
             equity_curve.append(equity)
@@ -2733,6 +2950,9 @@ class OptimizerGUI:
         self.var_symbol = tk.StringVar(value=SYMBOL)
         self.var_tf = tk.StringVar(value=INTERVAL)
         self.var_candles = tk.IntVar(value=3000)
+        self.var_start_date = tk.StringVar(value=START_DATE)
+        self.var_end_date = tk.StringVar(value=END_DATE)
+        self.var_cache_ind = tk.BooleanVar(value=CACHE_INDICATORS)
 
         self.var_pop = tk.IntVar(value=160)
         self.var_gens = tk.IntVar(value=120)
@@ -2815,6 +3035,8 @@ class OptimizerGUI:
         ttk.Label(top, text="Temporalidad:").pack(side="left", padx=4)
         cb = ttk.Combobox(top, textvariable=self.var_tf, values=list(INTERVAL_MS.keys()), width=6, state="readonly")
         cb.pack(side="left", padx=4)
+        add_labeled(top, "Inicio:", self.var_start_date, 12)
+        add_labeled(top, "Fin:", self.var_end_date, 12)
         add_labeled(top, "Velas:", self.var_candles, 8)
 
         mid = ttk.Frame(frm)
@@ -2840,6 +3062,7 @@ class OptimizerGUI:
         add_labeled(fit, "DD weight:", self.var_dd_w, 6)
         add_labeled(fit, "Trade floor:", self.var_trade_floor, 8)
         add_labeled(fit, "Pen/trade falt.:", self.var_pen_missing, 8)
+        ttk.Checkbutton(fit, text="Cache indicadores", variable=self.var_cache_ind).pack(side="left", padx=8)
 
         mode = ttk.LabelFrame(frm, text="Modo de optimización")
         mode.pack(fill="x", padx=pad, pady=pad)
@@ -3092,6 +3315,9 @@ class OptimizerGUI:
                 "symbol": self.var_symbol.get().strip(),
                 "timeframe": self.var_tf.get().strip(),
                 "candles": int(self.var_candles.get()),
+                "start_date": self.var_start_date.get().strip(),
+                "end_date": self.var_end_date.get().strip(),
+                "cache_indicators": bool(self.var_cache_ind.get()),
                 "ga": asdict(cfg),
                 "space": self.space.spec,
             }
@@ -3115,6 +3341,9 @@ class OptimizerGUI:
             self.var_symbol.set(payload.get("symbol", SYMBOL))
             self.var_tf.set(payload.get("timeframe", INTERVAL))
             self.var_candles.set(int(payload.get("candles", 3000)))
+            self.var_start_date.set(payload.get("start_date", START_DATE))
+            self.var_end_date.set(payload.get("end_date", END_DATE))
+            self.var_cache_ind.set(bool(payload.get("cache_indicators", CACHE_INDICATORS)))
 
             ga = payload.get("ga", {})
             self.var_pop.set(int(ga.get("population", self.var_pop.get())))
@@ -3155,21 +3384,80 @@ class OptimizerGUI:
             cfg = self.build_cfg()
             symbol = self.var_symbol.get().strip().upper()
             tf = self.var_tf.get().strip()
-            n = int(self.var_candles.get())
+            start_date = self.var_start_date.get().strip()
+            end_date = self.var_end_date.get().strip()
+            cache_ind = bool(self.var_cache_ind.get())
 
             self._stop = False
             self.txt.delete("1.0", "end")
 
-            self.log(f"[OK] Temporalidad objetivo: {tf} -> {n} velas")
+            self.log(f"[OK] Temporalidad objetivo: {tf} | rango {start_date} -> {end_date}")
             self.log(f"[GA] pop={cfg.population} gens={cfg.generations} elite={cfg.elite} | cons={cfg.n_cons} exp={cfg.n_exp} wild={cfg.n_wild}")
             self.log(f"[INFO] Ejecutando archivo: {os.path.abspath(__file__)}")
-            self.log("[DESCARGA] Bajando datos desde Binance...")
+            self.log("[DATOS] Revisando cache de velas...")
 
             def job():
                 try:
-                    candles = fetch_klines_public(symbol, tf, n)
+                    tv_path = tv_build_json_path(symbol, tf, start_date, end_date)
+                    if not os.path.exists(tv_path):
+                        self.log("[DESCARGA] Bajando datos desde Binance...")
+                        tv_df = fetch_ohlcv_by_date_range(symbol, tf, start_date, end_date)
+                        if cache_ind:
+                            tv_df = tv_apply_indicator_cache(tv_df, DEFAULT_GEN)
+                        tv_path = save_candles_json(tv_df, symbol, tf, start_date, end_date, "binance")
+                        self.log(f"[OK] JSON creado: {tv_path}")
+                    else:
+                        self.log(f"[OK] JSON existente: {tv_path}")
+
+                    tv_df = load_candles_json(tv_path)
+                    self.log(f"[OK] {symbol} cargado: {len(tv_df)} velas ({tf})")
+                    if not tv_df.empty:
+                        self.log(
+                            f"[VERIF] rango={tv_df['datetime'].min()} -> {tv_df['datetime'].max()} "
+                            f"| velas={len(tv_df)}"
+                        )
+                        self.log("[VERIF] primeras 3 filas:")
+                        self.log(tv_df[["datetime", "open", "high", "low", "close"]].head(3).to_string(index=False))
+                        self.log("[VERIF] ultimas 3 filas:")
+                        self.log(tv_df[["datetime", "open", "high", "low", "close"]].tail(3).to_string(index=False))
+                        if "rsi" in tv_df.columns or "macd_hist" in tv_df.columns:
+                            nan_rsi = tv_df["rsi"].isna().sum() if "rsi" in tv_df.columns else 0
+                            nan_macd = tv_df["macd_hist"].isna().sum() if "macd_hist" in tv_df.columns else 0
+                            self.log(f"[VERIF] NaN RSI={nan_rsi} NaN MACD={nan_macd}")
+
+                    candles = tv_df_to_candles(tv_df, tf)
                     self.cached_candles = candles
-                    self.log(f"[OK] {symbol} cargado: {len(candles)} velas ({tf})")
+
+                    test_params = DEFAULT_GEN.copy()
+                    test_params.update(
+                        {
+                            "use_ha": 1,
+                            "rsi_period": 15,
+                            "rsi_oversold": 32,
+                            "rsi_overbought": 80,
+                            "macd_fast": 26,
+                            "macd_slow": 87,
+                            "macd_signal": 47,
+                            "consec_red": 5,
+                            "consec_green": 3,
+                            "take_profit": 0.27,
+                            "stop_loss": 0.04,
+                            "cooldown": 12,
+                            "buy_th": 0.85,
+                            "sell_th": 0.55,
+                        }
+                    )
+                    test_ge = Genome(**test_params)
+                    test_metrics = simulate_spot(
+                        candles,
+                        test_ge,
+                        self.var_fee.get() * self.var_fee_mult.get(),
+                        self.var_slip.get(),
+                    )
+                    self.log(
+                        f"[PRUEBA] GEN600 balance={test_metrics.balance:.2f} trades={test_metrics.trades} "
+                        f"PF={test_metrics.pf:.2f} net={test_metrics.net:.4f} winrate={test_metrics.winrate:.1f}%"
+                    )
                     log_fn = lambda s: self.root.after(0, self.log, s)
                     fee_per_side = self.var_fee.get() * self.var_fee_mult.get()
                     slip_per_side = self.var_slip.get()
@@ -3220,9 +3508,18 @@ class OptimizerGUI:
             if not self.cached_candles:
                 symbol = self.var_symbol.get().strip().upper()
                 tf = self.var_tf.get().strip()
-                n = int(self.var_candles.get())
-                self.log("[DESCARGA] Bajando datos desde Binance para backtest...")
-                self.cached_candles = fetch_klines_public(symbol, tf, n)
+                start_date = self.var_start_date.get().strip()
+                end_date = self.var_end_date.get().strip()
+                cache_ind = bool(self.var_cache_ind.get())
+                tv_path = tv_build_json_path(symbol, tf, start_date, end_date)
+                if not os.path.exists(tv_path):
+                    self.log("[DESCARGA] Bajando datos desde Binance para backtest...")
+                    tv_df = fetch_ohlcv_by_date_range(symbol, tf, start_date, end_date)
+                    if cache_ind:
+                        tv_df = tv_apply_indicator_cache(tv_df, DEFAULT_GEN)
+                    tv_path = save_candles_json(tv_df, symbol, tf, start_date, end_date, "binance")
+                tv_df = load_candles_json(tv_path)
+                self.cached_candles = tv_df_to_candles(tv_df, tf)
 
             ge = self.space.sample()
             metrics = simulate_spot(self.cached_candles, ge, self.var_fee.get() * self.var_fee_mult.get(), self.var_slip.get())
