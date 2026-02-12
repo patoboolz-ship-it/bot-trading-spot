@@ -564,13 +564,22 @@ def filter_closed_candles_by_interval_ms(candles: list[dict], interval_ms: int, 
     return [c for c in candles if is_candle_closed(c["close_time"], server_time_ms, interval_ms)]
 
 
-def assert_simulator_uses_closed_last_price(candles_closed: list[dict], used_close: float):
+def assert_simulator_uses_closed_last_price(candles_closed: list[dict], used_close: float, use_ha: bool):
     if not candles_closed:
         return
-    expected = float(candles_closed[-1]["close"])
+
+    if use_ha:
+        if candles_closed[-1].get("ha_close") is not None:
+            expected = float(candles_closed[-1]["ha_close"])
+        else:
+            expected = float(heikin_ashi(candles_closed)[-1]["close"])
+    else:
+        expected = float(candles_closed[-1]["close"])
+
     if abs(float(used_close) - expected) > 1e-12:
+        src = "ha_close" if use_ha else "close"
         raise AssertionError(
-            f"[VALIDACION] El simulador no usa el último close cerrado. used={used_close} expected={expected}"
+            f"[VALIDACION] El simulador no usa el último {src} de vela cerrada. used={used_close} expected={expected}"
         )
 
 
@@ -2265,7 +2274,7 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
             dd_curve.append((peak - equity) / peak if peak > 0 else 0.0)
 
     net = equity - 1.0
-    assert_simulator_uses_closed_last_price(candles, close_sig[-1])
+    assert_simulator_uses_closed_last_price(candles, close_sig[-1], ge.use_ha == 1)
     assert_bot_simulator_score_parity(ge, candles)
 
     balance = START_CAPITAL * equity

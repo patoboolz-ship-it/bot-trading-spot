@@ -133,3 +133,9 @@ def test_bot_simulator_score_parity_on_same_closed_candle():
     candles = make_candles(300)
     ge = bot.Genome(**bot.DEFAULT_GEN)
     bot.assert_bot_simulator_score_parity(ge, candles, index=len(candles) - 2)
+
+
+def test_closed_last_price_validation_supports_heikin_ashi():
+    candles = make_candles(50)
+    ha_last = bot.heikin_ashi(candles)[-1]["close"]
+    bot.assert_simulator_uses_closed_last_price(candles, ha_last, use_ha=True)
