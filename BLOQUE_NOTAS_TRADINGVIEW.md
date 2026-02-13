@@ -1,152 +1,227 @@
-# Bloque de notas: Cómo replicar el bot en TradingView (RSI + MACD + Consecutivas)
+# Bloque de notas: cómo replicar el bot en TradingView (RSI + MACD + Consecutivas)
 
-Este documento está hecho para **revisar configuración** antes de tocar más código.
-La idea es que puedas copiar estas reglas a TradingView y verificar por qué a veces “no opera”.
+Este documento explica **exactamente** cómo decide entradas/salidas el bot para que lo puedas clonar en TradingView sin “configuraciones ocultas”.
 
 ---
 
-## 1) Qué estrategia usa realmente el bot
+## 1) Lógica real del bot (resumen corto)
 
-La estrategia no es “RSI solo” ni “MACD solo”.
-Usa un **score ponderado** de 3 componentes para compra y 3 para venta:
+La estrategia es un **score ponderado** por lado:
 
-- RSI
-- MACD histograma
-- Velas consecutivas (subidas/bajadas)
+- Compra = mezcla de señal RSI + señal MACD + señal de velas consecutivas.
+- Venta = mezcla de señal RSI + señal MACD + señal de velas consecutivas.
 
-Ecuaciones exactas:
+Luego se compara con umbrales:
 
-```python
-BUY_SCORE  = Wbuy_rsi * RSI_buy + Wbuy_macd * MACD_buy + Wbuy_consec * CONSEC_buy
-SELL_SCORE = Wsell_rsi * RSI_sell + Wsell_macd * MACD_sell + Wsell_consec * CONSEC_sell
+- si `BUY_SCORE >= buy_th` ⇒ condición de compra;
+- si `SELL_SCORE >= sell_th` ⇒ condición de venta.
+
+Además intervienen:
+
+- `cooldown` (espera mínima entre entradas),
+- `take_profit` y `stop_loss`,
+- `edge_trigger` (MACD por estado o por cruce),
+- `use_ha` (si se calcula sobre Heikin-Ashi o vela normal),
+- y **evaluación solo al cierre de vela cerrada**.
+
+---
+
+## 2) Ecuaciones exactas (pesos + umbrales)
+
+### 2.1 Score de compra
+
+```text
+BUY_SCORE = w_buy_rsi   * RSI_buy_component
+          + w_buy_macd  * MACD_buy_component
+          + w_buy_consec* CONSEC_buy_component
 ```
 
-Luego:
+Disparo de compra:
 
-- Compra si `BUY_SCORE >= buy_th`
-- Venta si `SELL_SCORE >= sell_th`
+```text
+BUY_SCORE >= buy_th
+```
 
-Además hay:
+### 2.2 Score de venta
 
-- `cooldown` por velas
-- salida por `take_profit` o `stop_loss`
-- opción `use_ha` (Heikin Ashi) para cálculo de señales
+```text
+SELL_SCORE = w_sell_rsi    * RSI_sell_component
+           + w_sell_macd   * MACD_sell_component
+           + w_sell_consec * CONSEC_sell_component
+```
 
----
+Disparo de venta:
 
-## 2) Señales base (0 o 1)
+```text
+SELL_SCORE >= sell_th
+```
 
-### 2.1 RSI
+### 2.3 Qué significan los pesos
 
-- `buy_rsi = 1` cuando RSI está en/por debajo de `rsi_oversold`
-- `sell_rsi = 1` cuando RSI está en/por encima de `rsi_overbought`
-
-> Nota: en el código hay una forma continua para RSI (normalizada 0..1), no solo binaria dura.
-
-### 2.2 MACD (histograma)
-
-Si `edge_trigger = 0`:
-
-- `buy_macd = 1` cuando histograma > 0
-- `sell_macd = 1` cuando histograma < 0
-
-Si `edge_trigger = 1`:
-
-- `buy_macd = 1` solo en cruce de histograma de <=0 a >0
-- `sell_macd = 1` solo en cruce de histograma de >=0 a <0
-
-### 2.3 Consecutivas
-
-- `buy_consec = 1` cuando se cumplen `consec_green` cierres no-decrecientes seguidos
-- `sell_consec = 1` cuando se cumplen `consec_red` cierres no-crecientes seguidos
+- `w_buy_rsi`, `w_buy_macd`, `w_buy_consec`: cuánto “aporta” cada familia al score de compra.
+- `w_sell_rsi`, `w_sell_macd`, `w_sell_consec`: cuánto “aporta” cada familia al score de venta.
+- Internamente se normalizan por lado (la suma efectiva de pesos por compra y por venta queda 1), pero debes usar los valores exactos del GEN ganador para que el balance relativo quede igual.
 
 ---
 
-## 3) Parámetros que DEBES igualar en TradingView
+## 3) Componentes de señal (RSI/MACD/Consecutivas)
 
-## 3.1 Timeframe
+## 3.1 RSI
 
-- Debe ser el mismo que `INTERVAL` del bot (ejemplo típico: `1h`).
+Parámetros:
 
-## 3.2 Fuente de precio
+- `rsi_period`
+- `rsi_oversold`
+- `rsi_overbought`
 
-Si `use_ha = 1`:
+Interpretación operativa:
 
-- Debes usar **Heikin Ashi** también para RSI/MACD/consecutivas.
-- Si en TradingView usas velas normales pero el bot está en HA, te dará señales distintas.
+- lado compra se activa cuando RSI entra zona baja (oversold),
+- lado venta se activa cuando RSI entra zona alta (overbought).
 
-Si `use_ha = 0`:
+> En el código, la contribución puede trabajar en forma continua (no siempre 0/1 duro), así que en TradingView conviene replicar fórmula, no simplificarla.
 
-- usa velas normales en ambos lados.
+## 3.2 MACD (histograma)
 
-## 3.3 RSI (TradingView)
+Parámetros:
 
-Configurar RSI con:
+- `macd_fast`
+- `macd_slow`
+- `macd_signal`
+- `edge_trigger`
 
-- Length = `rsi_period`
-- Source = close (o ha_close si estás en HA)
-- Umbrales de estrategia:
-  - Oversold = `rsi_oversold`
-  - Overbought = `rsi_overbought`
+Si `edge_trigger = 0` (modo estado):
 
-## 3.4 MACD (TradingView)
+- compra favorecida cuando histograma > 0,
+- venta favorecida cuando histograma < 0.
 
-Configurar MACD con:
+Si `edge_trigger = 1` (modo cruce):
 
-- Fast Length = `macd_fast`
-- Slow Length = `macd_slow`
-- Signal Smoothing = `macd_signal`
-- Señal usa el **histograma MACD**
+- compra favorecida **solo en la barra del cruce** de hist ≤ 0 a hist > 0,
+- venta favorecida **solo en la barra del cruce** de hist ≥ 0 a hist < 0.
 
-## 3.5 Umbrales de decisión
+Este switch cambia muchísimo la frecuencia de entradas.
 
-- `buy_th` (umbral de compra del score)
-- `sell_th` (umbral de venta del score)
+## 3.3 Velas consecutivas
 
-## 3.6 Pesos (muy importante)
+Parámetros:
 
-Compra:
+- `consec_green` para compra,
+- `consec_red` para venta.
 
-- `w_buy_rsi`
-- `w_buy_macd`
-- `w_buy_consec`
+Interpretación:
 
-Venta:
-
-- `w_sell_rsi`
-- `w_sell_macd`
-- `w_sell_consec`
-
-Estos pesos se normalizan internamente (suma 1 por lado), pero igual debes usar los mismos números del gen ganador.
+- componente de compra sube cuando se cumplen `consec_green` cierres consecutivos alcistas/no-decrecientes,
+- componente de venta sube cuando se cumplen `consec_red` cierres consecutivos bajistas/no-crecientes.
 
 ---
 
-## 4) Por qué puede “no operar” aunque parezca que está bien
+## 4) Cierre de vela (clave para que TradingView coincida)
 
-1. **`buy_th` muy alto** para la combinación de señales/pesos.
-2. **`sell_th` muy alto** y deja posiciones abiertas demasiado tiempo (o casi no vende).
-3. **`edge_trigger=1`** reduce mucho señales MACD (solo cruces, no estado >0/<0).
-4. **`cooldown`** bloquea entradas consecutivas.
-5. **`use_ha` desalineado** entre bot y TradingView.
-6. **Timeframe distinto** entre bot y gráfico.
-7. En bot real, señales sólo en **vela cerrada**, no intrabar.
+El bot/simulador evalúa señales **solo con vela cerrada**, no intrabar.
+
+Criterio implementado:
+
+```python
+close_time < server_time - interval_ms
+```
+
+O sea, una vela entra al motor de señales únicamente cuando ya quedó atrás del reloj de servidor por al menos 1 intervalo.
+
+En TradingView debes forzar evaluación al cierre de barra (`barstate.isconfirmed`) para evitar entradas fantasmas que luego desaparecen.
 
 ---
 
-## 5) Checklist rápido para copiar a TradingView
+## 5) Orden de decisión por vela (pipeline mental)
 
-1. Mismo símbolo (ej. `SOLUSDT`).
+En cada vela cerrada:
+
+1. Se calcula fuente de precio (normal o HA según `use_ha`).
+2. Se actualizan RSI/MACD/consecutivas.
+3. Se construye `BUY_SCORE` y `SELL_SCORE` con los pesos.
+4. Se comparan scores con `buy_th` y `sell_th`.
+5. Se aplican filtros de estado (`cooldown`, posición abierta/cerrada).
+6. Si hay posición abierta, pueden salir por `SELL_SCORE`, `take_profit`, `stop_loss`.
+
+Si tú en TradingView cambias el orden, o evalúas intrabar, o no respetas cooldown, ya no coincide.
+
+---
+
+## 6) Qué debes configurar en TradingView (checklist exacto)
+
+1. Mismo símbolo (ejemplo `SOLUSDT`).
 2. Mismo timeframe (`INTERVAL`).
-3. Misma fuente de precio (`use_ha`).
-4. RSI: period/overbought/oversold exactos.
-5. MACD: fast/slow/signal exactos.
-6. Misma lógica de score ponderado + umbrales `buy_th`/`sell_th`.
-7. Evaluar solo al cierre de vela.
-8. Aplicar `cooldown`, TP y SL.
+3. Misma fuente de precio:
+   - `use_ha = 1` ⇒ indicadores y lógica sobre Heikin-Ashi.
+   - `use_ha = 0` ⇒ indicadores y lógica sobre velas normales.
+4. RSI:
+   - Length = `rsi_period`
+   - Oversold = `rsi_oversold`
+   - Overbought = `rsi_overbought`
+5. MACD:
+   - Fast = `macd_fast`
+   - Slow = `macd_slow`
+   - Signal = `macd_signal`
+   - usar histograma y respetar `edge_trigger`
+6. Consecutivas:
+   - `consec_green`
+   - `consec_red`
+7. Pesos compra:
+   - `w_buy_rsi`, `w_buy_macd`, `w_buy_consec`
+8. Pesos venta:
+   - `w_sell_rsi`, `w_sell_macd`, `w_sell_consec`
+9. Umbrales:
+   - `buy_th`
+   - `sell_th`
+10. Gestión:
+   - `cooldown`
+   - `take_profit`
+   - `stop_loss`
+11. Ejecutar señales solo al cierre de vela.
 
 ---
 
-## 6) Parámetros base actuales (DEFAULT_GEN en el código)
+## 7) Por qué a veces “no opera nada”
+
+Causas típicas:
+
+- `buy_th` demasiado alto para la combinación de pesos.
+- `w_buy_consec` o `w_buy_macd` casi en 0 deja una pata “apagada”.
+- `edge_trigger=1` reduce mucho disparos MACD.
+- `consec_green`/`consec_red` altos para ese timeframe.
+- `cooldown` demasiado largo.
+- `use_ha` diferente entre bot y TradingView.
+- Estás mirando señales intrabar y no al cierre.
+
+---
+
+## 8) Mapa rápido de parámetros del GEN → panel TradingView
+
+- RSI Length ← `rsi_period`
+- RSI Oversold ← `rsi_oversold`
+- RSI Overbought ← `rsi_overbought`
+- MACD Fast ← `macd_fast`
+- MACD Slow ← `macd_slow`
+- MACD Signal ← `macd_signal`
+- Buy weight RSI ← `w_buy_rsi`
+- Buy weight MACD ← `w_buy_macd`
+- Buy weight Consecutive ← `w_buy_consec`
+- Sell weight RSI ← `w_sell_rsi`
+- Sell weight MACD ← `w_sell_macd`
+- Sell weight Consecutive ← `w_sell_consec`
+- Buy threshold ← `buy_th`
+- Sell threshold ← `sell_th`
+- Consecutive green bars ← `consec_green`
+- Consecutive red bars ← `consec_red`
+- MACD edge mode ← `edge_trigger`
+- Use Heikin-Ashi ← `use_ha`
+- Cooldown bars ← `cooldown`
+- Take Profit ← `take_profit`
+- Stop Loss ← `stop_loss`
+
+---
+
+## 9) Parámetros base actuales (DEFAULT_GEN de referencia)
 
 ```text
 use_ha=1
@@ -172,52 +247,37 @@ cooldown=1
 edge_trigger=0
 ```
 
-Si el optimizador te entrega otro GEN, ese reemplaza estos valores.
+Si el optimizador entrega otro GEN, usa ese (este bloque solo es punto de partida).
 
 ---
 
-## 7) Fragmentos de código clave (explicados)
+## 10) Mini plantillas de validación (para comparar con TradingView)
 
-### Criterio de vela cerrada
+### 10.1 Validación de score por barra
 
-```python
-return int(close_time_ms) < int(server_time_ms) - int(interval_ms)
-```
+Para una barra histórica X, registra y compara:
 
-Interpretación: una vela se considera cerrada para señales sólo si su `close_time` está al menos un intervalo detrás del tiempo de servidor.
+- `RSI_buy_component`, `MACD_buy_component`, `CONSEC_buy_component`
+- `RSI_sell_component`, `MACD_sell_component`, `CONSEC_sell_component`
+- `BUY_SCORE`, `SELL_SCORE`
+- decisión final (buy/sell/hold)
 
-### Cálculo de score (fuente de verdad)
+Si estos números empatan barra por barra, la implementación está alineada.
 
-```python
-payload = score_components_at_index(...)
-bs = payload["buy_score"]
-ss = payload["sell_score"]
-```
+### 10.2 Validación de cierre de vela
 
-Interpretación: tanto bot como simulador deben pasar por esta misma función para no divergir.
+Comprobar que la barra usada por estrategia cumple criterio de cerrada y que no se usa la vela en formación.
 
 ---
 
-## 8) Prompt sugerido para pedir validación automática a ChatGPT
+## 11) Prompt sugerido para pedir Pine Script exacto
 
-“Te paso estos parámetros del GEN y quiero que me construyas un Pine Script Strategy que replique EXACTAMENTE:
-- score ponderado compra/venta,
-- RSI/MACD/consecutivas,
-- use_ha,
-- edge_trigger,
-- cooldown,
-- TP/SL,
-- evaluación sólo en vela cerrada.
-Luego compara señales barra por barra con estos datos exportados.”
-
----
-
-## 9) Recomendación operativa
-
-Antes de retocar el código de optimización:
-
-1. Toma 1 GEN que “sí operaba”.
-2. Replícalo exacto en TradingView con este checklist.
-3. Verifica señales por barra (al menos 200 velas).
-4. Recién después ajusta código si aún hay diferencias.
-
+"Construye una estrategia Pine v5 que replique 1:1 esta lógica:
+- score ponderado compra/venta con RSI, MACD-hist y consecutivas,
+- pesos `w_buy_*` y `w_sell_*`,
+- umbrales `buy_th` y `sell_th`,
+- modo `edge_trigger`,
+- `use_ha`,
+- `cooldown`, `take_profit`, `stop_loss`,
+- ejecución solo en barra cerrada (`barstate.isconfirmed`).
+Luego imprime en tabla por barra los componentes y scores para compararlos con mi bot." 
