@@ -1,15 +1,91 @@
 import importlib
+import importlib.util
+import os
 import queue
 import threading
 import time
 import traceback
 import tkinter as tk
+from pathlib import Path
 from tkinter import ttk
 from typing import Any, Callable
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
+
+
+API_KEY_PATH = r"C:\Users\EQCONF\Documents\programas python\claves\bot trading\Clave API.txt"
+API_SECRET_PATH = r"C:\Users\EQCONF\Documents\programas python\claves\bot trading\Clave secreta.txt"
+
+
+class _BinancePublicFallbackAPI:
+    """Fallback para ver dashboard aunque no exista bot.py en el directorio actual."""
+
+    BASE_URL = "https://api.binance.com"
+
+    def __init__(self, symbol: str, interval: str):
+        self.symbol = symbol
+        self.interval = interval
+        self._running = False
+
+    def _get_json(self, path: str, params: dict[str, Any]):
+        import urllib.parse
+        import urllib.request
+
+        qs = urllib.parse.urlencode(params)
+        with urllib.request.urlopen(f"{self.BASE_URL}{path}?{qs}", timeout=10) as resp:
+            import json
+
+            return json.loads(resp.read().decode("utf-8"))
+
+    def get_balance(self):
+        return {"USDT": 0.0, "asset_qty": 0.0}
+
+    def get_price(self, symbol: str):
+        row = self._get_json("/api/v3/ticker/price", {"symbol": symbol})
+        return float(row["price"])
+
+    def get_trades(self):
+        rows = self._get_json("/api/v3/trades", {"symbol": self.symbol, "limit": 100})
+        out = []
+        for r in rows:
+            out.append(
+                {
+                    "id": r.get("id"),
+                    "price": r.get("price"),
+                    "qty": r.get("qty"),
+                    "time": r.get("time"),
+                    "side": "BUY" if not r.get("isBuyerMaker", False) else "SELL",
+                }
+            )
+        return out
+
+    def get_candles(self, symbol: str, interval: str):
+        rows = self._get_json("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": 500})
+        candles = []
+        for row in rows:
+            candles.append(
+                {
+                    "open_time": int(row[0]),
+                    "close_time": int(row[6]),
+                    "open": float(row[1]),
+                    "high": float(row[2]),
+                    "low": float(row[3]),
+                    "close": float(row[4]),
+                    "volume": float(row[5]),
+                }
+            )
+        return candles
+
+    def start_bot(self):
+        self._running = True
+
+    def pause_bot(self):
+        self._running = False
+
+    def stop_bot(self):
+        self._running = False
 
 
 class _BotModuleAdapter:
@@ -24,8 +100,10 @@ class _BotModuleAdapter:
         self._params = getattr(bot_mod, "DEFAULT_GEN", {}).copy() if hasattr(bot_mod, "DEFAULT_GEN") else {}
 
     def _build_client(self):
-        key = self.bot_mod.read_key(self.bot_mod.API_KEY_PATH)
-        sec = self.bot_mod.read_key(self.bot_mod.API_SECRET_PATH)
+        key_path = getattr(self.bot_mod, "API_KEY_PATH", API_KEY_PATH)
+        sec_path = getattr(self.bot_mod, "API_SECRET_PATH", API_SECRET_PATH)
+        key = self.bot_mod.read_key(key_path)
+        sec = self.bot_mod.read_key(sec_path)
         return self.bot_mod.Client(key, sec)
 
     def get_balance(self):
@@ -59,6 +137,31 @@ class _BotModuleAdapter:
             self._bot.stop()
 
 
+def _import_bot_module_from_candidates() -> Any | None:
+    try:
+        return importlib.import_module("bot")
+    except Exception:
+        pass
+
+    candidates = [
+        Path.cwd() / "bot.py",
+        Path(__file__).resolve().parent / "bot.py",
+    ]
+    for c in candidates:
+        if not c.exists():
+            continue
+        try:
+            spec = importlib.util.spec_from_file_location("bot_local", c)
+            if not spec or not spec.loader:
+                continue
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            return mod
+        except Exception:
+            continue
+    return None
+
+
 class TradingDashboard(tk.Tk):
     def __init__(self, symbol: str = "SOLUSDT", interval: str = "1h"):
         super().__init__()
@@ -85,11 +188,15 @@ class TradingDashboard(tk.Tk):
         self.last_error = ""
         self._last_trade_id: Any = None
 
-        self._api = self._resolve_api_functions()
+        self._api, self._api_mode = self._resolve_api_functions()
         self._ui_queue: queue.Queue = queue.Queue()
         self._stop_event = threading.Event()
 
         self._build_layout()
+        if self._api_mode == "public_fallback":
+            self._set_error(
+                "Modo fallback activo: no se encontró bot.py. Se muestran datos de mercado; PLAY/PAUSE/STOP no operan cuenta real."
+            )
         self._load_initial_data()
 
         self.after(150, self._process_ui_queue)
@@ -98,7 +205,7 @@ class TradingDashboard(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
 
-    def _resolve_api_functions(self) -> dict[str, Callable[..., Any]]:
+    def _resolve_api_functions(self) -> tuple[dict[str, Callable[..., Any]], str]:
         required = ["get_balance", "get_price", "get_trades", "get_candles", "start_bot", "pause_bot"]
         optional = ["stop_bot"]
         modules = ["bot", "api", "trading_api"]
@@ -114,48 +221,53 @@ class TradingDashboard(tk.Tk):
                     resolved[fn] = getattr(mod, fn)
 
         missing = [name for name in required if name not in resolved]
-        if missing:
-            # Fallback especial: adaptar bot.py (estructura original del proyecto)
-            try:
-                bot_mod = importlib.import_module("bot")
-                if all(hasattr(bot_mod, name) for name in [
-                    "read_key",
-                    "API_KEY_PATH",
-                    "API_SECRET_PATH",
-                    "Client",
-                    "fetch_klines_closed",
-                    "get_free_balance",
-                    "SpotBot",
-                ]):
-                    symbol = getattr(bot_mod, "SYMBOL", self.symbol)
-                    interval = getattr(bot_mod, "INTERVAL", self.interval)
-                    adapter = _BotModuleAdapter(bot_mod, symbol, interval)
-                    resolved = {
-                        "get_balance": adapter.get_balance,
-                        "get_price": adapter.get_price,
-                        "get_trades": adapter.get_trades,
-                        "get_candles": adapter.get_candles,
-                        "start_bot": adapter.start_bot,
-                        "pause_bot": adapter.pause_bot,
-                        "stop_bot": adapter.stop_bot,
-                    }
-                    self.symbol = symbol
-                    self.interval = interval
-                    return resolved
-            except Exception as exc:
-                raise RuntimeError(
-                    "No se pudieron resolver funciones API ni crear adapter desde bot.py. "
-                    f"Detalle: {exc}"
-                ) from exc
+        if not missing:
+            if "stop_bot" not in resolved:
+                resolved["stop_bot"] = resolved["pause_bot"]
+            return resolved, "direct"
 
-            raise RuntimeError(
-                "No se encontraron funciones requeridas de API: "
-                f"{', '.join(missing)}. Deben existir en bot.py/api.py/trading_api.py "
-                "o bien en bot.py con read_key/API paths/Client/fetch_klines_closed/get_free_balance/SpotBot."
+        bot_mod = _import_bot_module_from_candidates()
+        if bot_mod and all(
+            hasattr(bot_mod, name)
+            for name in [
+                "read_key",
+                "Client",
+                "fetch_klines_closed",
+                "get_free_balance",
+                "SpotBot",
+            ]
+        ):
+            symbol = getattr(bot_mod, "SYMBOL", self.symbol)
+            interval = getattr(bot_mod, "INTERVAL", self.interval)
+            adapter = _BotModuleAdapter(bot_mod, symbol, interval)
+            self.symbol = symbol
+            self.interval = interval
+            return (
+                {
+                    "get_balance": adapter.get_balance,
+                    "get_price": adapter.get_price,
+                    "get_trades": adapter.get_trades,
+                    "get_candles": adapter.get_candles,
+                    "start_bot": adapter.start_bot,
+                    "pause_bot": adapter.pause_bot,
+                    "stop_bot": adapter.stop_bot,
+                },
+                "bot_adapter",
             )
-        if "stop_bot" not in resolved:
-            resolved["stop_bot"] = resolved["pause_bot"]
-        return resolved
+
+        fallback = _BinancePublicFallbackAPI(self.symbol, self.interval)
+        return (
+            {
+                "get_balance": fallback.get_balance,
+                "get_price": fallback.get_price,
+                "get_trades": fallback.get_trades,
+                "get_candles": fallback.get_candles,
+                "start_bot": fallback.start_bot,
+                "pause_bot": fallback.pause_bot,
+                "stop_bot": fallback.stop_bot,
+            },
+            "public_fallback",
+        )
 
     def _build_layout(self) -> None:
         self.grid_rowconfigure(1, weight=1)
@@ -229,6 +341,7 @@ class TradingDashboard(tk.Tk):
             self._last_trade_id = self._get_last_trade_id(self.trades)
             self.update_chart(self.candles)
             self._refresh_ui()
+            self._render_trades(self.trades[-20:])
         except Exception as exc:
             self._set_error(f"Error inicializando: {exc}")
 
