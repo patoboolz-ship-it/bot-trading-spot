@@ -9,6 +9,7 @@ import csv
 import json
 import os
 import random
+import socket
 import sqlite3
 import threading
 import time
@@ -74,6 +75,18 @@ class DotDict(dict):
 def ts_to_iso(ts_ms: int) -> str:
     return datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
+
+
+
+def detect_local_ipv4() -> str:
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        sock.connect(("8.8.8.8", 80))
+        ip = sock.getsockname()[0]
+        sock.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
 
 def interval_to_ms(interval: str) -> int:
     if interval not in INTERVAL_MS:
@@ -723,7 +736,10 @@ async def run_dashboard(args: argparse.Namespace):
 
     cfg = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
     server = uvicorn.Server(cfg)
-    print(f"[INFO] Dashboard disponible en http://{args.host}:{args.port}")
+    local_ip = detect_local_ipv4()
+    print(f"[INFO] Dashboard disponible local: http://127.0.0.1:{args.port}")
+    print(f"[INFO] Dashboard disponible en tu red Wi-Fi: http://{local_ip}:{args.port}")
+    print(f"[INFO] Host de escucha: {args.host} (usa 0.0.0.0 para acceso desde otros dispositivos)")
     print("[INFO] Logs de frontend/backend se imprimirán en esta consola.")
     await server.serve()
 
@@ -748,7 +764,7 @@ def make_parser():
     p.add_argument("--csv-delimiter", default=";")
     p.add_argument("--show", dest="show", action="store_true")
     p.add_argument("--no-show", dest="show", action="store_false")
-    p.add_argument("--host", default="127.0.0.1")
+    p.add_argument("--host", default="0.0.0.0")
     p.add_argument("--port", type=int, default=8085)
     p.add_argument("--poll-seconds", type=int, default=3)
     p.add_argument("--live-limit", type=int, default=500)
