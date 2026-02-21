@@ -12,6 +12,53 @@ from matplotlib.figure import Figure
 from matplotlib.patches import Rectangle
 
 
+class _BotModuleAdapter:
+    """Adapter para usar bot.py cuando no expone funciones get_* directas."""
+
+    def __init__(self, bot_mod: Any, symbol: str, interval: str):
+        self.bot_mod = bot_mod
+        self.symbol = symbol
+        self.interval = interval
+        self.client = self._build_client()
+        self._bot = None
+        self._params = getattr(bot_mod, "DEFAULT_GEN", {}).copy() if hasattr(bot_mod, "DEFAULT_GEN") else {}
+
+    def _build_client(self):
+        key = self.bot_mod.read_key(self.bot_mod.API_KEY_PATH)
+        sec = self.bot_mod.read_key(self.bot_mod.API_SECRET_PATH)
+        return self.bot_mod.Client(key, sec)
+
+    def get_balance(self):
+        quote = getattr(self.bot_mod, "QUOTE_ASSET", "USDT")
+        base = getattr(self.bot_mod, "BASE_ASSET", self.symbol.replace(quote, ""))
+        usdt = float(self.bot_mod.get_free_balance(self.client, quote))
+        asset = float(self.bot_mod.get_free_balance(self.client, base))
+        return {"USDT": usdt, "asset_qty": asset}
+
+    def get_price(self, symbol: str):
+        return float(self.client.get_symbol_ticker(symbol=symbol)["price"])
+
+    def get_trades(self):
+        return self.client.get_my_trades(symbol=self.symbol, limit=200) or []
+
+    def get_candles(self, symbol: str, interval: str):
+        return self.bot_mod.fetch_klines_closed(self.client, symbol, interval, limit=500)
+
+    def start_bot(self):
+        if self._bot and getattr(self._bot, "running", False):
+            return
+        self._bot = self.bot_mod.SpotBot(self.client, self.symbol, self.interval, self._params, ui_cb=None)
+        self._bot.start()
+
+    def pause_bot(self):
+        if self._bot:
+            self._bot.stop()
+
+    def stop_bot(self):
+        if self._bot:
+            self._bot.stop()
+
+
 class TradingDashboard(tk.Tk):
     def __init__(self, symbol: str = "SOLUSDT", interval: str = "1h"):
         super().__init__()
@@ -68,9 +115,43 @@ class TradingDashboard(tk.Tk):
 
         missing = [name for name in required if name not in resolved]
         if missing:
+            # Fallback especial: adaptar bot.py (estructura original del proyecto)
+            try:
+                bot_mod = importlib.import_module("bot")
+                if all(hasattr(bot_mod, name) for name in [
+                    "read_key",
+                    "API_KEY_PATH",
+                    "API_SECRET_PATH",
+                    "Client",
+                    "fetch_klines_closed",
+                    "get_free_balance",
+                    "SpotBot",
+                ]):
+                    symbol = getattr(bot_mod, "SYMBOL", self.symbol)
+                    interval = getattr(bot_mod, "INTERVAL", self.interval)
+                    adapter = _BotModuleAdapter(bot_mod, symbol, interval)
+                    resolved = {
+                        "get_balance": adapter.get_balance,
+                        "get_price": adapter.get_price,
+                        "get_trades": adapter.get_trades,
+                        "get_candles": adapter.get_candles,
+                        "start_bot": adapter.start_bot,
+                        "pause_bot": adapter.pause_bot,
+                        "stop_bot": adapter.stop_bot,
+                    }
+                    self.symbol = symbol
+                    self.interval = interval
+                    return resolved
+            except Exception as exc:
+                raise RuntimeError(
+                    "No se pudieron resolver funciones API ni crear adapter desde bot.py. "
+                    f"Detalle: {exc}"
+                ) from exc
+
             raise RuntimeError(
                 "No se encontraron funciones requeridas de API: "
-                f"{', '.join(missing)}. Deben existir en bot.py/api.py/trading_api.py"
+                f"{', '.join(missing)}. Deben existir en bot.py/api.py/trading_api.py "
+                "o bien en bot.py con read_key/API paths/Client/fetch_klines_closed/get_free_balance/SpotBot."
             )
         if "stop_bot" not in resolved:
             resolved["stop_bot"] = resolved["pause_bot"]
@@ -284,16 +365,18 @@ class TradingDashboard(tk.Tk):
             return trades_all[-20:]
 
         out: list[dict[str, Any]] = []
+        found_last = False
         for t in trades_all:
             tid = t.get("id") or t.get("trade_id") or t.get("time")
             if tid is None:
                 continue
             if str(tid) == str(self._last_trade_id):
-                out = []
-            else:
+                found_last = True
+                continue
+            if found_last:
                 out.append(t)
         self._last_trade_id = self._get_last_trade_id(trades_all)
-        return out[-20:]
+        return out[-20:] if found_last else trades_all[-20:]
 
     def start_bot(self) -> None:
         try:
