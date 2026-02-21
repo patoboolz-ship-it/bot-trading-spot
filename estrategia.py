@@ -11,13 +11,19 @@ import os
 import random
 import socket
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
 import traceback
+import webbrowser
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
+
+import queue
+import tkinter as tk
+from tkinter import ttk
 
 BEST_GEN = {
     "use_ha": 1,
@@ -761,9 +767,160 @@ async def run_dashboard(args: argparse.Namespace):
     await server.serve()
 
 
+class EstrategiaLauncherGUI:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("Estrategia.py - Launcher Visual")
+        self.proc: subprocess.Popen[str] | None = None
+        self.log_q: queue.Queue[str] = queue.Queue()
+
+        self.var_mode = tk.StringVar(value="dashboard")
+        self.var_symbol = tk.StringVar(value="SOLUSDT")
+        self.var_interval = tk.StringVar(value="1h")
+        self.var_host = tk.StringVar(value="0.0.0.0")
+        self.var_port = tk.StringVar(value="8085")
+        self.var_start = tk.StringVar(value="2020-01-01")
+        self.var_end = tk.StringVar(value="2024-12-31")
+        self.var_status = tk.StringVar(value="IDLE")
+        self.var_show = tk.BooleanVar(value=False)
+
+        self._build()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.after(200, self._drain_logs)
+
+    def _build(self):
+        frm = ttk.Frame(self.root, padding=10)
+        frm.pack(fill="both", expand=True)
+
+        row = 0
+        ttk.Label(frm, text="Modo").grid(row=row, column=0, sticky="w")
+        ttk.Combobox(frm, textvariable=self.var_mode, values=["dashboard", "backtest"], state="readonly", width=14).grid(row=row, column=1, sticky="w")
+        ttk.Label(frm, text="Estado:").grid(row=row, column=2, sticky="e")
+        ttk.Label(frm, textvariable=self.var_status).grid(row=row, column=3, sticky="w", padx=(4, 0))
+
+        row += 1
+        ttk.Label(frm, text="Símbolo").grid(row=row, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.var_symbol, width=16).grid(row=row, column=1, sticky="w")
+        ttk.Label(frm, text="Intervalo").grid(row=row, column=2, sticky="e")
+        ttk.Combobox(frm, textvariable=self.var_interval, values=list(INTERVAL_MS.keys()), state="readonly", width=12).grid(row=row, column=3, sticky="w")
+
+        row += 1
+        ttk.Label(frm, text="Host").grid(row=row, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.var_host, width=16).grid(row=row, column=1, sticky="w")
+        ttk.Label(frm, text="Port").grid(row=row, column=2, sticky="e")
+        ttk.Entry(frm, textvariable=self.var_port, width=12).grid(row=row, column=3, sticky="w")
+
+        row += 1
+        ttk.Label(frm, text="Inicio").grid(row=row, column=0, sticky="w")
+        ttk.Entry(frm, textvariable=self.var_start, width=16).grid(row=row, column=1, sticky="w")
+        ttk.Label(frm, text="Fin").grid(row=row, column=2, sticky="e")
+        ttk.Entry(frm, textvariable=self.var_end, width=12).grid(row=row, column=3, sticky="w")
+
+        row += 1
+        ttk.Checkbutton(frm, text="Abrir ventana matplotlib en backtest (--show)", variable=self.var_show).grid(row=row, column=0, columnspan=4, sticky="w", pady=(4, 6))
+
+        row += 1
+        btns = ttk.Frame(frm)
+        btns.grid(row=row, column=0, columnspan=4, sticky="w")
+        ttk.Button(btns, text="Iniciar", command=self.start_process).pack(side="left")
+        ttk.Button(btns, text="Detener", command=self.stop_process).pack(side="left", padx=6)
+        ttk.Button(btns, text="Abrir Web", command=self.open_web).pack(side="left", padx=6)
+
+        row += 1
+        ttk.Label(frm, text="Consola / errores").grid(row=row, column=0, columnspan=4, sticky="w", pady=(8, 2))
+        row += 1
+        self.txt = tk.Text(frm, height=18, width=120)
+        self.txt.grid(row=row, column=0, columnspan=4, sticky="nsew")
+        frm.grid_columnconfigure(1, weight=1)
+        frm.grid_rowconfigure(row, weight=1)
+
+    def _cmd(self) -> list[str]:
+        mode = self.var_mode.get().strip()
+        cmd = [
+            sys.executable,
+            os.path.abspath(__file__),
+            "--mode",
+            mode,
+            "--symbol",
+            self.var_symbol.get().strip() or "SOLUSDT",
+            "--interval",
+            self.var_interval.get().strip() or "1h",
+        ]
+        if mode == "dashboard":
+            cmd += ["--host", self.var_host.get().strip() or "0.0.0.0", "--port", self.var_port.get().strip() or "8085"]
+        else:
+            cmd += ["--start", self.var_start.get().strip() or "2020-01-01", "--end", self.var_end.get().strip() or "2024-12-31"]
+            cmd += ["--show"] if self.var_show.get() else ["--no-show"]
+        return cmd
+
+    def start_process(self):
+        if self.proc and self.proc.poll() is None:
+            self._append("[GUI] Ya hay un proceso en ejecución.\n")
+            return
+        cmd = self._cmd()
+        self._append(f"[GUI] Ejecutando: {' '.join(cmd)}\n")
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        self.var_status.set("RUNNING")
+        threading.Thread(target=self._pump_stdout, daemon=True).start()
+
+    def stop_process(self):
+        if not self.proc or self.proc.poll() is not None:
+            self._append("[GUI] No hay proceso activo.\n")
+            self.var_status.set("IDLE")
+            return
+        self.proc.terminate()
+        self._append("[GUI] Proceso detenido.\n")
+        self.var_status.set("IDLE")
+
+    def open_web(self):
+        url = f"http://127.0.0.1:{self.var_port.get().strip() or '8085'}"
+        webbrowser.open(url)
+        self._append(f"[GUI] Abriendo {url}\n")
+
+    def _pump_stdout(self):
+        assert self.proc is not None
+        if self.proc.stdout is None:
+            return
+        for line in self.proc.stdout:
+            self.log_q.put(line)
+        rc = self.proc.poll()
+        self.log_q.put(f"[GUI] Proceso finalizado con código {rc}.\n")
+        self.var_status.set("IDLE")
+
+    def _drain_logs(self):
+        while True:
+            try:
+                line = self.log_q.get_nowait()
+            except queue.Empty:
+                break
+            self._append(line)
+        self.root.after(200, self._drain_logs)
+
+    def _append(self, line: str):
+        self.txt.insert("end", line)
+        self.txt.see("end")
+
+    def _on_close(self):
+        self.stop_process()
+        self.root.destroy()
+
+    def run(self):
+        self.root.mainloop()
+
+
+def run_visual_launcher():
+    try:
+        gui = EstrategiaLauncherGUI()
+        gui.run()
+    except tk.TclError as exc:
+        raise RuntimeError(
+            "No se pudo abrir la interfaz visual (Tk). En Linux sin escritorio usa --mode dashboard."
+        ) from exc
+
+
 def make_parser():
     p = argparse.ArgumentParser(description="Estrategia.py: backtest + dashboard")
-    p.add_argument("--mode", choices=["backtest", "dashboard"], default="backtest")
+    p.add_argument("--mode", choices=["backtest", "dashboard", "visual"], default="backtest")
     p.add_argument("--symbol", default="SOLUSDT")
     p.add_argument("--start", default="2020-01-01")
     p.add_argument("--end", default="2024-12-31")
@@ -794,6 +951,8 @@ def print_mode_help(args: argparse.Namespace) -> None:
     if args.mode == "backtest":
         print("[WARN] Estás en modo BACKTEST: este modo NO crea webserver.", flush=True)
         print("[WARN] Para dashboard web usa exactamente: --mode dashboard", flush=True)
+    elif args.mode == "visual":
+        print("[INFO] Estás en modo VISUAL: launcher gráfico tipo bot.py.", flush=True)
     else:
         print("[INFO] Estás en modo DASHBOARD: se creará webserver FastAPI.", flush=True)
 
@@ -810,6 +969,9 @@ def main():
 
     if args.mode == "dashboard":
         asyncio.run(run_dashboard(args))
+        return
+    if args.mode == "visual":
+        run_visual_launcher()
         return
 
     params = load_params(args)
