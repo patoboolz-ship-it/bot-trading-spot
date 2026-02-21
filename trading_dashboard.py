@@ -189,6 +189,7 @@ class _BinancePublicFallbackAPI:
     def __init__(self, symbol: str):
         self.symbol = symbol
         self._running = False
+        self._cache_last_candles: list[dict[str, Any]] = []
 
     def _get_json(self, path: str, params: dict[str, Any]):
         import json
@@ -228,7 +229,43 @@ class _BinancePublicFallbackAPI:
             for r in rows
         ]
         server_ms = self.get_server_time_ms()
-        return [c for c in candles if is_candle_closed(c["close_time"], server_ms, INTERVAL_MS[INTERVAL])]
+        out = [c for c in candles if is_candle_closed(c["close_time"], server_ms, INTERVAL_MS[INTERVAL])]
+        self._cache_last_candles = out
+        return out
+
+    def get_candles_range(self, symbol: str, interval: str, start_ms: int, end_ms: int):
+        out = []
+        cur = int(start_ms)
+        end_ms = int(end_ms)
+        while cur <= end_ms:
+            rows = self._get_json(
+                "/api/v3/klines",
+                {"symbol": symbol, "interval": interval, "startTime": cur, "endTime": end_ms, "limit": 1000},
+            )
+            if not rows:
+                break
+            for r in rows:
+                out.append(
+                    {
+                        "open_time": int(r[0]),
+                        "close_time": int(r[6]),
+                        "open": float(r[1]),
+                        "high": float(r[2]),
+                        "low": float(r[3]),
+                        "close": float(r[4]),
+                        "volume": float(r[5]),
+                    }
+                )
+            last_open = int(rows[-1][0])
+            if last_open <= cur:
+                break
+            cur = last_open + INTERVAL_MS[INTERVAL]
+            if len(rows) < 1000:
+                break
+        server_ms = self.get_server_time_ms()
+        filtered = [c for c in out if is_candle_closed(c["close_time"], server_ms, INTERVAL_MS[INTERVAL])]
+        self._cache_last_candles = filtered
+        return filtered
 
     def start_bot(self):
         self._running = True
@@ -275,6 +312,41 @@ class _BotModuleAdapter:
 
     def get_candles(self, symbol: str, interval: str):
         return self.bot_mod.fetch_klines_closed(self.client, symbol, interval, limit=600)
+
+    def get_candles_range(self, symbol: str, interval: str, start_ms: int, end_ms: int):
+        out = []
+        cur = int(start_ms)
+        end_ms = int(end_ms)
+        while cur <= end_ms:
+            rows = self.client.get_klines(
+                symbol=symbol,
+                interval=interval,
+                startTime=cur,
+                endTime=end_ms,
+                limit=1000,
+            )
+            if not rows:
+                break
+            for r in rows:
+                out.append(
+                    {
+                        "open_time": int(r[0]),
+                        "close_time": int(r[6]),
+                        "open": float(r[1]),
+                        "high": float(r[2]),
+                        "low": float(r[3]),
+                        "close": float(r[4]),
+                        "volume": float(r[5]),
+                    }
+                )
+            last_open = int(rows[-1][0])
+            if last_open <= cur:
+                break
+            cur = last_open + INTERVAL_MS[INTERVAL]
+            if len(rows) < 1000:
+                break
+        server_ms = self.get_server_time_ms()
+        return [c for c in out if is_candle_closed(c["close_time"], server_ms, INTERVAL_MS[INTERVAL])]
 
     def start_bot(self):
         if self._bot and getattr(self._bot, "running", False):
@@ -343,6 +415,9 @@ class TradingDashboard(tk.Tk):
 
         self.date_from_var = tk.StringVar(value="")
         self.date_to_var = tk.StringVar(value="")
+        self.range_locked = False
+        self.selected_start_ms: Optional[int] = None
+        self.selected_end_ms: Optional[int] = None
 
         self._api, self._api_mode = self._resolve_api_functions()
         self._ui_queue: queue.Queue = queue.Queue()
@@ -384,6 +459,7 @@ class TradingDashboard(tk.Tk):
                 "get_price": adapter.get_price,
                 "get_trades": adapter.get_trades,
                 "get_candles": adapter.get_candles,
+                "get_candles_range": adapter.get_candles_range,
                 "start_bot": adapter.start_bot,
                 "pause_bot": adapter.pause_bot,
                 "stop_bot": adapter.stop_bot,
@@ -395,6 +471,7 @@ class TradingDashboard(tk.Tk):
             "get_price": fb.get_price,
             "get_trades": fb.get_trades,
             "get_candles": fb.get_candles,
+            "get_candles_range": fb.get_candles_range,
             "start_bot": fb.start_bot,
             "pause_bot": fb.pause_bot,
             "stop_bot": fb.stop_bot,
@@ -653,13 +730,75 @@ class TradingDashboard(tk.Tk):
         self._set_error("")
         return out
 
+    def _read_selected_range(self) -> tuple[Optional[int], Optional[int]]:
+        try:
+            start_ms = self._parse_date_to_ms(self.date_from_var.get(), end_of_day=False)
+            end_ms = self._parse_date_to_ms(self.date_to_var.get(), end_of_day=True)
+        except ValueError as exc:
+            raise ValueError("Formato de fecha inválido. Usa YYYY/MM/DD") from exc
+        if start_ms is not None and end_ms is not None and start_ms > end_ms:
+            raise ValueError("Rango inválido: 'Desde' no puede ser mayor que 'Hasta'")
+        return start_ms, end_ms
+
+    def _save_current_range_chart(self) -> None:
+        if not self.active_candles:
+            return
+        out_dir = Path("estrategia_output")
+        out_dir.mkdir(parents=True, exist_ok=True)
+        if self.selected_start_ms and self.selected_end_ms:
+            ds = datetime.fromtimestamp(self.selected_start_ms / 1000, tz=timezone.utc).strftime("%Y%m%d")
+            de = datetime.fromtimestamp(self.selected_end_ms / 1000, tz=timezone.utc).strftime("%Y%m%d")
+            path = out_dir / f"grafico_rango_{ds}_{de}.png"
+        else:
+            path = out_dir / "grafico_rango_full.png"
+        self.figure.savefig(path, dpi=130, bbox_inches="tight")
+        self._set_error(f"Rango aplicado. Gráfico generado: {path}")
+
     def apply_date_range(self) -> None:
+        try:
+            start_ms, end_ms = self._read_selected_range()
+        except ValueError as exc:
+            self._set_error(str(exc))
+            return
+
+        if start_ms is None and end_ms is None:
+            self.range_locked = False
+            self.selected_start_ms = None
+            self.selected_end_ms = None
+            self._recompute_strategy_views()
+            return
+
+        # Si no vino algún extremo, usamos extremos del dataset actual.
+        if not self.candles:
+            self._set_error("No hay velas cargadas para aplicar rango.")
+            return
+        start_ms = start_ms if start_ms is not None else int(self.candles[0]["close_time"])
+        end_ms = end_ms if end_ms is not None else int(self.candles[-1]["close_time"])
+
+        if "get_candles_range" not in self._api:
+            self._set_error("La API actual no soporta carga histórica por rango.")
+            return
+        candles = self._api["get_candles_range"](self.symbol, self.interval, int(start_ms), int(end_ms)) or []
+        if not candles:
+            self._set_error("No se pudieron cargar velas para ese rango.")
+            return
+
+        self.candles = candles
+        self.range_locked = True
+        self.selected_start_ms = int(start_ms)
+        self.selected_end_ms = int(end_ms)
         self._recompute_strategy_views()
+        self._save_current_range_chart()
 
     def clear_date_range(self) -> None:
         self.date_from_var.set("")
         self.date_to_var.set("")
+        self.range_locked = False
+        self.selected_start_ms = None
+        self.selected_end_ms = None
+        self.candles = self._api["get_candles"](self.symbol, self.interval) or []
         self._recompute_strategy_views()
+        self._set_error("Rango limpiado. Volviste al dataset reciente.")
 
     def _refresh_period_table(self) -> None:
         for i in self.tree_periods.get_children():
@@ -780,7 +919,7 @@ class TradingDashboard(tk.Tk):
                 raw_balance = self._api["get_balance"]()
                 balance, asset_qty = self._parse_balance(raw_balance)
                 price = float(self._api["get_price"](self.symbol))
-                candles = self._api["get_candles"](self.symbol, self.interval) or []
+                candles = self.candles if self.range_locked else (self._api["get_candles"](self.symbol, self.interval) or [])
                 self._ui_queue.put(
                     {
                         "kind": "update",
@@ -820,7 +959,13 @@ class TradingDashboard(tk.Tk):
 
             with pd.ExcelWriter(path, engine="openpyxl") as w:
                 pd.DataFrame(ops_rows).to_excel(w, index=False, sheet_name="Operaciones")
-                pd.DataFrame(self.period_rows).to_excel(w, index=False, sheet_name="Rentabilidades")
+                period_export = []
+                for row in self.period_rows:
+                    r = row.copy()
+                    r["fecha_desde"] = self.date_from_var.get() or "FULL"
+                    r["fecha_hasta"] = self.date_to_var.get() or "FULL"
+                    period_export.append(r)
+                pd.DataFrame(period_export).to_excel(w, index=False, sheet_name="Rentabilidades")
                 pd.DataFrame(self.strategy_equity_curve, columns=["time_ms", "equity"]).to_excel(
                     w, index=False, sheet_name="EquityCurve"
                 )
