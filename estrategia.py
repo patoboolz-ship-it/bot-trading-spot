@@ -339,11 +339,15 @@ function applyC(c){const r={time:Math.floor(c.time/1000),open:c.open,high:c.high
 function snap(x){document.getElementById('state').textContent=x.bot_state; document.getElementById('symbol').value=x.symbol; document.getElementById('interval').value=x.interval; s.setData((x.market_state.candles||[]).map(c=>({time:Math.floor(c.time/1000),open:c.open,high:c.high,low:c.low,close:c.close}))); account(x.account_state); rows('orders',x.orders_state,['status','side','origQty','price','time_iso']); rows('trades',x.trades_state,['side','qty','price','commission','time_iso']); chart.timeScale().scrollToRealTime();}
 function ws(){const p=location.protocol==='https:'?'wss':'ws'; const w=new WebSocket(p+'://'+location.host+'/stream'); w.onopen=()=>log('WS conectado'); w.onclose=()=>setTimeout(ws,1500); w.onmessage=e=>{const m=JSON.parse(e.data); if(m.type==='snapshot')snap(m.payload); if(m.type==='market.candle_update') (m.payload.candles||[]).forEach(applyC); if(m.type==='account.update')account(m.payload); if(m.type==='orders.update')rows('orders',m.payload.orders,['status','side','origQty','price','time_iso']); if(m.type==='trades.update')rows('trades',m.payload.trades,['side','qty','price','commission','time_iso']); if(m.type==='bot.state')document.getElementById('state').textContent=m.payload.state;};}
 async function post(u,b={}){await fetch(u,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(b)})}
+async function frontendLog(level,message,extra=''){try{await fetch('/frontend-log',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({level,message,extra})});}catch(_e){}}
 ['play','pause','stop'].forEach(id=>document.getElementById(id).onclick=()=>post('/control/'+id));
 document.getElementById('symbol').onchange=e=>post('/symbol',{symbol:e.target.value});
 document.getElementById('interval').onchange=e=>post('/timeframe',{interval:e.target.value});
 document.getElementById('live').onchange=e=>{live=e.target.checked; log(live?'LIVE ON':'HIST ON')};
 document.getElementById('goLive').onclick=()=>{live=true;document.getElementById('live').checked=true;pending.forEach(c=>s.update(c));pending=[];chart.timeScale().scrollToRealTime();};
+window.addEventListener('error',(ev)=>{frontendLog('ERROR',ev.message,`${ev.filename||''}:${ev.lineno||0}:${ev.colno||0}`);});
+window.addEventListener('unhandledrejection',(ev)=>{frontendLog('ERROR','Unhandled promise rejection',String(ev.reason||''));});
+frontendLog('INFO','Dashboard cargado',location.href);
 ws();
 </script></body></html>
 """
@@ -391,6 +395,7 @@ class StateStore:
 
     def log(self, msg: str):
         line = f"{time.strftime('%H:%M:%S')} {msg}"
+        print(f"[DASHBOARD] {line}")
         with self.lock:
             self.state.logs.append(line)
             self.state.logs = self.state.logs[-300:]
@@ -595,6 +600,14 @@ async def run_dashboard(args: argparse.Namespace):
     def state():
         return store.snapshot()
 
+    @app.post("/frontend-log")
+    def frontend_log(payload: dict[str, Any]):
+        level = str(payload.get("level", "INFO")).upper()
+        msg = str(payload.get("message", ""))
+        extra = str(payload.get("extra", ""))
+        store.log(f"FRONTEND-{level}: {msg} {extra}".strip())
+        return {"ok": True}
+
     @app.post("/control/play")
     def play():
         engine.start()
@@ -638,6 +651,8 @@ async def run_dashboard(args: argparse.Namespace):
 
     cfg = uvicorn.Config(app, host=args.host, port=args.port, log_level="info")
     server = uvicorn.Server(cfg)
+    print(f"[INFO] Dashboard disponible en http://{args.host}:{args.port}")
+    print("[INFO] Logs de frontend/backend se imprimirán en esta consola.")
     await server.serve()
 
 
