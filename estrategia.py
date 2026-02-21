@@ -11,6 +11,7 @@ import os
 import random
 import socket
 import sqlite3
+import sys
 import threading
 import time
 import traceback
@@ -87,6 +88,16 @@ def detect_local_ipv4() -> str:
         return ip
     except Exception:
         return "127.0.0.1"
+
+
+def configure_stdout() -> None:
+    """Fuerza salida en tiempo real para consolas/IDEs que bufferizan print()."""
+    try:
+        sys.stdout.reconfigure(line_buffering=True, write_through=True)
+        sys.stderr.reconfigure(line_buffering=True, write_through=True)
+    except Exception:
+        # Compatibilidad con runners que no soportan reconfigure
+        pass
 
 def interval_to_ms(interval: str) -> int:
     if interval not in INTERVAL_MS:
@@ -619,6 +630,9 @@ async def run_dashboard(args: argparse.Namespace):
         raise RuntimeError("Falta FastAPI/uvicorn. Instala con: pip install fastapi uvicorn") from exc
 
     store, data = StateStore(args.db_path), DataLayer()
+    print("[INFO] Iniciando modo dashboard...", flush=True)
+    print(f"[INFO] Configuración: host={args.host} port={args.port} symbol={args.symbol} interval={args.interval}", flush=True)
+    print(f"[INFO] Poll={args.poll_seconds}s live_limit={args.live_limit} db_path={args.db_path}", flush=True)
     store.state.symbol = args.symbol
     store.state.interval = args.interval
     store.state.equity_initial = args.capital_inicial
@@ -640,6 +654,7 @@ async def run_dashboard(args: argparse.Namespace):
 
     async def market_loop():
         tick_count = 0
+        store.log("Market loop iniciado")
         while True:
             try:
                 candles = data.get_candles(store.state.symbol, store.state.interval, limit=args.live_limit)
@@ -741,6 +756,8 @@ async def run_dashboard(args: argparse.Namespace):
     print(f"[INFO] Dashboard disponible en tu red Wi-Fi: http://{local_ip}:{args.port}")
     print(f"[INFO] Host de escucha: {args.host} (usa 0.0.0.0 para acceso desde otros dispositivos)")
     print("[INFO] Logs de frontend/backend se imprimirán en esta consola.")
+    print("[INFO] Si no abre la web en 10s, prueba: /state y revisa firewall/VPN.")
+    print(f"[INFO] Healthcheck rápido: http://127.0.0.1:{args.port}/state", flush=True)
     await server.serve()
 
 
@@ -773,9 +790,23 @@ def make_parser():
     return p
 
 
+def print_mode_help(args: argparse.Namespace) -> None:
+    if args.mode == "backtest":
+        print("[WARN] Estás en modo BACKTEST: este modo NO crea webserver.", flush=True)
+        print("[WARN] Para dashboard web usa exactamente: --mode dashboard", flush=True)
+    else:
+        print("[INFO] Estás en modo DASHBOARD: se creará webserver FastAPI.", flush=True)
+
+
 def main():
+    configure_stdout()
     args = make_parser().parse_args()
     interval_to_ms(args.interval)
+    print_mode_help(args)
+
+    if args.mode == "backtest" and args.show:
+        print("[WARN] --show abre una ventana de gráfico y puede parecer 'pegado' hasta cerrarla.", flush=True)
+        print("[WARN] Si quieres ejecución sin bloqueo usa --no-show.", flush=True)
 
     if args.mode == "dashboard":
         asyncio.run(run_dashboard(args))
