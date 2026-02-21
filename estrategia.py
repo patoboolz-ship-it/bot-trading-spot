@@ -373,7 +373,14 @@ def export_events(events: list[dict[str, Any]], metrics: Metrics, out_dir: str):
     print(f"[OK] Métricas JSON: {metrics_path}")
 
 
-def plot_chart(candles: list[dict[str, Any]], events: list[dict[str, Any]], symbol: str, out_dir: str):
+def plot_chart(
+    candles: list[dict[str, Any]],
+    events: list[dict[str, Any]],
+    symbol: str,
+    out_dir: str,
+    *,
+    show_chart: bool,
+):
     try:
         import matplotlib.pyplot as plt
         from matplotlib.patches import Rectangle
@@ -428,10 +435,13 @@ def plot_chart(candles: list[dict[str, Any]], events: list[dict[str, Any]], symb
     plt.tight_layout()
     plt.savefig(png_path, dpi=140)
     print(f"[OK] Gráfico guardado: {png_path}")
-    if os.environ.get("DISPLAY"):
-        plt.show()
-    else:
-        plt.close(fig)
+    if show_chart:
+        try:
+            plt.show()
+            return
+        except Exception as exc:
+            print(f"[WARN] No se pudo abrir ventana interactiva del gráfico: {exc}")
+    plt.close(fig)
 
 
 def make_parser():
@@ -445,6 +455,9 @@ def make_parser():
     p.add_argument("--slip-side", type=float, default=0.0005)
     p.add_argument("--params-json", default=None)
     p.add_argument("--set", action="append", default=[])
+    p.add_argument("--show", dest="show", action="store_true", help="Abrir ventana del gráfico al finalizar")
+    p.add_argument("--no-show", dest="show", action="store_false", help="No abrir ventana (solo guardar PNG)")
+    p.set_defaults(show=True)
     return p
 
 
@@ -469,7 +482,7 @@ def main():
     events, metrics = run_timeline(candles, ge, args.fee_side, args.slip_side)
     print(f"[RESUMEN] trades={metrics.trades} winrate={metrics.winrate:.2f}% pf={metrics.pf:.2f} net={metrics.net:.4f} dd={metrics.dd_pct:.2f}%")
     export_events(events, metrics, args.out)
-    plot_chart(candles, events, args.symbol, args.out)
+    plot_chart(candles, events, args.symbol, args.out, show_chart=args.show)
 
 
 if __name__ == "__main__":
