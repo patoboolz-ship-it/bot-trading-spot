@@ -7,6 +7,7 @@ import time
 import tkinter as tk
 import traceback
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import filedialog, ttk
 from typing import Any, Callable, Optional
@@ -338,6 +339,10 @@ class TradingDashboard(tk.Tk):
         self.strategy_ops: list[SimOp] = []
         self.strategy_equity_curve: list[tuple[int, float]] = []
         self.period_rows: list[dict[str, Any]] = []
+        self.active_candles: list[dict[str, Any]] = []
+
+        self.date_from_var = tk.StringVar(value="")
+        self.date_to_var = tk.StringVar(value="")
 
         self._api, self._api_mode = self._resolve_api_functions()
         self._ui_queue: queue.Queue = queue.Queue()
@@ -457,7 +462,13 @@ class TradingDashboard(tk.Tk):
 
         btns = ttk.Frame(tab_perf)
         btns.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        ttk.Button(btns, text="Recalcular Rentabilidades", command=self._refresh_period_table).pack(side="left", padx=4)
+        ttk.Label(btns, text="Desde (YYYY/MM/DD):").pack(side="left", padx=(2, 4))
+        ttk.Entry(btns, textvariable=self.date_from_var, width=14).pack(side="left", padx=(0, 8))
+        ttk.Label(btns, text="Hasta (YYYY/MM/DD):").pack(side="left", padx=(2, 4))
+        ttk.Entry(btns, textvariable=self.date_to_var, width=14).pack(side="left", padx=(0, 8))
+        ttk.Button(btns, text="Aplicar Rango", command=self.apply_date_range).pack(side="left", padx=4)
+        ttk.Button(btns, text="Limpiar Rango", command=self.clear_date_range).pack(side="left", padx=4)
+        ttk.Button(btns, text="Recalcular Rentabilidades", command=self._recompute_strategy_views).pack(side="left", padx=4)
         ttk.Button(btns, text="Exportar Excel", command=self.export_excel).pack(side="left", padx=4)
 
         cols = ("periodo", "operaciones", "roi_pct", "pnl_usdt", "equity_final")
@@ -581,13 +592,14 @@ class TradingDashboard(tk.Tk):
         return ops, curve
 
     def _recompute_strategy_views(self) -> None:
-        self.strategy_ops, self.strategy_equity_curve = self._compute_strategy_ops(self.candles)
+        self.active_candles = self._get_candles_in_selected_range(self.candles)
+        self.strategy_ops, self.strategy_equity_curve = self._compute_strategy_ops(self.active_candles)
         if self.strategy_equity_curve:
             self.equity = float(self.strategy_equity_curve[-1][1])
             self.pnl = self.equity - self.initial_equity
             self.pnl_percent = (self.pnl / self.initial_equity) * 100 if self.initial_equity else 0.0
         self._render_ops_listbox()
-        self.update_chart(self.candles)
+        self.update_chart(self.active_candles)
         self._refresh_period_table()
         self._update_perf_chart()
 
@@ -599,6 +611,55 @@ class TradingDashboard(tk.Tk):
                 f"{op.side:<4} {self.symbol:<8} {op.price:>10.4f} qty {op.qty:<10.6f} {op.reason} t={op.time_ms}",
             )
         self.trades_listbox.yview_moveto(1.0)
+
+    def _parse_date_to_ms(self, value: str, end_of_day: bool = False) -> Optional[int]:
+        text = (value or "").strip()
+        if not text:
+            return None
+        dt = datetime.strptime(text, "%Y/%m/%d")
+        if end_of_day:
+            dt = dt.replace(hour=23, minute=59, second=59, microsecond=999000)
+        dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+
+    def _get_candles_in_selected_range(self, candles: list[dict]) -> list[dict]:
+        if not candles:
+            return []
+        try:
+            start_ms = self._parse_date_to_ms(self.date_from_var.get(), end_of_day=False)
+            end_ms = self._parse_date_to_ms(self.date_to_var.get(), end_of_day=True)
+        except ValueError:
+            self._set_error("Formato de fecha inválido. Usa YYYY/MM/DD")
+            return candles
+
+        if start_ms is None and end_ms is None:
+            return candles
+        if start_ms is not None and end_ms is not None and start_ms > end_ms:
+            self._set_error("Rango inválido: 'Desde' no puede ser mayor que 'Hasta'")
+            return candles
+
+        out = []
+        for c in candles:
+            t = int(c.get("close_time", c.get("open_time", 0)))
+            if start_ms is not None and t < start_ms:
+                continue
+            if end_ms is not None and t > end_ms:
+                continue
+            out.append(c)
+
+        if not out:
+            self._set_error("No hay velas en el rango solicitado. Ajusta las fechas.")
+            return candles
+        self._set_error("")
+        return out
+
+    def apply_date_range(self) -> None:
+        self._recompute_strategy_views()
+
+    def clear_date_range(self) -> None:
+        self.date_from_var.set("")
+        self.date_to_var.set("")
+        self._recompute_strategy_views()
 
     def _refresh_period_table(self) -> None:
         for i in self.tree_periods.get_children():
