@@ -264,8 +264,17 @@ class _BinancePublicFallbackAPI:
                 break
         server_ms = self.get_server_time_ms()
         filtered = [c for c in out if is_candle_closed(c["close_time"], server_ms, INTERVAL_MS[INTERVAL])]
-        self._cache_last_candles = filtered
-        return filtered
+        filtered.sort(key=lambda x: int(x.get("open_time", 0)))
+        dedup = []
+        seen = set()
+        for c in filtered:
+            ot = int(c.get("open_time", 0))
+            if ot in seen:
+                continue
+            seen.add(ot)
+            dedup.append(c)
+        self._cache_last_candles = dedup
+        return dedup
 
     def start_bot(self):
         self._running = True
@@ -346,7 +355,17 @@ class _BotModuleAdapter:
             if len(rows) < 1000:
                 break
         server_ms = self.get_server_time_ms()
-        return [c for c in out if is_candle_closed(c["close_time"], server_ms, INTERVAL_MS[INTERVAL])]
+        filtered = [c for c in out if is_candle_closed(c["close_time"], server_ms, INTERVAL_MS[INTERVAL])]
+        filtered.sort(key=lambda x: int(x.get("open_time", 0)))
+        dedup = []
+        seen = set()
+        for c in filtered:
+            ot = int(c.get("open_time", 0))
+            if ot in seen:
+                continue
+            seen.add(ot)
+            dedup.append(c)
+        return dedup
 
     def start_bot(self):
         if self._bot and getattr(self._bot, "running", False):
@@ -545,7 +564,7 @@ class TradingDashboard(tk.Tk):
         ttk.Entry(btns, textvariable=self.date_to_var, width=14).pack(side="left", padx=(0, 8))
         ttk.Button(btns, text="Aplicar Rango", command=self.apply_date_range).pack(side="left", padx=4)
         ttk.Button(btns, text="Limpiar Rango", command=self.clear_date_range).pack(side="left", padx=4)
-        ttk.Button(btns, text="Recalcular Rentabilidades", command=self._recompute_strategy_views).pack(side="left", padx=4)
+        ttk.Button(btns, text="Recalcular Rentabilidades", command=self.apply_date_range).pack(side="left", padx=4)
         ttk.Button(btns, text="Exportar Excel", command=self.export_excel).pack(side="left", padx=4)
 
         cols = ("periodo", "operaciones", "roi_pct", "pnl_usdt", "equity_final")
@@ -669,6 +688,7 @@ class TradingDashboard(tk.Tk):
         return ops, curve
 
     def _recompute_strategy_views(self) -> None:
+        self._ensure_range_dataset_if_requested()
         self.active_candles = self._get_candles_in_selected_range(self.candles)
         self.strategy_ops, self.strategy_equity_curve = self._compute_strategy_ops(self.active_candles)
         if self.strategy_equity_curve:
@@ -698,6 +718,42 @@ class TradingDashboard(tk.Tk):
             dt = dt.replace(hour=23, minute=59, second=59, microsecond=999000)
         dt = dt.replace(tzinfo=timezone.utc)
         return int(dt.timestamp() * 1000)
+
+    def _ensure_range_dataset_if_requested(self) -> None:
+        """Si hay fechas cargadas, descarga velas históricas aunque el usuario pulse solo 'Recalcular'."""
+        try:
+            start_ms, end_ms = self._read_selected_range()
+        except ValueError:
+            return
+
+        if start_ms is None and end_ms is None:
+            return
+
+        if "get_candles_range" not in self._api:
+            return
+
+        # Si ya está lockeado con el mismo rango, no volver a descargar.
+        if (
+            self.range_locked
+            and self.selected_start_ms == (start_ms if start_ms is not None else self.selected_start_ms)
+            and self.selected_end_ms == (end_ms if end_ms is not None else self.selected_end_ms)
+        ):
+            return
+
+        base_start = int(self.candles[0]["close_time"]) if self.candles else int(start_ms or 0)
+        base_end = int(self.candles[-1]["close_time"]) if self.candles else int(end_ms or 0)
+        start_ms = start_ms if start_ms is not None else base_start
+        end_ms = end_ms if end_ms is not None else base_end
+        if start_ms > end_ms:
+            return
+
+        candles = self._api["get_candles_range"](self.symbol, self.interval, int(start_ms), int(end_ms)) or []
+        if candles:
+            self.candles = candles
+            self.range_locked = True
+            self.selected_start_ms = int(start_ms)
+            self.selected_end_ms = int(end_ms)
+            self._set_error("")
 
     def _get_candles_in_selected_range(self, candles: list[dict]) -> list[dict]:
         if not candles:
