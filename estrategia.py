@@ -53,6 +53,8 @@ INTERVAL_MS = {
     "1d": 86_400_000,
 }
 
+INITIAL_CAPITAL = 1000.0
+
 
 @dataclass
 class Metrics:
@@ -63,6 +65,9 @@ class Metrics:
     winrate: float
     pf: float
     dd_pct: float
+    balance_final: float
+    pnl_usd: float
+    roi_pct: float
 
 
 class DotDict(dict):
@@ -256,7 +261,15 @@ def build_genome(params: dict[str, Any]) -> DotDict:
     return DotDict(params)
 
 
-def run_timeline(candles: list[dict[str, Any]], ge, fee_side: float, slip_side: float):
+def run_timeline(
+    candles: list[dict[str, Any]],
+    ge,
+    fee_side: float,
+    slip_side: float,
+    *,
+    initial_capital: float,
+    feedback: bool,
+):
     data = heikin_ashi(candles) if int(ge.use_ha) == 1 else candles
     close_sig = [c["close"] for c in data]
     rsi_arr = rsi_wilder_series(close_sig, int(ge.rsi_period))
@@ -267,13 +280,17 @@ def run_timeline(candles: list[dict[str, Any]], ge, fee_side: float, slip_side: 
     entry_i = -10_000
     last_trade_i = -10_000
     events: list[dict[str, Any]] = []
+    trade_rows: list[dict[str, Any]] = []
+    open_trade: dict[str, Any] | None = None
     equity = 1.0
+    balance = float(initial_capital)
     peak = 1.0
     max_dd = 0.0
     wins = 0
     losses = 0
     gross_profit = 0.0
     gross_loss = 0.0
+    equity_curve: list[dict[str, Any]] = []
 
     for i in range(1, len(close_sig) - 1):
         payload = score_components_at_index(close_sig, rsi_arr, mh_arr, i, ge)
@@ -290,7 +307,18 @@ def run_timeline(candles: list[dict[str, Any]], ge, fee_side: float, slip_side: 
                 entry = buy_price
                 entry_i = i + 1
                 in_pos = True
-                events.append({"type": "BUY", "i": i + 1, "time": next_candle["open_time"], "price": buy_price, "buy_score": bs, "sell_score": ss})
+                events.append({
+                    "type": "BUY", "i": i + 1, "time": next_candle["open_time"], "price": buy_price,
+                    "buy_score": bs, "sell_score": ss, "capital_antes": balance,
+                })
+                open_trade = {
+                    "entrada_idx": i + 1,
+                    "entrada_fecha": ts_to_iso(next_candle["open_time"]),
+                    "entrada_precio": buy_price,
+                    "capital_antes": balance,
+                }
+                if feedback:
+                    print(f"[BUY] {open_trade['entrada_fecha']} precio={buy_price:.4f} capital={balance:.2f}")
         else:
             tp_px = entry * (1.0 + abs(float(ge.take_profit)))
             sl_px = entry * (1.0 - abs(float(ge.stop_loss)))
@@ -310,6 +338,7 @@ def run_timeline(candles: list[dict[str, Any]], ge, fee_side: float, slip_side: 
                 trade_ratio = (1.0 - fee_side) * gross_ratio
                 trade_ret = trade_ratio - 1.0
                 equity *= trade_ratio
+                balance *= trade_ratio
                 peak = max(peak, equity)
                 max_dd = max(max_dd, (peak - equity) / peak)
                 if trade_ret >= 0:
@@ -321,25 +350,75 @@ def run_timeline(candles: list[dict[str, Any]], ge, fee_side: float, slip_side: 
                 events.append({
                     "type": "SELL", "i": i + 1, "time": next_candle["open_time"], "price": sell_price,
                     "reason": exit_reason, "ret": trade_ret, "entry_i": entry_i, "entry_price": entry,
-                    "buy_score": bs, "sell_score": ss,
+                    "buy_score": bs, "sell_score": ss, "capital_despues": balance,
                 })
+                if open_trade is not None:
+                    trade_rows.append({
+                        "n_operacion": len(trade_rows) + 1,
+                        "entrada_idx": open_trade["entrada_idx"],
+                        "salida_idx": i + 1,
+                        "entrada_fecha": open_trade["entrada_fecha"],
+                        "salida_fecha": ts_to_iso(next_candle["open_time"]),
+                        "entrada_precio": open_trade["entrada_precio"],
+                        "salida_precio": sell_price,
+                        "motivo_salida": exit_reason,
+                        "retorno_pct": trade_ret * 100.0,
+                        "capital_antes": open_trade["capital_antes"],
+                        "capital_despues": balance,
+                        "pnl_usd": balance - open_trade["capital_antes"],
+                    })
+                if feedback:
+                    print(
+                        f"[SELL-{exit_reason}] {ts_to_iso(next_candle['open_time'])} "
+                        f"ret={trade_ret*100:.2f}% capital={balance:.2f}"
+                    )
                 in_pos = False
                 last_trade_i = i + 1
+                open_trade = None
+
+        equity_curve.append({
+            "idx": i,
+            "time": candles[i]["open_time"],
+            "time_iso": ts_to_iso(candles[i]["open_time"]),
+            "equity": equity,
+            "capital": balance,
+        })
 
     trades = wins + losses
     winrate = (wins / trades * 100.0) if trades else 0.0
     pf = gross_profit / (gross_loss + 1e-9) if trades else 0.0
-    metrics = Metrics(net=equity - 1.0, trades=trades, wins=wins, losses=losses, winrate=winrate, pf=pf, dd_pct=max_dd * 100.0)
-    return events, metrics
+    metrics = Metrics(
+        net=equity - 1.0,
+        trades=trades,
+        wins=wins,
+        losses=losses,
+        winrate=winrate,
+        pf=pf,
+        dd_pct=max_dd * 100.0,
+        balance_final=balance,
+        pnl_usd=balance - float(initial_capital),
+        roi_pct=(equity - 1.0) * 100.0,
+    )
+    return events, metrics, equity_curve, trade_rows
 
 
 def ts_to_iso(ts_ms: int) -> str:
     return datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
 
 
-def export_events(events: list[dict[str, Any]], metrics: Metrics, out_dir: str):
+def export_events(
+    events: list[dict[str, Any]],
+    metrics: Metrics,
+    out_dir: str,
+    *,
+    equity_curve: list[dict[str, Any]],
+    trade_rows: list[dict[str, Any]],
+    params: dict[str, Any],
+):
     os.makedirs(out_dir, exist_ok=True)
-    events_path = os.path.join(out_dir, "operaciones.csv")
+    events_path = os.path.join(out_dir, "eventos_crudos.csv")
+    trades_path = os.path.join(out_dir, "operaciones_resumen.csv")
+    equity_path = os.path.join(out_dir, "curva_capital.csv")
     metrics_path = os.path.join(out_dir, "metricas.json")
 
     if events:
@@ -350,6 +429,25 @@ def export_events(events: list[dict[str, Any]], metrics: Metrics, out_dir: str):
             for ev in events:
                 row = dict(ev)
                 row["time_iso"] = ts_to_iso(ev["time"])
+                w.writerow(row)
+
+    if trade_rows:
+        ordered_cols = [
+            "n_operacion", "entrada_fecha", "salida_fecha", "entrada_precio", "salida_precio",
+            "motivo_salida", "retorno_pct", "capital_antes", "capital_despues", "pnl_usd",
+            "entrada_idx", "salida_idx",
+        ]
+        with open(trades_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=ordered_cols)
+            w.writeheader()
+            for row in trade_rows:
+                w.writerow(row)
+
+    if equity_curve:
+        with open(equity_path, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=["idx", "time", "time_iso", "equity", "capital"])
+            w.writeheader()
+            for row in equity_curve:
                 w.writerow(row)
 
     with open(metrics_path, "w", encoding="utf-8") as f:
@@ -363,13 +461,32 @@ def export_events(events: list[dict[str, Any]], metrics: Metrics, out_dir: str):
             df["time_iso"] = df["time"].apply(ts_to_iso)
         excel_path = os.path.join(out_dir, "reporte_estrategia.xlsx")
         with pd.ExcelWriter(excel_path) as writer:
-            df.to_excel(writer, sheet_name="operaciones", index=False)
-            pd.DataFrame([asdict(metrics)]).to_excel(writer, sheet_name="metricas", index=False)
+            resumen_df = pd.DataFrame([
+                {
+                    "capital_inicial": params.get("capital_inicial", INITIAL_CAPITAL),
+                    "capital_final": metrics.balance_final,
+                    "pnl_usd": metrics.pnl_usd,
+                    "roi_pct": metrics.roi_pct,
+                    "trades": metrics.trades,
+                    "winrate_pct": metrics.winrate,
+                    "profit_factor": metrics.pf,
+                    "drawdown_pct": metrics.dd_pct,
+                }
+            ])
+            resumen_df.to_excel(writer, sheet_name="Resumen", index=False)
+            pd.DataFrame(trade_rows).to_excel(writer, sheet_name="Operaciones", index=False)
+            df.to_excel(writer, sheet_name="Eventos", index=False)
+            pd.DataFrame(equity_curve).to_excel(writer, sheet_name="CurvaCapital", index=False)
+            pd.DataFrame([params]).to_excel(writer, sheet_name="Parametros", index=False)
         print(f"[OK] Excel exportado: {excel_path}")
     except Exception as exc:
         print(f"[WARN] Excel no disponible ({exc}). CSV/JSON sí fueron exportados.")
 
-    print(f"[OK] Operaciones CSV: {events_path}")
+    print(f"[OK] Eventos CSV: {events_path}")
+    if trade_rows:
+        print(f"[OK] Operaciones resumidas CSV: {trades_path}")
+    if equity_curve:
+        print(f"[OK] Curva de capital CSV: {equity_path}")
     print(f"[OK] Métricas JSON: {metrics_path}")
 
 
@@ -378,21 +495,26 @@ def plot_chart(
     events: list[dict[str, Any]],
     symbol: str,
     out_dir: str,
+    equity_curve: list[dict[str, Any]],
     *,
     show_chart: bool,
+    plot_candles: int,
 ):
     try:
         import matplotlib.pyplot as plt
         from matplotlib.patches import Rectangle
+        from matplotlib.widgets import Button
     except Exception as exc:
         print(f"[WARN] No se pudo abrir gráfico (matplotlib no disponible): {exc}")
         return
 
     os.makedirs(out_dir, exist_ok=True)
-    fig, (ax_price, ax_ret) = plt.subplots(2, 1, figsize=(16, 9), sharex=True, gridspec_kw={"height_ratios": [3, 1]})
+    start_idx = max(0, len(candles) - int(max(200, plot_candles)))
+    view_candles = candles[start_idx:]
+    fig, (ax_price, ax_ret, ax_eq) = plt.subplots(3, 1, figsize=(16, 10), sharex=True, gridspec_kw={"height_ratios": [3, 1, 1]})
 
     width = 0.65
-    for i, c in enumerate(candles):
+    for i, c in enumerate(view_candles):
         o, h, l, cl = c["open"], c["high"], c["low"], c["close"]
         color = "#2ecc71" if cl >= o else "#e74c3c"
         ax_price.vlines(i, l, h, color=color, linewidth=1)
@@ -403,14 +525,17 @@ def plot_chart(
 
     buy_x, buy_y, sell_x, sell_y, ret_x, rets = [], [], [], [], [], []
     for ev in events:
+        if ev["i"] < start_idx:
+            continue
+        local_i = ev["i"] - start_idx
         if ev["type"] == "BUY":
-            buy_x.append(ev["i"])
+            buy_x.append(local_i)
             buy_y.append(ev["price"])
         else:
-            sell_x.append(ev["i"])
+            sell_x.append(local_i)
             sell_y.append(ev["price"])
             if "ret" in ev:
-                ret_x.append(ev["i"])
+                ret_x.append(local_i)
                 rets.append(ev["ret"] * 100)
 
     if buy_x:
@@ -418,7 +543,7 @@ def plot_chart(
     if sell_x:
         ax_price.scatter(sell_x, sell_y, marker="v", s=35, color="#d63031", label="Salidas SELL")
 
-    ax_price.set_title(f"{symbol} | Estrategia (1h)")
+    ax_price.set_title(f"{symbol} | Estrategia (1h) | velas mostradas={len(view_candles)}")
     ax_price.set_ylabel("Precio")
     ax_price.grid(alpha=0.2)
     ax_price.legend(loc="upper left")
@@ -428,8 +553,43 @@ def plot_chart(
         colors = ["#2ecc71" if r >= 0 else "#e74c3c" for r in rets]
         ax_ret.bar(ret_x, rets, color=colors, alpha=0.85, width=0.8)
     ax_ret.set_ylabel("Ret %")
-    ax_ret.set_xlabel("Velas")
+    ax_ret.set_xlabel("Velas (vista actual)")
     ax_ret.grid(alpha=0.2)
+
+    if equity_curve:
+        eq_points = [row for row in equity_curve if row["idx"] >= start_idx]
+        eq_x = [row["idx"] - start_idx for row in eq_points]
+        eq_y = [row["capital"] for row in eq_points]
+        if eq_x:
+            ax_eq.plot(eq_x, eq_y, color="#1565c0", linewidth=1.2, label="Capital")
+            ax_eq.legend(loc="upper left")
+    ax_eq.set_ylabel("Capital")
+    ax_eq.grid(alpha=0.2)
+
+    txt = (
+        f"Trades={len([e for e in events if e['type']=='SELL'])} | "
+        f"Último capital={equity_curve[-1]['capital']:.2f}" if equity_curve else "Sin curva capital"
+    )
+    ax_eq.text(0.01, 0.92, txt, transform=ax_eq.transAxes, fontsize=9, va="top")
+
+    windows = [("7D", 7 * 24), ("30D", 30 * 24), ("90D", 90 * 24), ("180D", 180 * 24), ("ALL", None)]
+    for idx_btn, (label, hours) in enumerate(windows):
+        bax = fig.add_axes([0.08 + idx_btn * 0.08, 0.01, 0.07, 0.035])
+        btn = Button(bax, label)
+
+        def _factory(h):
+            def _onclick(_event):
+                total = len(view_candles)
+                if h is None:
+                    ax_price.set_xlim(0, max(1, total - 1))
+                else:
+                    size = min(total, int(h))
+                    ax_price.set_xlim(max(0, total - size), max(1, total - 1))
+                fig.canvas.draw_idle()
+
+            return _onclick
+
+        btn.on_clicked(_factory(hours))
 
     png_path = os.path.join(out_dir, "grafico_estrategia.png")
     plt.tight_layout()
@@ -455,9 +615,14 @@ def make_parser():
     p.add_argument("--slip-side", type=float, default=0.0005)
     p.add_argument("--params-json", default=None)
     p.add_argument("--set", action="append", default=[])
+    p.add_argument("--capital-inicial", type=float, default=INITIAL_CAPITAL)
+    p.add_argument("--max-candles", type=int, default=8000, help="Máximo de velas para simulación (acelera)")
+    p.add_argument("--plot-candles", type=int, default=2500, help="Velas a mostrar en pantalla")
+    p.add_argument("--feedback", dest="feedback", action="store_true", help="Mostrar feedback de operaciones")
+    p.add_argument("--no-feedback", dest="feedback", action="store_false", help="Silenciar feedback por operación")
     p.add_argument("--show", dest="show", action="store_true", help="Abrir ventana del gráfico al finalizar")
     p.add_argument("--no-show", dest="show", action="store_false", help="No abrir ventana (solo guardar PNG)")
-    p.set_defaults(show=True)
+    p.set_defaults(show=True, feedback=True)
     return p
 
 
@@ -465,6 +630,7 @@ def main():
     args = make_parser().parse_args()
     interval_to_ms(args.interval)
     params = load_params(args)
+    params["capital_inicial"] = args.capital_inicial
     ge = build_genome(params)
     print("[INFO] Parámetros finales:")
     print(json.dumps(dict(ge), indent=2, ensure_ascii=False))
@@ -476,13 +642,35 @@ def main():
 
     client = Client(None, None)
     candles = fetch_historical_closed(client, args.symbol, args.interval, args.start, args.end)
+    if args.max_candles > 0 and len(candles) > args.max_candles:
+        candles = candles[-args.max_candles :]
+        print(f"[INFO] Se limitaron velas a las más recientes: {len(candles)}")
     if len(candles) < 220:
         raise RuntimeError(f"Muy pocas velas cerradas para simular: {len(candles)}")
 
-    events, metrics = run_timeline(candles, ge, args.fee_side, args.slip_side)
-    print(f"[RESUMEN] trades={metrics.trades} winrate={metrics.winrate:.2f}% pf={metrics.pf:.2f} net={metrics.net:.4f} dd={metrics.dd_pct:.2f}%")
-    export_events(events, metrics, args.out)
-    plot_chart(candles, events, args.symbol, args.out, show_chart=args.show)
+    events, metrics, equity_curve, trade_rows = run_timeline(
+        candles,
+        ge,
+        args.fee_side,
+        args.slip_side,
+        initial_capital=args.capital_inicial,
+        feedback=args.feedback,
+    )
+    rentable = "SI" if metrics.pnl_usd > 0 else "NO"
+    print(
+        f"[RESUMEN] rentable={rentable} trades={metrics.trades} winrate={metrics.winrate:.2f}% "
+        f"pf={metrics.pf:.2f} roi={metrics.roi_pct:.2f}% pnl_usd={metrics.pnl_usd:.2f} dd={metrics.dd_pct:.2f}%"
+    )
+    export_events(events, metrics, args.out, equity_curve=equity_curve, trade_rows=trade_rows, params=params)
+    plot_chart(
+        candles,
+        events,
+        args.symbol,
+        args.out,
+        equity_curve,
+        show_chart=args.show,
+        plot_candles=args.plot_candles,
+    )
 
 
 if __name__ == "__main__":
