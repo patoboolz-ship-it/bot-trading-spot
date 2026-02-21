@@ -12,6 +12,7 @@ import random
 import sqlite3
 import threading
 import time
+import traceback
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any
@@ -316,41 +317,67 @@ def plot_chart(candles: list[dict[str, Any]], events: list[dict[str, Any]], symb
 HTML_DASHBOARD = """
 <!doctype html><html><head><meta charset='utf-8'/><title>Estrategia Dashboard</title>
 <script src='https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js'></script>
-<style>body{font-family:Arial;background:#0b1220;color:#e2e8f0;margin:0} .top,.grid{display:flex;gap:10px;padding:10px}.panel{background:#111827;border:1px solid #334155;border-radius:8px;padding:10px}.grid{align-items:stretch}.left{flex:3}.right{flex:2} table{width:100%;font-size:12px} td,th{border-bottom:1px solid #334155;padding:4px} #chart{height:420px}</style>
+<style>
+body{font-family:Arial;background:#0b1220;color:#e2e8f0;margin:0}
+.top,.grid{display:flex;gap:10px;padding:10px}.panel{background:#111827;border:1px solid #334155;border-radius:8px;padding:10px}
+.grid{align-items:stretch}.left{flex:3}.right{flex:2}
+table{width:100%;font-size:12px;border-collapse:collapse}td,th{border-bottom:1px solid #334155;padding:4px;text-align:left}
+#chart,#eqchart{height:280px}.tabs{display:flex;gap:6px;margin-bottom:8px}.tabbtn{padding:6px 10px;border:1px solid #475569;background:#1e293b;color:#e2e8f0;cursor:pointer}
+.tabbtn.active{background:#2563eb}.tab{display:none}.tab.active{display:block}
+</style>
 </head><body>
 <div class='top panel'>
 <select id='symbol'><option>SOLUSDT</option><option>BTCUSDT</option><option>ETHUSDT</option></select>
 <select id='interval'><option>1m</option><option>5m</option><option>15m</option><option selected>1h</option><option>4h</option><option>1d</option></select>
-<label><input type='checkbox' id='live' checked/> LIVE</label><button id='goLive'>Volver a tiempo real</button>
+<label><input type='checkbox' id='live' checked/> LIVE</label><button id='goLive'>Go Live</button>
 <button id='play'>Play</button><button id='pause'>Pause</button><button id='stop'>Stop</button>
-<span>Estado: <b id='state'>IDLE</b></span></div>
-<div class='grid'><div class='left panel'><div id='chart'></div></div><div class='right panel'>
-<div id='account'></div><h4>Activos</h4><div id='assets'></div><h4>Logs</h4><pre id='logs' style='max-height:180px;overflow:auto'></pre></div></div>
-<div class='grid'><div class='left panel'><h4>Órdenes</h4><table><thead><tr><th>Estado</th><th>Side</th><th>Qty</th><th>Precio</th><th>Hora</th></tr></thead><tbody id='orders'></tbody></table></div>
-<div class='right panel'><h4>Trades</h4><table><thead><tr><th>Side</th><th>Qty</th><th>Precio</th><th>Comisión</th><th>Hora</th></tr></thead><tbody id='trades'></tbody></table></div></div>
+<span>Estado: <b id='state'>IDLE</b></span><span>Última acción: <b id='lastAction'>init</b></span>
+</div>
+<div class='grid'>
+<div class='left panel'><h4>Precio (OHLCV)</h4><div id='chart'></div><h4>Curva Equity</h4><div id='eqchart'></div></div>
+<div class='right panel'><h4>Cartera / PnL</h4><div id='account'></div><h4>Activos Spot</h4><div id='assets'></div></div>
+</div>
+<div class='panel' style='margin:10px'>
+<div class='tabs'>
+<button class='tabbtn active' data-tab='ordersTab'>Órdenes</button>
+<button class='tabbtn' data-tab='tradesTab'>Trades</button>
+<button class='tabbtn' data-tab='logsTab'>Logs</button>
+</div>
+<div id='ordersTab' class='tab active'><table><thead><tr><th>Estado</th><th>Side</th><th>Qty</th><th>Precio</th><th>Hora</th></tr></thead><tbody id='orders'></tbody></table></div>
+<div id='tradesTab' class='tab'><table><thead><tr><th>Side</th><th>Qty</th><th>Precio</th><th>Comisión</th><th>Hora</th></tr></thead><tbody id='trades'></tbody></table></div>
+<div id='logsTab' class='tab'><pre id='logs' style='max-height:220px;overflow:auto'></pre></div>
+</div>
 <script>
 const chart = LightweightCharts.createChart(document.getElementById('chart'), {layout:{background:{color:'#0b1220'},textColor:'#cbd5e1'}});
 const s = chart.addCandlestickSeries();
-let live=true,pending=[];
-function log(m){const box=document.getElementById('logs'); box.textContent='['+new Date().toLocaleTimeString()+'] '+m+'\n'+box.textContent;}
-function rows(id,data,cols){document.getElementById(id).innerHTML=(data||[]).slice(-25).reverse().map(r=>'<tr>'+cols.map(c=>'<td>'+(r[c]??'')+'</td>').join('')+'</tr>').join('');}
-function account(a){document.getElementById('account').innerHTML='<b>Equity:</b> '+(a.equity||0).toFixed(2)+' USDT<br><b>PnL:</b> '+(a.pnl_usdt||0).toFixed(2)+' ('+(a.pnl_pct||0).toFixed(2)+'%)<br><b>USDT:</b> '+((a.balances||{}).USDT||0).toFixed(2); document.getElementById('assets').innerHTML=(a.assets||[]).map(x=>x.asset+': '+Number(x.qty).toFixed(4)+' (~'+Number(x.est_usdt).toFixed(2)+' USDT)').join('<br>')||'Sin posición';}
-function applyC(c){const r={time:Math.floor(c.time/1000),open:c.open,high:c.high,low:c.low,close:c.close}; if(!live){pending.push(r); return;} s.update(r);}
-function snap(x){document.getElementById('state').textContent=x.bot_state; document.getElementById('symbol').value=x.symbol; document.getElementById('interval').value=x.interval; s.setData((x.market_state.candles||[]).map(c=>({time:Math.floor(c.time/1000),open:c.open,high:c.high,low:c.low,close:c.close}))); account(x.account_state); rows('orders',x.orders_state,['status','side','origQty','price','time_iso']); rows('trades',x.trades_state,['side','qty','price','commission','time_iso']); chart.timeScale().scrollToRealTime();}
-function ws(){const p=location.protocol==='https:'?'wss':'ws'; const w=new WebSocket(p+'://'+location.host+'/stream'); w.onopen=()=>log('WS conectado'); w.onclose=()=>setTimeout(ws,1500); w.onmessage=e=>{const m=JSON.parse(e.data); if(m.type==='snapshot')snap(m.payload); if(m.type==='market.candle_update') (m.payload.candles||[]).forEach(applyC); if(m.type==='account.update')account(m.payload); if(m.type==='orders.update')rows('orders',m.payload.orders,['status','side','origQty','price','time_iso']); if(m.type==='trades.update')rows('trades',m.payload.trades,['side','qty','price','commission','time_iso']); if(m.type==='bot.state')document.getElementById('state').textContent=m.payload.state;};}
+const eqChart = LightweightCharts.createChart(document.getElementById('eqchart'), {layout:{background:{color:'#0b1220'},textColor:'#cbd5e1'},height:280});
+const eqSeries = eqChart.addLineSeries({color:'#22c55e'});
+let live=true,pending=[];let markers=[];
+function toTs(ms){return Math.floor(ms/1000)}
+function pushLog(m){const box=document.getElementById('logs'); box.textContent='['+new Date().toLocaleTimeString()+'] '+m+'\n'+box.textContent;}
+function rows(id,data,cols){document.getElementById(id).innerHTML=(data||[]).slice(-60).reverse().map(r=>'<tr>'+cols.map(c=>'<td>'+(r[c]??'')+'</td>').join('')+'</tr>').join('');}
+function account(a){document.getElementById('account').innerHTML='<div><b>USDT disponible:</b> '+((a.balances||{}).USDT||0).toFixed(2)+'</div><div><b>Equity total:</b> '+(a.equity||0).toFixed(2)+' USDT</div><div><b>Rentabilidad:</b> '+(a.pnl_usdt||0).toFixed(2)+' USDT ('+(a.pnl_pct||0).toFixed(2)+'%)</div><div><b>PnL realizado:</b> '+(a.realized_pnl_usd||0).toFixed(2)+' USDT</div><div><b>PnL no realizado:</b> '+(a.unrealized_pnl_usd||0).toFixed(2)+' USDT</div>'; document.getElementById('assets').innerHTML=(a.assets||[]).map(x=>x.asset+': '+Number(x.qty).toFixed(4)+' (~'+Number(x.est_usdt).toFixed(2)+' USDT)').join('<br>')||'Sin posiciones';}
+function applyCandles(items){(items||[]).forEach(c=>{const r={time:toTs(c.time),open:c.open,high:c.high,low:c.low,close:c.close}; if(!live){pending.push(r); return;} s.update(r);});}
+function setMarkersFromTrades(trades){markers=(trades||[]).map(t=>({time:toTs(t.time),position:t.side==='BUY'?'belowBar':'aboveBar',color:t.side==='BUY'?'#22c55e':'#ef4444',shape:t.side==='BUY'?'arrowUp':'arrowDown',text:t.side+' '+t.qty})); s.setMarkers(markers);}
+function setEquity(perf){eqSeries.setData((perf.equity_curve||[]).map(x=>({time:toTs(x.time),value:x.equity})));}
+function setLogs(payload){const merged=[...(payload.logs||[]), ...((payload.errors||[]).map(e=>'ERROR '+e))].slice(-120).reverse(); document.getElementById('logs').textContent=merged.join('\n');}
+function applySnapshot(x){document.getElementById('state').textContent=x.bot_state; document.getElementById('lastAction').textContent=x.last_action||'init'; document.getElementById('symbol').value=x.symbol; document.getElementById('interval').value=x.interval; s.setData((x.market_state.candles||[]).map(c=>({time:toTs(c.time),open:c.open,high:c.high,low:c.low,close:c.close}))); account(x.account_state); rows('orders',x.orders_state,['status','side','origQty','price','time_iso']); rows('trades',x.trades_state,['side','qty','price','commission','time_iso']); setMarkersFromTrades(x.trades_state||[]); setEquity(x.performance_state||{equity_curve:[]}); setLogs({logs:x.logs||[], errors:x.errors||[]}); chart.timeScale().scrollToRealTime(); eqChart.timeScale().scrollToRealTime();}
+function switchTab(id){document.querySelectorAll('.tabbtn').forEach(b=>b.classList.toggle('active',b.dataset.tab===id)); document.querySelectorAll('.tab').forEach(t=>t.classList.toggle('active',t.id===id));}
+document.querySelectorAll('.tabbtn').forEach(b=>b.onclick=()=>switchTab(b.dataset.tab));
 async function post(u,b={}){await fetch(u,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(b)})}
 async function frontendLog(level,message,extra=''){try{await fetch('/frontend-log',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({level,message,extra})});}catch(_e){}}
 ['play','pause','stop'].forEach(id=>document.getElementById(id).onclick=()=>post('/control/'+id));
 document.getElementById('symbol').onchange=e=>post('/symbol',{symbol:e.target.value});
 document.getElementById('interval').onchange=e=>post('/timeframe',{interval:e.target.value});
-document.getElementById('live').onchange=e=>{live=e.target.checked; log(live?'LIVE ON':'HIST ON')};
-document.getElementById('goLive').onclick=()=>{live=true;document.getElementById('live').checked=true;pending.forEach(c=>s.update(c));pending=[];chart.timeScale().scrollToRealTime();};
-window.addEventListener('error',(ev)=>{frontendLog('ERROR',ev.message,`${ev.filename||''}:${ev.lineno||0}:${ev.colno||0}`);});
-window.addEventListener('unhandledrejection',(ev)=>{frontendLog('ERROR','Unhandled promise rejection',String(ev.reason||''));});
-frontendLog('INFO','Dashboard cargado',location.href);
-ws();
+document.getElementById('live').onchange=e=>{live=e.target.checked; pushLog(live?'LIVE ON':'HIST ON')};
+document.getElementById('goLive').onclick=()=>{live=true;document.getElementById('live').checked=true;pending.forEach(c=>s.update(c));pending=[];chart.timeScale().scrollToRealTime();eqChart.timeScale().scrollToRealTime();};
+window.addEventListener('error',(ev)=>frontendLog('ERROR',ev.message,`${ev.filename||''}:${ev.lineno||0}:${ev.colno||0}`));
+window.addEventListener('unhandledrejection',(ev)=>frontendLog('ERROR','Unhandled promise rejection',String(ev.reason||'')));
+function ws(){const p=location.protocol==='https:'?'wss':'ws'; const w=new WebSocket(p+'://'+location.host+'/stream'); w.onopen=()=>pushLog('WS conectado'); w.onclose=()=>{pushLog('WS desconectado. Reintentando...'); setTimeout(ws,1500)}; w.onmessage=e=>{const m=JSON.parse(e.data); if(m.type==='snapshot')applySnapshot(m.payload); if(m.type==='market.candle_update')applyCandles(m.payload.candles||[]); if(m.type==='account.update')account(m.payload); if(m.type==='orders.update')rows('orders',m.payload.orders||[],['status','side','origQty','price','time_iso']); if(m.type==='trades.update'){rows('trades',m.payload.trades||[],['side','qty','price','commission','time_iso']); setMarkersFromTrades(m.payload.trades||[]);} if(m.type==='performance.update')setEquity(m.payload); if(m.type==='logs.update')setLogs(m.payload); if(m.type==='bot.state'){document.getElementById('state').textContent=m.payload.state; document.getElementById('lastAction').textContent=m.payload.last_action||'';}};}
+frontendLog('INFO','Dashboard cargado',location.href); ws();
 </script></body></html>
 """
+
 
 
 @dataclass
@@ -365,10 +392,15 @@ class AppState:
     equity_initial: float = INITIAL_CAPITAL
     pnl_usdt: float = 0.0
     pnl_pct: float = 0.0
+    realized_pnl_usd: float = 0.0
+    unrealized_pnl_usd: float = 0.0
+    position_cost_usd: float = 0.0
     orders: list[dict[str, Any]] = None
     trades: list[dict[str, Any]] = None
     candles: list[dict[str, Any]] = None
     logs: list[str] = None
+    errors: list[str] = None
+    equity_curve: list[dict[str, Any]] = None
 
     def __post_init__(self):
         self.balances = {"USDT": INITIAL_CAPITAL} if self.balances is None else self.balances
@@ -377,6 +409,8 @@ class AppState:
         self.trades = [] if self.trades is None else self.trades
         self.candles = [] if self.candles is None else self.candles
         self.logs = [] if self.logs is None else self.logs
+        self.errors = [] if self.errors is None else self.errors
+        self.equity_curve = [] if self.equity_curve is None else self.equity_curve
 
 
 class StateStore:
@@ -395,28 +429,42 @@ class StateStore:
 
     def log(self, msg: str):
         line = f"{time.strftime('%H:%M:%S')} {msg}"
-        print(f"[DASHBOARD] {line}")
+        print(f"[DASHBOARD] {line}", flush=True)
         with self.lock:
             self.state.logs.append(line)
             self.state.logs = self.state.logs[-300:]
+
+    def log_error(self, msg: str):
+        self.log(f"ERROR: {msg}")
+        with self.lock:
+            self.state.errors.append(msg)
+            self.state.errors = self.state.errors[-100:]
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
             return {
                 "bot_state": self.state.bot_state,
+                "last_action": self.state.last_action,
                 "symbol": self.state.symbol,
                 "interval": self.state.interval,
-                "market_state": {"candles": self.state.candles[-1500:]},
+                "market_state": {
+                    "candles": self.state.candles[-1500:],
+                    "last_price": self.state.candles[-1]["close"] if self.state.candles else None,
+                },
                 "account_state": {
                     "balances": self.state.balances,
                     "assets": self.state.assets,
                     "equity": self.state.equity,
                     "pnl_usdt": self.state.pnl_usdt,
                     "pnl_pct": self.state.pnl_pct,
+                    "realized_pnl_usd": self.state.realized_pnl_usd,
+                    "unrealized_pnl_usd": self.state.unrealized_pnl_usd,
                 },
                 "orders_state": self.state.orders[-100:],
                 "trades_state": self.state.trades[-100:],
+                "performance_state": {"equity_curve": self.state.equity_curve[-2000:]},
                 "logs": self.state.logs[-100:],
+                "errors": self.state.errors[-50:],
             }
 
 
@@ -467,14 +515,17 @@ class BotEngine:
 
     def start(self):
         self.store.state.bot_state = "RUNNING"
+        self.store.state.last_action = "play"
         self.store.log("Bot RUNNING")
 
     def pause(self):
         self.store.state.bot_state = "PAUSED"
+        self.store.state.last_action = "pause"
         self.store.log("Bot PAUSED")
 
     def stop(self):
         self.store.state.bot_state = "IDLE"
+        self.store.state.last_action = "stop"
         self.store.log("Bot STOP")
 
     def on_market(self):
@@ -494,19 +545,25 @@ class BotEngine:
 
         if not self.in_pos and score["buy_score"] >= float(self.ge.buy_th) and (i - self.last_i) >= int(self.ge.cooldown) and usdt > 10:
             qbuy = (usdt * 0.98) / (px + 1e-12)
-            self.store.state.balances["USDT"] = 0.0
+            invested = usdt * 0.98
+            self.store.state.balances["USDT"] = max(0.0, usdt - invested)
             self.store.state.balances[base_asset] = qty + qbuy
+            self.store.state.position_cost_usd = invested
             self.in_pos, self.entry = True, px
             order = {"status": "FILLED", "side": "BUY", "origQty": round(qbuy, 6), "price": px, "time": int(time.time() * 1000), "time_iso": ts_to_iso(int(time.time() * 1000))}
             trade = {"side": "BUY", "qty": round(qbuy, 6), "price": px, "commission": round(qbuy * 0.001, 6), "time": order["time"], "time_iso": order["time_iso"]}
             self.store.state.orders.append(order); self.store.state.trades.append(trade)
             self.store.persist("order", order); self.store.persist("trade", trade)
+            self.store.state.last_action = f"BUY {qbuy:.6f} {base_asset} @ {px:.4f}"
             self.store.log(f"BUY ejecutado qty={qbuy:.4f} px={px:.4f}")
         elif self.in_pos:
             tp, sl = self.entry * (1.0 + abs(float(self.ge.take_profit))), self.entry * (1.0 - abs(float(self.ge.stop_loss)))
             do_sell = nxt["low"] <= sl or nxt["high"] >= tp or score["sell_score"] >= float(self.ge.sell_th)
             if do_sell and qty > 0:
                 usdt_new = qty * px * (1.0 - 0.001)
+                realized = usdt_new - self.store.state.position_cost_usd
+                self.store.state.realized_pnl_usd += realized
+                self.store.state.position_cost_usd = 0.0
                 self.store.state.balances["USDT"] = usdt_new
                 self.store.state.balances[base_asset] = 0.0
                 self.in_pos, self.last_i = False, i
@@ -514,6 +571,7 @@ class BotEngine:
                 trade = {"side": "SELL", "qty": round(qty, 6), "price": px, "commission": round(qty * 0.001, 6), "time": order["time"], "time_iso": order["time_iso"]}
                 self.store.state.orders.append(order); self.store.state.trades.append(trade)
                 self.store.persist("order", order); self.store.persist("trade", trade)
+                self.store.state.last_action = f"SELL {qty:.6f} {base_asset} @ {px:.4f}"
                 self.store.log(f"SELL ejecutado qty={qty:.4f} px={px:.4f}")
 
 
@@ -521,17 +579,22 @@ def recalc_account(store: StateStore):
     last = store.state.candles[-1]["close"] if store.state.candles else 0.0
     eq = float(store.state.balances.get("USDT", 0.0))
     assets = []
+    holdings_value = 0.0
     for asset, qty in store.state.balances.items():
         if asset == "USDT":
             continue
         est = float(qty) * float(last)
         assets.append({"asset": asset, "qty": qty, "est_usdt": est})
         eq += est
+        holdings_value += est
     store.state.assets = assets
     store.state.equity = eq
+    store.state.unrealized_pnl_usd = holdings_value - float(store.state.position_cost_usd)
     store.state.pnl_usdt = eq - store.state.equity_initial
     base = store.state.equity_initial or 1.0
     store.state.pnl_pct = store.state.pnl_usdt / base * 100.0
+    store.state.equity_curve.append({"time": int(time.time() * 1000), "equity": eq, "pnl": store.state.pnl_usdt})
+    store.state.equity_curve = store.state.equity_curve[-5000:]
 
 
 async def run_dashboard(args: argparse.Namespace):
@@ -563,6 +626,7 @@ async def run_dashboard(args: argparse.Namespace):
                 clients.remove(ws)
 
     async def market_loop():
+        tick_count = 0
         while True:
             try:
                 candles = data.get_candles(store.state.symbol, store.state.interval, limit=args.live_limit)
@@ -574,22 +638,30 @@ async def run_dashboard(args: argparse.Namespace):
                     recalc_account(store)
                     is_new = prev is None or candles[-1]["time"] != prev
                     payload = {"candles": candles[-2:] if is_new else candles[-1:]}
+                    snap = store.snapshot()
                 await broadcast({"type": "market.candle_update", "payload": payload})
-                await broadcast({"type": "account.update", "payload": store.snapshot()["account_state"]})
-                await broadcast({"type": "orders.update", "payload": {"orders": store.state.orders[-100:]}})
-                await broadcast({"type": "trades.update", "payload": {"trades": store.state.trades[-100:]}})
-                await broadcast({"type": "bot.state", "payload": {"state": store.state.bot_state}})
-            except Exception as exc:
+                await broadcast({"type": "account.update", "payload": snap["account_state"]})
+                await broadcast({"type": "orders.update", "payload": {"orders": snap["orders_state"]}})
+                await broadcast({"type": "trades.update", "payload": {"trades": snap["trades_state"]}})
+                await broadcast({"type": "performance.update", "payload": snap["performance_state"]})
+                await broadcast({"type": "logs.update", "payload": {"logs": snap["logs"], "errors": snap["errors"]}})
+                await broadcast({"type": "bot.state", "payload": {"state": store.state.bot_state, "last_action": store.state.last_action}})
+                tick_count += 1
+                if tick_count % 10 == 0:
+                    store.log(f"Heartbeat market loop | symbol={store.state.symbol} interval={store.state.interval} equity={store.state.equity:.2f}")
+            except Exception:
                 store.state.bot_state = "ERROR"
-                store.log(f"ERROR market_loop: {exc}")
+                store.log_error(traceback.format_exc())
             await asyncio.sleep(max(1, args.poll_seconds))
 
     app = FastAPI(title="Estrategia Dashboard single-file")
 
     @app.on_event("startup")
     async def _startup():
+        store.log("En espera: inicializando interfaz y cargando velas...")
         store.state.candles = data.get_candles(store.state.symbol, store.state.interval, limit=args.live_limit)
         recalc_account(store)
+        store.log(f"Interfaz lista con {len(store.state.candles)} velas iniciales")
         asyncio.create_task(market_loop())
 
     @app.get("/")
