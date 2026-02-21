@@ -382,6 +382,7 @@ def run_timeline(
             "time_iso": ts_to_iso(candles[i]["open_time"]),
             "equity": equity,
             "capital": balance,
+            "en_posicion": int(in_pos),
         })
 
     trades = wins + losses
@@ -414,6 +415,7 @@ def export_events(
     equity_curve: list[dict[str, Any]],
     trade_rows: list[dict[str, Any]],
     params: dict[str, Any],
+    csv_delimiter: str,
 ):
     os.makedirs(out_dir, exist_ok=True)
     events_path = os.path.join(out_dir, "eventos_crudos.csv")
@@ -424,7 +426,7 @@ def export_events(
     if events:
         keys = sorted({k for ev in events for k in ev.keys()})
         with open(events_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=keys + ["time_iso"])
+            w = csv.DictWriter(f, fieldnames=keys + ["time_iso"], delimiter=csv_delimiter)
             w.writeheader()
             for ev in events:
                 row = dict(ev)
@@ -438,14 +440,14 @@ def export_events(
             "entrada_idx", "salida_idx",
         ]
         with open(trades_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=ordered_cols)
+            w = csv.DictWriter(f, fieldnames=ordered_cols, delimiter=csv_delimiter)
             w.writeheader()
             for row in trade_rows:
                 w.writerow(row)
 
     if equity_curve:
         with open(equity_path, "w", newline="", encoding="utf-8") as f:
-            w = csv.DictWriter(f, fieldnames=["idx", "time", "time_iso", "equity", "capital"])
+            w = csv.DictWriter(f, fieldnames=["idx", "time", "time_iso", "equity", "capital", "en_posicion"], delimiter=csv_delimiter)
             w.writeheader()
             for row in equity_curve:
                 w.writerow(row)
@@ -474,9 +476,51 @@ def export_events(
                 }
             ])
             resumen_df.to_excel(writer, sheet_name="Resumen", index=False)
-            pd.DataFrame(trade_rows).to_excel(writer, sheet_name="Operaciones", index=False)
-            df.to_excel(writer, sheet_name="Eventos", index=False)
-            pd.DataFrame(equity_curve).to_excel(writer, sheet_name="CurvaCapital", index=False)
+            ops_df = pd.DataFrame(trade_rows)
+            if not ops_df.empty:
+                ops_df = ops_df.rename(columns={
+                    "n_operacion": "N Operación",
+                    "entrada_fecha": "Entrada Fecha",
+                    "salida_fecha": "Salida Fecha",
+                    "entrada_precio": "Entrada Precio",
+                    "salida_precio": "Salida Precio",
+                    "motivo_salida": "Motivo Salida",
+                    "retorno_pct": "Retorno %",
+                    "capital_antes": "Capital Antes",
+                    "capital_despues": "Capital Después",
+                    "pnl_usd": "PnL USD",
+                    "entrada_idx": "Entrada Idx",
+                    "salida_idx": "Salida Idx",
+                })[[
+                    "N Operación", "Entrada Fecha", "Salida Fecha", "Entrada Precio", "Salida Precio",
+                    "Motivo Salida", "Retorno %", "Capital Antes", "Capital Después", "PnL USD",
+                    "Entrada Idx", "Salida Idx",
+                ]]
+            ops_df.to_excel(writer, sheet_name="Operaciones", index=False)
+
+            ev_df = df.rename(columns={
+                "type": "Tipo",
+                "time_iso": "Fecha",
+                "price": "Precio",
+                "buy_score": "Buy Score",
+                "sell_score": "Sell Score",
+                "capital_antes": "Capital Antes",
+                "capital_despues": "Capital Después",
+                "reason": "Motivo",
+                "ret": "Retorno",
+            })
+            ev_df.to_excel(writer, sheet_name="Eventos", index=False)
+
+            cap_df = pd.DataFrame(equity_curve)
+            if not cap_df.empty:
+                cap_df = cap_df.rename(columns={
+                    "idx": "Idx",
+                    "time_iso": "Fecha",
+                    "equity": "Equity",
+                    "capital": "Capital",
+                    "en_posicion": "En Posición",
+                })[["Idx", "Fecha", "Equity", "Capital", "En Posición"]]
+            cap_df.to_excel(writer, sheet_name="CurvaCapital", index=False)
             pd.DataFrame([params]).to_excel(writer, sheet_name="Parametros", index=False)
         print(f"[OK] Excel exportado: {excel_path}")
     except Exception as exc:
@@ -509,7 +553,11 @@ def plot_chart(
         return
 
     os.makedirs(out_dir, exist_ok=True)
-    start_idx = max(0, len(candles) - int(max(200, plot_candles)))
+    base_window = int(max(200, plot_candles))
+    start_idx = max(0, len(candles) - base_window)
+    if events and not any(ev["i"] >= start_idx for ev in events):
+        last_event_i = events[-1]["i"]
+        start_idx = max(0, last_event_i - base_window // 2)
     view_candles = candles[start_idx:]
     fig, (ax_price, ax_ret, ax_eq) = plt.subplots(3, 1, figsize=(16, 10), sharex=True, gridspec_kw={"height_ratios": [3, 1, 1]})
 
@@ -539,9 +587,9 @@ def plot_chart(
                 rets.append(ev["ret"] * 100)
 
     if buy_x:
-        ax_price.scatter(buy_x, buy_y, marker="^", s=35, color="#00b894", label="Entradas BUY")
+        ax_price.scatter(buy_x, buy_y, marker="^", s=70, color="#00b894", label="Entradas BUY", zorder=6)
     if sell_x:
-        ax_price.scatter(sell_x, sell_y, marker="v", s=35, color="#d63031", label="Salidas SELL")
+        ax_price.scatter(sell_x, sell_y, marker="v", s=70, color="#d63031", label="Salidas SELL", zorder=6)
 
     ax_price.set_title(f"{symbol} | Estrategia (1h) | velas mostradas={len(view_candles)}")
     ax_price.set_ylabel("Precio")
@@ -560,19 +608,28 @@ def plot_chart(
         eq_points = [row for row in equity_curve if row["idx"] >= start_idx]
         eq_x = [row["idx"] - start_idx for row in eq_points]
         eq_y = [row["capital"] for row in eq_points]
+        eq_pos = [row.get("en_posicion", 0) for row in eq_points]
         if eq_x:
             ax_eq.plot(eq_x, eq_y, color="#1565c0", linewidth=1.2, label="Capital")
+            if any(eq_pos):
+                ymin = min(eq_y)
+                ymax = max(eq_y)
+                span = max(ymax - ymin, 1e-9)
+                pos_y = [ymin + 0.02 * span if p else ymin for p in eq_pos]
+                ax_eq.fill_between(eq_x, ymin, pos_y, where=[p > 0 for p in eq_pos], color="#ffca28", alpha=0.25, label="En posición")
             ax_eq.legend(loc="upper left")
     ax_eq.set_ylabel("Capital")
     ax_eq.grid(alpha=0.2)
 
+    open_state = "SI" if events and events[-1]["type"] == "BUY" else "NO"
     txt = (
         f"Trades={len([e for e in events if e['type']=='SELL'])} | "
-        f"Último capital={equity_curve[-1]['capital']:.2f}" if equity_curve else "Sin curva capital"
+        f"Último capital={equity_curve[-1]['capital']:.2f} | En posición={open_state}" if equity_curve else "Sin curva capital"
     )
     ax_eq.text(0.01, 0.92, txt, transform=ax_eq.transAxes, fontsize=9, va="top")
 
     windows = [("7D", 7 * 24), ("30D", 30 * 24), ("90D", 90 * 24), ("180D", 180 * 24), ("ALL", None)]
+    buttons = []
     for idx_btn, (label, hours) in enumerate(windows):
         bax = fig.add_axes([0.08 + idx_btn * 0.08, 0.01, 0.07, 0.035])
         btn = Button(bax, label)
@@ -581,15 +638,20 @@ def plot_chart(
             def _onclick(_event):
                 total = len(view_candles)
                 if h is None:
-                    ax_price.set_xlim(0, max(1, total - 1))
+                    left, right = 0, max(1, total - 1)
                 else:
                     size = min(total, int(h))
-                    ax_price.set_xlim(max(0, total - size), max(1, total - 1))
+                    left, right = max(0, total - size), max(1, total - 1)
+                for ax in (ax_price, ax_ret, ax_eq):
+                    ax.set_xlim(left, right)
                 fig.canvas.draw_idle()
 
             return _onclick
 
         btn.on_clicked(_factory(hours))
+        buttons.append(btn)
+
+    fig._range_buttons = buttons
 
     png_path = os.path.join(out_dir, "grafico_estrategia.png")
     plt.tight_layout()
@@ -620,6 +682,7 @@ def make_parser():
     p.add_argument("--plot-candles", type=int, default=2500, help="Velas a mostrar en pantalla")
     p.add_argument("--feedback", dest="feedback", action="store_true", help="Mostrar feedback de operaciones")
     p.add_argument("--no-feedback", dest="feedback", action="store_false", help="Silenciar feedback por operación")
+    p.add_argument("--csv-delimiter", default=";", help="Delimitador CSV (recomendado ';' para Excel en español)")
     p.add_argument("--show", dest="show", action="store_true", help="Abrir ventana del gráfico al finalizar")
     p.add_argument("--no-show", dest="show", action="store_false", help="No abrir ventana (solo guardar PNG)")
     p.set_defaults(show=True, feedback=True)
@@ -661,7 +724,15 @@ def main():
         f"[RESUMEN] rentable={rentable} trades={metrics.trades} winrate={metrics.winrate:.2f}% "
         f"pf={metrics.pf:.2f} roi={metrics.roi_pct:.2f}% pnl_usd={metrics.pnl_usd:.2f} dd={metrics.dd_pct:.2f}%"
     )
-    export_events(events, metrics, args.out, equity_curve=equity_curve, trade_rows=trade_rows, params=params)
+    export_events(
+        events,
+        metrics,
+        args.out,
+        equity_curve=equity_curve,
+        trade_rows=trade_rows,
+        params=params,
+        csv_delimiter=args.csv_delimiter,
+    )
     plot_chart(
         candles,
         events,
