@@ -438,6 +438,8 @@ class TradingDashboard(tk.Tk):
         self.range_loading = False
         self.selected_start_ms: Optional[int] = None
         self.selected_end_ms: Optional[int] = None
+        self.chart_segments: list[tuple[int, int]] = []
+        self.current_segment_idx = 0
 
         self._api, self._api_mode = self._resolve_api_functions()
         self._ui_queue: queue.Queue = queue.Queue()
@@ -541,6 +543,15 @@ class TradingDashboard(tk.Tk):
         self.ax = self.figure.add_subplot(111)
         self.canvas = FigureCanvasTkAgg(self.figure, master=chart_frame)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
+        nav = ttk.Frame(chart_frame)
+        nav.grid(row=1, column=0, sticky="ew", pady=(6, 0))
+        self.btn_prev_chart = ttk.Button(nav, text="◀ Anterior", command=self.show_prev_chart)
+        self.btn_prev_chart.pack(side="left", padx=4)
+        self.btn_next_chart = ttk.Button(nav, text="Siguiente ▶", command=self.show_next_chart)
+        self.btn_next_chart.pack(side="left", padx=4)
+        self.lbl_chart_page = ttk.Label(nav, text="Gráfico 0/0")
+        self.lbl_chart_page.pack(side="left", padx=10)
 
         trades_frame = ttk.LabelFrame(tab_dash, text="Operaciones de la Estrategia (1h, cierre de vela)", padding=8)
         trades_frame.grid(row=0, column=1, sticky="nsew")
@@ -699,9 +710,63 @@ class TradingDashboard(tk.Tk):
             self.pnl = self.equity - self.initial_equity
             self.pnl_percent = (self.pnl / self.initial_equity) * 100 if self.initial_equity else 0.0
         self._render_ops_listbox()
-        self.update_chart(self.active_candles)
+        self._build_chart_segments()
+        self.current_segment_idx = 0
+        self._render_current_segment_chart()
         self._refresh_period_table()
         self._update_perf_chart()
+
+    def _build_chart_segments(self) -> None:
+        self.chart_segments = []
+        n = len(self.active_candles)
+        if n == 0:
+            self.lbl_chart_page.config(text="Gráfico 0/0")
+            return
+
+        # Segmentación por trimestres (~90 días) para mantener legibilidad.
+        max_window_ms = 90 * 24 * 60 * 60 * 1000
+        start_idx = 0
+        while start_idx < n:
+            start_ms = int(self.active_candles[start_idx].get("close_time", 0))
+            end_idx = start_idx
+            while end_idx + 1 < n:
+                nxt_ms = int(self.active_candles[end_idx + 1].get("close_time", 0))
+                if (nxt_ms - start_ms) > max_window_ms:
+                    break
+                end_idx += 1
+            if end_idx == start_idx:
+                end_idx = min(start_idx + 1, n - 1)
+            self.chart_segments.append((start_idx, end_idx))
+            start_idx = end_idx + 1
+
+        if not self.chart_segments:
+            self.chart_segments = [(0, n - 1)]
+        self.lbl_chart_page.config(text=f"Gráfico 1/{len(self.chart_segments)}")
+
+    def _render_current_segment_chart(self) -> None:
+        if not self.chart_segments:
+            self.update_chart([])
+            self.lbl_chart_page.config(text="Gráfico 0/0")
+            return
+        self.current_segment_idx = max(0, min(self.current_segment_idx, len(self.chart_segments) - 1))
+        a, b = self.chart_segments[self.current_segment_idx]
+        sub = self.active_candles[a : b + 1]
+        self.update_chart(sub, seg_start=a)
+        self.lbl_chart_page.config(text=f"Gráfico {self.current_segment_idx + 1}/{len(self.chart_segments)}")
+
+    def show_next_chart(self) -> None:
+        if not self.chart_segments:
+            return
+        if self.current_segment_idx < len(self.chart_segments) - 1:
+            self.current_segment_idx += 1
+            self._render_current_segment_chart()
+
+    def show_prev_chart(self) -> None:
+        if not self.chart_segments:
+            return
+        if self.current_segment_idx > 0:
+            self.current_segment_idx -= 1
+            self._render_current_segment_chart()
 
     def _render_ops_listbox(self) -> None:
         self.trades_listbox.delete(0, tk.END)
@@ -774,6 +839,7 @@ class TradingDashboard(tk.Tk):
             path = out_dir / f"grafico_rango_{ds}_{de}.png"
         else:
             path = out_dir / "grafico_rango_full.png"
+        self._render_current_segment_chart()
         self.figure.savefig(path, dpi=130, bbox_inches="tight")
         self._set_error(f"Rango aplicado. Gráfico generado: {path}")
 
@@ -900,7 +966,7 @@ class TradingDashboard(tk.Tk):
             self.ax_perf.set_xlabel("Tiempo (UTC)")
         self.canvas_perf.draw_idle()
 
-    def update_chart(self, candles: list[dict]) -> None:
+    def update_chart(self, candles: list[dict], seg_start: int = 0) -> None:
         self.ax.clear()
         if not candles:
             self.canvas.draw_idle()
@@ -925,7 +991,7 @@ class TradingDashboard(tk.Tk):
 
         buy_x, buy_y, sell_x, sell_y = [], [], [], []
         for op in self.strategy_ops:
-            x = op.index // step
+            x = (op.index - seg_start) // step
             if x < 0 or x >= len(data):
                 continue
             if op.side == "BUY":
