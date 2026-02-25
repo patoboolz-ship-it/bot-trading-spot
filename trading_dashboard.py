@@ -453,6 +453,7 @@ class TradingDashboard(tk.Tk):
         self.selected_end_ms: Optional[int] = None
         self.chart_segments: list[tuple[int, int]] = []
         self.current_segment_idx = 0
+        self._last_candles_sig: tuple[int, int, float] = (0, 0, 0.0)
 
         self._api, self._api_mode = self._resolve_api_functions()
         self._ui_queue: queue.Queue = queue.Queue()
@@ -715,6 +716,16 @@ class TradingDashboard(tk.Tk):
 
         return ops, curve
 
+    def _candles_signature(self, candles: list[dict]) -> tuple[int, int, float]:
+        if not candles:
+            return (0, 0, 0.0)
+        last = candles[-1]
+        return (
+            len(candles),
+            int(last.get("close_time", last.get("open_time", 0))),
+            float(last.get("close", 0.0)),
+        )
+
     def _recompute_strategy_views(self) -> None:
         self.active_candles = self._get_candles_in_selected_range(self.candles)
         self.strategy_ops, self.strategy_equity_curve = self._compute_strategy_ops(self.active_candles)
@@ -725,9 +736,11 @@ class TradingDashboard(tk.Tk):
         self._render_ops_listbox()
         self._build_chart_segments()
         self.current_segment_idx = 0
+        self._last_candles_sig: tuple[int, int, float] = (0, 0, 0.0)
         self._render_current_segment_chart()
         self._refresh_period_table()
         self._update_perf_chart()
+        self._last_candles_sig = self._candles_signature(self.candles)
 
     def _build_chart_segments(self) -> None:
         self.chart_segments = []
@@ -1085,9 +1098,16 @@ class TradingDashboard(tk.Tk):
                     self.balance = payload["balance"]
                     self.asset_qty = payload["asset_qty"]
                     self.price = payload["price"]
-                    self.candles = payload["candles"]
                     self.status_text = payload["status"]
-                    self._recompute_strategy_views()
+
+                    incoming_candles = payload["candles"]
+                    incoming_sig = self._candles_signature(incoming_candles)
+
+                    # Evita recálculos pesados repetidos (causa de congelamiento en navegación de gráficos).
+                    # Si el dataset no cambió, solo refrescamos encabezado.
+                    if incoming_sig != self._last_candles_sig:
+                        self.candles = incoming_candles
+                        self._recompute_strategy_views()
                     self._refresh_ui()
                 elif payload["kind"] == "range_loaded":
                     self.range_loading = False
