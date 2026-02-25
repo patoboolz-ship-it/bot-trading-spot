@@ -616,36 +616,8 @@ class TradingDashboard(tk.Tk):
         self.canvas_perf = FigureCanvasTkAgg(self.figure_perf, master=chart_perf_frame)
         self.canvas_perf.get_tk_widget().grid(row=0, column=0, sticky="nsew")
 
-        # Tab BOT (control de estrategia en vivo / long-only)
-        tab_bot.grid_rowconfigure(2, weight=1)
-        tab_bot.grid_columnconfigure(0, weight=1)
-
-        bot_top = ttk.LabelFrame(tab_bot, text="Control Bot Spot (Long Only)", padding=10)
-        bot_top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
-        self.btn_bot_play = ttk.Button(bot_top, text="PLAY BOT", command=self.start_bot)
-        self.btn_bot_pause = ttk.Button(bot_top, text="PAUSE BOT", command=self.pause_bot)
-        self.btn_bot_stop = ttk.Button(bot_top, text="STOP BOT", command=self.stop_bot)
-        self.btn_bot_recalc = ttk.Button(bot_top, text="Recalcular Estrategia", command=self._recompute_strategy_views)
-        self.btn_bot_play.pack(side="left", padx=4)
-        self.btn_bot_pause.pack(side="left", padx=4)
-        self.btn_bot_stop.pack(side="left", padx=4)
-        self.btn_bot_recalc.pack(side="left", padx=4)
-
-        bot_info = ttk.Frame(tab_bot)
-        bot_info.grid(row=1, column=0, sticky="ew", pady=(0, 8))
-        self.lbl_bot_mode = ttk.Label(bot_info, text="Modo: PAUSADO", font=("Segoe UI", 10, "bold"))
-        self.lbl_bot_last_op = ttk.Label(bot_info, text="Última operación: -")
-        self.lbl_bot_open_pos = ttk.Label(bot_info, text="Posición actual: SIN POSICIÓN")
-        self.lbl_bot_mode.pack(anchor="w")
-        self.lbl_bot_last_op.pack(anchor="w")
-        self.lbl_bot_open_pos.pack(anchor="w")
-
-        bot_ops_frame = ttk.LabelFrame(tab_bot, text="Operaciones recientes del bot/estrategia", padding=8)
-        bot_ops_frame.grid(row=2, column=0, sticky="nsew")
-        bot_ops_frame.grid_rowconfigure(0, weight=1)
-        bot_ops_frame.grid_columnconfigure(0, weight=1)
-        self.bot_ops_listbox = tk.Listbox(bot_ops_frame, font=("Consolas", 10))
-        self.bot_ops_listbox.grid(row=0, column=0, sticky="nsew")
+        # Tab BOT integrado con el bot real (si está disponible)
+        self._build_bot_tab(tab_bot)
 
         bottom = ttk.Frame(self, padding=8)
         bottom.grid(row=2, column=0, sticky="ew")
@@ -851,7 +823,56 @@ class TradingDashboard(tk.Tk):
             )
         self.trades_listbox.yview_moveto(1.0)
 
+    def _build_bot_tab(self, tab_bot: ttk.Frame) -> None:
+        tab_bot.grid_rowconfigure(0, weight=1)
+        tab_bot.grid_columnconfigure(0, weight=1)
+
+        self.embedded_bot_gui = None
+        # Intentamos incrustar el BotGUI real de bot.py (igual que en el optimizador original).
+        try:
+            bot_mod = _import_bot_module_from_candidates()
+            if bot_mod and hasattr(bot_mod, "BotGUI"):
+                host = ttk.Frame(tab_bot)
+                host.grid(row=0, column=0, sticky="nsew")
+                self.embedded_bot_gui = bot_mod.BotGUI(host)
+                return
+        except Exception as exc:
+            self._set_error(f"No se pudo incrustar BotGUI real: {exc}")
+
+        # Fallback: panel simplificado (si no existe BotGUI en bot.py)
+        tab_bot.grid_rowconfigure(2, weight=1)
+        bot_top = ttk.LabelFrame(tab_bot, text="Control Bot Spot (Long Only)", padding=10)
+        bot_top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        self.btn_bot_play = ttk.Button(bot_top, text="PLAY BOT", command=self.start_bot)
+        self.btn_bot_pause = ttk.Button(bot_top, text="PAUSE BOT", command=self.pause_bot)
+        self.btn_bot_stop = ttk.Button(bot_top, text="STOP BOT", command=self.stop_bot)
+        self.btn_bot_recalc = ttk.Button(bot_top, text="Recalcular Estrategia", command=self._recompute_strategy_views)
+        self.btn_bot_play.pack(side="left", padx=4)
+        self.btn_bot_pause.pack(side="left", padx=4)
+        self.btn_bot_stop.pack(side="left", padx=4)
+        self.btn_bot_recalc.pack(side="left", padx=4)
+
+        bot_info = ttk.Frame(tab_bot)
+        bot_info.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self.lbl_bot_mode = ttk.Label(bot_info, text="Modo: PAUSADO", font=("Segoe UI", 10, "bold"))
+        self.lbl_bot_last_op = ttk.Label(bot_info, text="Última operación: -")
+        self.lbl_bot_open_pos = ttk.Label(bot_info, text="Posición actual: SIN POSICIÓN")
+        self.lbl_bot_mode.pack(anchor="w")
+        self.lbl_bot_last_op.pack(anchor="w")
+        self.lbl_bot_open_pos.pack(anchor="w")
+
+        bot_ops_frame = ttk.LabelFrame(tab_bot, text="Operaciones recientes del bot/estrategia", padding=8)
+        bot_ops_frame.grid(row=2, column=0, sticky="nsew")
+        bot_ops_frame.grid_rowconfigure(0, weight=1)
+        bot_ops_frame.grid_columnconfigure(0, weight=1)
+        self.bot_ops_listbox = tk.Listbox(bot_ops_frame, font=("Consolas", 10))
+        self.bot_ops_listbox.grid(row=0, column=0, sticky="nsew")
+
     def _refresh_bot_tab(self) -> None:
+        if getattr(self, "embedded_bot_gui", None) is not None:
+            return
+        if not hasattr(self, "lbl_bot_mode"):
+            return
         mode_txt = "RUNNING" if self.bot_running else "PAUSADO"
         self.lbl_bot_mode.config(text=f"Modo: {mode_txt}")
 
