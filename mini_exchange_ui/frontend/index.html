@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mini Exchange UI</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <select id="symbol"><option>SOLUSDT</option><option>BTCUSDT</option><option>ETHUSDT</option></select>
+      <select id="interval"><option>1m</option><option>5m</option><option>15m</option><option selected>1h</option><option>4h</option><option>1d</option></select>
+      <button id="goLive">Volver a tiempo real</button>
+      <label><input type="checkbox" id="liveMode" checked /> LIVE</label>
+    </div>
+    <div>
+      <button id="play">Play</button>
+      <button id="pause">Pause</button>
+      <button id="stop">Stop</button>
+      <span id="botState">IDLE</span>
+    </div>
+  </header>
+
+  <main class="grid">
+    <section class="chart-wrap">
+      <div id="chart"></div>
+    </section>
+
+    <aside class="side">
+      <h3>Cartera</h3>
+      <div id="equity"></div>
+      <div id="balances"></div>
+      <h3>Órdenes</h3>
+      <table id="orders"><thead><tr><th>Estado</th><th>Lado</th><th>Qty</th><th>Hora</th></tr></thead><tbody></tbody></table>
+      <h3>Trades</h3>
+      <table id="trades"><thead><tr><th>Lado</th><th>Precio</th><th>Qty</th><th>Comisión</th><th>Hora</th></tr></thead><tbody></tbody></table>
+    </aside>
+
+    <section class="logs">
+      <h3>Logs / Estado</h3>
+      <pre id="logBox"></pre>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
