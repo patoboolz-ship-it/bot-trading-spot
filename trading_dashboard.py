@@ -435,6 +435,7 @@ class TradingDashboard(tk.Tk):
         self.date_from_var = tk.StringVar(value="")
         self.date_to_var = tk.StringVar(value="")
         self.range_locked = False
+        self.range_loading = False
         self.selected_start_ms: Optional[int] = None
         self.selected_end_ms: Optional[int] = None
 
@@ -562,9 +563,12 @@ class TradingDashboard(tk.Tk):
         ttk.Entry(btns, textvariable=self.date_from_var, width=14).pack(side="left", padx=(0, 8))
         ttk.Label(btns, text="Hasta (YYYY/MM/DD):").pack(side="left", padx=(2, 4))
         ttk.Entry(btns, textvariable=self.date_to_var, width=14).pack(side="left", padx=(0, 8))
-        ttk.Button(btns, text="Aplicar Rango", command=self.apply_date_range).pack(side="left", padx=4)
-        ttk.Button(btns, text="Limpiar Rango", command=self.clear_date_range).pack(side="left", padx=4)
-        ttk.Button(btns, text="Recalcular Rentabilidades", command=self.apply_date_range).pack(side="left", padx=4)
+        self.btn_apply_range = ttk.Button(btns, text="Aplicar Rango", command=self.apply_date_range)
+        self.btn_apply_range.pack(side="left", padx=4)
+        self.btn_clear_range = ttk.Button(btns, text="Limpiar Rango", command=self.clear_date_range)
+        self.btn_clear_range.pack(side="left", padx=4)
+        self.btn_recalc = ttk.Button(btns, text="Recalcular Rentabilidades", command=self._recompute_strategy_views)
+        self.btn_recalc.pack(side="left", padx=4)
         ttk.Button(btns, text="Exportar Excel", command=self.export_excel).pack(side="left", padx=4)
 
         cols = ("periodo", "operaciones", "roi_pct", "pnl_usdt", "equity_final")
@@ -688,7 +692,6 @@ class TradingDashboard(tk.Tk):
         return ops, curve
 
     def _recompute_strategy_views(self) -> None:
-        self._ensure_range_dataset_if_requested()
         self.active_candles = self._get_candles_in_selected_range(self.candles)
         self.strategy_ops, self.strategy_equity_curve = self._compute_strategy_ops(self.active_candles)
         if self.strategy_equity_curve:
@@ -718,42 +721,6 @@ class TradingDashboard(tk.Tk):
             dt = dt.replace(hour=23, minute=59, second=59, microsecond=999000)
         dt = dt.replace(tzinfo=timezone.utc)
         return int(dt.timestamp() * 1000)
-
-    def _ensure_range_dataset_if_requested(self) -> None:
-        """Si hay fechas cargadas, descarga velas históricas aunque el usuario pulse solo 'Recalcular'."""
-        try:
-            start_ms, end_ms = self._read_selected_range()
-        except ValueError:
-            return
-
-        if start_ms is None and end_ms is None:
-            return
-
-        if "get_candles_range" not in self._api:
-            return
-
-        # Si ya está lockeado con el mismo rango, no volver a descargar.
-        if (
-            self.range_locked
-            and self.selected_start_ms == (start_ms if start_ms is not None else self.selected_start_ms)
-            and self.selected_end_ms == (end_ms if end_ms is not None else self.selected_end_ms)
-        ):
-            return
-
-        base_start = int(self.candles[0]["close_time"]) if self.candles else int(start_ms or 0)
-        base_end = int(self.candles[-1]["close_time"]) if self.candles else int(end_ms or 0)
-        start_ms = start_ms if start_ms is not None else base_start
-        end_ms = end_ms if end_ms is not None else base_end
-        if start_ms > end_ms:
-            return
-
-        candles = self._api["get_candles_range"](self.symbol, self.interval, int(start_ms), int(end_ms)) or []
-        if candles:
-            self.candles = candles
-            self.range_locked = True
-            self.selected_start_ms = int(start_ms)
-            self.selected_end_ms = int(end_ms)
-            self._set_error("")
 
     def _get_candles_in_selected_range(self, candles: list[dict]) -> list[dict]:
         if not candles:
@@ -811,6 +778,9 @@ class TradingDashboard(tk.Tk):
         self._set_error(f"Rango aplicado. Gráfico generado: {path}")
 
     def apply_date_range(self) -> None:
+        if self.range_loading:
+            self._set_error("Ya se está descargando un rango. Espera por favor...")
+            return
         try:
             start_ms, end_ms = self._read_selected_range()
         except ValueError as exc:
@@ -824,36 +794,50 @@ class TradingDashboard(tk.Tk):
             self._recompute_strategy_views()
             return
 
-        # Si no vino algún extremo, usamos extremos del dataset actual.
         if not self.candles:
-            self._set_error("No hay velas cargadas para aplicar rango.")
+            self._set_error("No hay velas base para inferir extremos. Espera carga inicial.")
             return
+
         start_ms = start_ms if start_ms is not None else int(self.candles[0]["close_time"])
         end_ms = end_ms if end_ms is not None else int(self.candles[-1]["close_time"])
+        if start_ms > end_ms:
+            self._set_error("Rango inválido: 'Desde' no puede ser mayor que 'Hasta'.")
+            return
 
         if "get_candles_range" not in self._api:
             self._set_error("La API actual no soporta carga histórica por rango.")
             return
-        candles = self._api["get_candles_range"](self.symbol, self.interval, int(start_ms), int(end_ms)) or []
-        if not candles:
-            self._set_error("No se pudieron cargar velas para ese rango.")
-            return
 
-        self.candles = candles
-        self.range_locked = True
-        self.selected_start_ms = int(start_ms)
-        self.selected_end_ms = int(end_ms)
-        self._recompute_strategy_views()
-        self._save_current_range_chart()
+        self.range_loading = True
+        self.btn_apply_range.config(state="disabled")
+        self.btn_recalc.config(state="disabled")
+        self._set_error("Descargando velas del rango solicitado... esto puede tardar en rangos largos.")
+
+        def worker():
+            try:
+                candles = self._api["get_candles_range"](self.symbol, self.interval, int(start_ms), int(end_ms)) or []
+                self._ui_queue.put({
+                    "kind": "range_loaded",
+                    "candles": candles,
+                    "start_ms": int(start_ms),
+                    "end_ms": int(end_ms),
+                })
+            except Exception:
+                self._ui_queue.put({"kind": "error", "message": f"Error descargando rango:\n{traceback.format_exc(limit=2)}"})
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def clear_date_range(self) -> None:
         self.date_from_var.set("")
         self.date_to_var.set("")
         self.range_locked = False
+        self.range_loading = False
         self.selected_start_ms = None
         self.selected_end_ms = None
         self.candles = self._api["get_candles"](self.symbol, self.interval) or []
         self._recompute_strategy_views()
+        self.btn_apply_range.config(state="normal")
+        self.btn_recalc.config(state="normal")
         self._set_error("Rango limpiado. Volviste al dataset reciente.")
 
     def _refresh_period_table(self) -> None:
@@ -898,10 +882,22 @@ class TradingDashboard(tk.Tk):
         if not self.strategy_equity_curve:
             self.canvas_perf.draw_idle()
             return
+        ts = [int(t) for t, _ in self.strategy_equity_curve]
         vals = [v for _, v in self.strategy_equity_curve]
-        self.ax_perf.plot(range(len(vals)), vals, color="#1976d2")
+        x = list(range(len(vals)))
+        self.ax_perf.plot(x, vals, color="#1976d2")
         self.ax_perf.set_title("Curva de Equity (Estrategia 1h, cierre de vela)")
         self.ax_perf.grid(alpha=0.2)
+        n = len(x)
+        if n > 1:
+            step = max(1, n // 8)
+            ticks = list(range(0, n, step))
+            if ticks[-1] != n - 1:
+                ticks.append(n - 1)
+            labels = [datetime.fromtimestamp(ts[i] / 1000, tz=timezone.utc).strftime("%Y-%m-%d") for i in ticks]
+            self.ax_perf.set_xticks(ticks)
+            self.ax_perf.set_xticklabels(labels, rotation=25, ha="right", fontsize=8)
+            self.ax_perf.set_xlabel("Tiempo (UTC)")
         self.canvas_perf.draw_idle()
 
     def update_chart(self, candles: list[dict]) -> None:
@@ -909,8 +905,11 @@ class TradingDashboard(tk.Tk):
         if not candles:
             self.canvas.draw_idle()
             return
-        data = candles[-300:]
-        offs = len(candles) - len(data)
+
+        # Mostrar todo el rango, reduciendo densidad visual si hay demasiadas velas.
+        max_draw = 1200
+        step = max(1, len(candles) // max_draw)
+        data = candles[::step]
 
         min_p = min(float(c["low"]) for c in data)
         max_p = max(float(c["high"]) for c in data)
@@ -922,13 +921,11 @@ class TradingDashboard(tk.Tk):
             cl = float(c["close"])
             color = "#26a69a" if cl >= o else "#ef5350"
             self.ax.vlines(i, l, h, color=color, linewidth=1)
-            self.ax.add_patch(Rectangle((i - 0.32, min(o, cl)), 0.64, max(abs(cl - o), 1e-8), color=color, alpha=0.85))
+            self.ax.add_patch(Rectangle((i - 0.28, min(o, cl)), 0.56, max(abs(cl - o), 1e-8), color=color, alpha=0.85))
 
         buy_x, buy_y, sell_x, sell_y = [], [], [], []
         for op in self.strategy_ops:
-            if op.index < offs:
-                continue
-            x = op.index - offs
+            x = op.index // step
             if x < 0 or x >= len(data):
                 continue
             if op.side == "BUY":
@@ -939,16 +936,26 @@ class TradingDashboard(tk.Tk):
                 sell_y.append(op.price)
 
         if buy_x:
-            self.ax.scatter(buy_x, buy_y, marker="^", color="#1b5e20", s=70, label="BUY", zorder=5)
+            self.ax.scatter(buy_x, buy_y, marker="^", color="#1b5e20", s=45, label="BUY", zorder=5)
         if sell_x:
-            self.ax.scatter(sell_x, sell_y, marker="v", color="#b71c1c", s=70, label="SELL", zorder=5)
+            self.ax.scatter(sell_x, sell_y, marker="v", color="#b71c1c", s=45, label="SELL", zorder=5)
         if buy_x or sell_x:
             self.ax.legend(loc="upper left")
 
         self.ax.set_xlim(-1, len(data) + 1)
         self.ax.set_ylim(min_p * 0.995, max_p * 1.005)
-        self.ax.set_title(f"{self.symbol} - 1h (solo cierre de vela)")
+        title_extra = f" | vista comprimida x{step}" if step > 1 else ""
+        self.ax.set_title(f"{self.symbol} - 1h (solo cierre de vela){title_extra}")
         self.ax.grid(alpha=0.2)
+
+        n = len(data)
+        if n > 1:
+            ticks = [0, n // 4, n // 2, (3 * n) // 4, n - 1]
+            ticks = sorted(set(ticks))
+            labels = [datetime.fromtimestamp(int(data[i]["close_time"]) / 1000, tz=timezone.utc).strftime("%Y-%m-%d") for i in ticks]
+            self.ax.set_xticks(ticks)
+            self.ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=8)
+
         self.canvas.draw_idle()
 
     def _process_ui_queue(self) -> None:
@@ -963,7 +970,24 @@ class TradingDashboard(tk.Tk):
                     self.status_text = payload["status"]
                     self._recompute_strategy_views()
                     self._refresh_ui()
+                elif payload["kind"] == "range_loaded":
+                    self.range_loading = False
+                    self.btn_apply_range.config(state="normal")
+                    self.btn_recalc.config(state="normal")
+                    candles = payload.get("candles") or []
+                    if not candles:
+                        self._set_error("No se pudieron descargar velas para ese rango. Prueba un rango menor o valida el símbolo.")
+                    else:
+                        self.candles = candles
+                        self.range_locked = True
+                        self.selected_start_ms = int(payload["start_ms"])
+                        self.selected_end_ms = int(payload["end_ms"])
+                        self._recompute_strategy_views()
+                        self._save_current_range_chart()
                 else:
+                    self.range_loading = False
+                    self.btn_apply_range.config(state="normal")
+                    self.btn_recalc.config(state="normal")
                     self._set_error(payload["message"])
         except queue.Empty:
             pass
