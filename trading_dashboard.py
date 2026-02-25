@@ -541,8 +541,10 @@ class TradingDashboard(tk.Tk):
 
         tab_dash = ttk.Frame(self.notebook)
         tab_perf = ttk.Frame(self.notebook)
+        tab_bot = ttk.Frame(self.notebook)
         self.notebook.add(tab_dash, text="Dashboard 1H")
         self.notebook.add(tab_perf, text="Rentabilidades")
+        self.notebook.add(tab_bot, text="Bot")
 
         tab_dash.grid_rowconfigure(0, weight=1)
         tab_dash.grid_columnconfigure(0, weight=4)
@@ -613,6 +615,37 @@ class TradingDashboard(tk.Tk):
         self.ax_perf = self.figure_perf.add_subplot(111)
         self.canvas_perf = FigureCanvasTkAgg(self.figure_perf, master=chart_perf_frame)
         self.canvas_perf.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
+        # Tab BOT (control de estrategia en vivo / long-only)
+        tab_bot.grid_rowconfigure(2, weight=1)
+        tab_bot.grid_columnconfigure(0, weight=1)
+
+        bot_top = ttk.LabelFrame(tab_bot, text="Control Bot Spot (Long Only)", padding=10)
+        bot_top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        self.btn_bot_play = ttk.Button(bot_top, text="PLAY BOT", command=self.start_bot)
+        self.btn_bot_pause = ttk.Button(bot_top, text="PAUSE BOT", command=self.pause_bot)
+        self.btn_bot_stop = ttk.Button(bot_top, text="STOP BOT", command=self.stop_bot)
+        self.btn_bot_recalc = ttk.Button(bot_top, text="Recalcular Estrategia", command=self._recompute_strategy_views)
+        self.btn_bot_play.pack(side="left", padx=4)
+        self.btn_bot_pause.pack(side="left", padx=4)
+        self.btn_bot_stop.pack(side="left", padx=4)
+        self.btn_bot_recalc.pack(side="left", padx=4)
+
+        bot_info = ttk.Frame(tab_bot)
+        bot_info.grid(row=1, column=0, sticky="ew", pady=(0, 8))
+        self.lbl_bot_mode = ttk.Label(bot_info, text="Modo: PAUSADO", font=("Segoe UI", 10, "bold"))
+        self.lbl_bot_last_op = ttk.Label(bot_info, text="Última operación: -")
+        self.lbl_bot_open_pos = ttk.Label(bot_info, text="Posición actual: SIN POSICIÓN")
+        self.lbl_bot_mode.pack(anchor="w")
+        self.lbl_bot_last_op.pack(anchor="w")
+        self.lbl_bot_open_pos.pack(anchor="w")
+
+        bot_ops_frame = ttk.LabelFrame(tab_bot, text="Operaciones recientes del bot/estrategia", padding=8)
+        bot_ops_frame.grid(row=2, column=0, sticky="nsew")
+        bot_ops_frame.grid_rowconfigure(0, weight=1)
+        bot_ops_frame.grid_columnconfigure(0, weight=1)
+        self.bot_ops_listbox = tk.Listbox(bot_ops_frame, font=("Consolas", 10))
+        self.bot_ops_listbox.grid(row=0, column=0, sticky="nsew")
 
         bottom = ttk.Frame(self, padding=8)
         bottom.grid(row=2, column=0, sticky="ew")
@@ -740,6 +773,7 @@ class TradingDashboard(tk.Tk):
         self._render_current_segment_chart()
         self._refresh_period_table()
         self._update_perf_chart()
+        self._refresh_bot_tab()
         self._last_candles_sig = self._candles_signature(self.candles)
 
     def _build_chart_segments(self) -> None:
@@ -816,6 +850,30 @@ class TradingDashboard(tk.Tk):
                 f"{op.side:<4} {self.symbol:<8} {op.price:>10.4f} qty {op.qty:<10.6f} {op.reason} t={op.time_ms}",
             )
         self.trades_listbox.yview_moveto(1.0)
+
+    def _refresh_bot_tab(self) -> None:
+        mode_txt = "RUNNING" if self.bot_running else "PAUSADO"
+        self.lbl_bot_mode.config(text=f"Modo: {mode_txt}")
+
+        if self.strategy_ops:
+            last = self.strategy_ops[-1]
+            ts = datetime.fromtimestamp(int(last.time_ms) / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+            self.lbl_bot_last_op.config(text=f"Última operación: {last.side} {last.reason} @ {last.price:.4f} ({ts} UTC)")
+            if last.side == "BUY":
+                self.lbl_bot_open_pos.config(text=f"Posición actual: LONG ABIERTA (qty={last.qty:.6f})")
+            else:
+                self.lbl_bot_open_pos.config(text="Posición actual: SIN POSICIÓN (último cierre SELL)")
+        else:
+            self.lbl_bot_last_op.config(text="Última operación: -")
+            self.lbl_bot_open_pos.config(text="Posición actual: SIN POSICIÓN")
+
+        self.bot_ops_listbox.delete(0, tk.END)
+        for op in self.strategy_ops[-200:]:
+            self.bot_ops_listbox.insert(
+                tk.END,
+                f"{op.side:<4} {op.reason:<3} px={op.price:>10.4f} qty={op.qty:<10.6f} t={op.time_ms}",
+            )
+        self.bot_ops_listbox.yview_moveto(1.0)
 
     def _parse_date_to_ms(self, value: str, end_of_day: bool = False) -> Optional[int]:
         text = (value or "").strip()
