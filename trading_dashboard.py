@@ -7,7 +7,7 @@ import time
 import tkinter as tk
 import traceback
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import filedialog, ttk
 from typing import Any, Callable, Optional
@@ -45,6 +45,19 @@ BEST_GEN = {
 
 INTERVAL = "1h"
 INTERVAL_MS = {"1h": 3_600_000}
+
+
+def add_months(dt: datetime, months: int) -> datetime:
+    m = dt.month - 1 + months
+    y = dt.year + m // 12
+    m = m % 12 + 1
+    # Evitar días inválidos (31,30,29)
+    day = min(dt.day, [31, 29 if (y % 4 == 0 and (y % 100 != 0 or y % 400 == 0)) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][m - 1])
+    return dt.replace(year=y, month=m, day=day)
+
+
+def ms_to_utc(ms: int) -> datetime:
+    return datetime.fromtimestamp(int(ms) / 1000, tz=timezone.utc)
 
 
 def ema(vals: list[float], period: int) -> list[float]:
@@ -723,24 +736,38 @@ class TradingDashboard(tk.Tk):
             self.lbl_chart_page.config(text="Gráfico 0/0")
             return
 
-        # Segmentación por trimestres (~90 días) para mantener legibilidad.
-        max_window_ms = 90 * 24 * 60 * 60 * 1000
-        start_idx = 0
-        while start_idx < n:
-            start_ms = int(self.active_candles[start_idx].get("close_time", 0))
-            end_idx = start_idx
-            while end_idx + 1 < n:
-                nxt_ms = int(self.active_candles[end_idx + 1].get("close_time", 0))
-                if (nxt_ms - start_ms) > max_window_ms:
-                    break
-                end_idx += 1
-            if end_idx == start_idx:
-                end_idx = min(start_idx + 1, n - 1)
-            self.chart_segments.append((start_idx, end_idx))
-            start_idx = end_idx + 1
+        # Segmentación por trimestre calendario del rango seleccionado.
+        # Ejemplo: 2025/03/03 -> 2025/08/01 => [03/03-06/03], [06/03-08/01]
+        start_ms = int(self.selected_start_ms or self.active_candles[0].get("close_time", 0))
+        end_ms = int(self.selected_end_ms or self.active_candles[-1].get("close_time", 0))
+        start_dt = ms_to_utc(start_ms)
+        end_dt = ms_to_utc(end_ms)
+
+        windows: list[tuple[int, int]] = []
+        cur_start = start_dt
+        while cur_start < end_dt:
+            nxt = add_months(cur_start, 3)
+            if nxt > end_dt:
+                nxt = end_dt
+            windows.append((int(cur_start.timestamp() * 1000), int(nxt.timestamp() * 1000)))
+            if nxt <= cur_start:
+                break
+            cur_start = nxt
+
+        if not windows:
+            windows = [(start_ms, end_ms)]
+
+        for w_start, w_end in windows:
+            idxs = [
+                i for i, c in enumerate(self.active_candles)
+                if w_start <= int(c.get("close_time", c.get("open_time", 0))) <= w_end
+            ]
+            if idxs:
+                self.chart_segments.append((idxs[0], idxs[-1]))
 
         if not self.chart_segments:
             self.chart_segments = [(0, n - 1)]
+
         self.lbl_chart_page.config(text=f"Gráfico 1/{len(self.chart_segments)}")
 
     def _render_current_segment_chart(self) -> None:
@@ -874,17 +901,43 @@ class TradingDashboard(tk.Tk):
             self._set_error("La API actual no soporta carga histórica por rango.")
             return
 
+        self.selected_start_ms = int(start_ms)
+        self.selected_end_ms = int(end_ms)
         self.range_loading = True
         self.btn_apply_range.config(state="disabled")
         self.btn_recalc.config(state="disabled")
-        self._set_error("Descargando velas del rango solicitado... esto puede tardar en rangos largos.")
+        self._set_error("Descargando velas del rango solicitado por bloques trimestrales... espera por favor.")
 
         def worker():
             try:
-                candles = self._api["get_candles_range"](self.symbol, self.interval, int(start_ms), int(end_ms)) or []
+                merged: list[dict[str, Any]] = []
+                cur_start_dt = ms_to_utc(int(start_ms))
+                end_dt = ms_to_utc(int(end_ms))
+                while cur_start_dt < end_dt:
+                    cur_end_dt = add_months(cur_start_dt, 3)
+                    if cur_end_dt > end_dt:
+                        cur_end_dt = end_dt
+                    c_start = int(cur_start_dt.timestamp() * 1000)
+                    c_end = int(cur_end_dt.timestamp() * 1000)
+                    part = self._api["get_candles_range"](self.symbol, self.interval, c_start, c_end) or []
+                    merged.extend(part)
+                    if cur_end_dt <= cur_start_dt:
+                        break
+                    cur_start_dt = cur_end_dt + timedelta(hours=1)
+
+                merged.sort(key=lambda x: int(x.get("open_time", 0)))
+                dedup: list[dict[str, Any]] = []
+                seen = set()
+                for c in merged:
+                    ot = int(c.get("open_time", 0))
+                    if ot in seen:
+                        continue
+                    seen.add(ot)
+                    dedup.append(c)
+
                 self._ui_queue.put({
                     "kind": "range_loaded",
-                    "candles": candles,
+                    "candles": dedup,
                     "start_ms": int(start_ms),
                     "end_ms": int(end_ms),
                 })
