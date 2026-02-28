@@ -1,0 +1,138 @@
+//@version=6
+strategy(
+     "BOT LONG ONLY — Python Parity",
+     overlay=true,
+     pyramiding=0,
+     process_orders_on_close=false,   // Python sim ejecuta en OPEN de la vela siguiente
+     commission_type=strategy.commission.percent,
+     commission_value=0.10
+)
+
+// =========================
+// BEST_GEN (DEFAULT_GEN)
+// =========================
+useHA = input.bool(true, "use_ha")
+
+rsiPeriod = input.int(10, "rsi_period", minval=2)
+rsiOS = input.float(40.0, "rsi_oversold")
+rsiOB = input.float(58.0, "rsi_overbought")
+
+macdFast = input.int(40, "macd_fast", minval=2)
+macdSlow = input.int(83, "macd_slow", minval=3)
+macdSignal = input.int(46, "macd_signal", minval=2)
+edgeTrigger = input.int(0, "edge_trigger", minval=0, maxval=1)
+
+consecRedN = input.int(3, "consec_red", minval=1)
+consecGreenN = input.int(4, "consec_green", minval=1)
+
+wBR = input.float(0.51, "w_buy_rsi")
+wBM = input.float(0.49, "w_buy_macd")
+wBC = input.float(0.00, "w_buy_consec")
+
+wSR = input.float(0.21, "w_sell_rsi")
+wSM = input.float(0.46, "w_sell_macd")
+wSC = input.float(0.33, "w_sell_consec")
+
+buyTh = input.float(0.74, "buy_th")
+sellTh = input.float(0.62, "sell_th")
+
+tpPct = input.float(0.109, "take_profit", minval=0.0)
+slPct = input.float(0.012, "stop_loss", minval=0.0)
+cooldownBars = input.int(1, "cooldown", minval=0)
+
+// =========================
+// SOURCE (HA close parity)
+// =========================
+haClose = (open + high + low + close) / 4.0
+src = useHA ? haClose : close
+
+// =========================
+// Helpers (paridad Python)
+// =========================
+clamp01(x) => math.max(0.0, math.min(1.0, x))
+
+normalize3(a, b, c) =>
+    s = a + b + c
+    s <= 1e-12 ? [1.0/3.0, 1.0/3.0, 1.0/3.0] : [a/s, b/s, c/s]
+
+buyRsiSignal(r, os, ob) =>
+    os2 = math.min(os, ob - 1e-6)
+    ob2 = math.max(ob, os2 + 1e-6)
+    r <= os2 ? 1.0 : r >= ob2 ? 0.0 : clamp01((ob2 - r) / (ob2 - os2))
+
+sellRsiSignal(r, os, ob) =>
+    os2 = math.min(os, ob - 1e-6)
+    ob2 = math.max(ob, os2 + 1e-6)
+    r >= ob2 ? 1.0 : r <= os2 ? 0.0 : clamp01((r - os2) / (ob2 - os2))
+
+consecUp(s, n) =>
+    ok = true
+    for k = 0 to n - 1
+        ok := ok and (s[k] >= s[k + 1])
+    ok ? 1.0 : 0.0
+
+consecDown(s, n) =>
+    ok = true
+    for k = 0 to n - 1
+        ok := ok and (s[k] <= s[k + 1])
+    ok ? 1.0 : 0.0
+
+// =========================
+// RSI / MACD / CONSEC
+// =========================
+rsiVal = ta.rsi(src, rsiPeriod)
+
+emaF = ta.ema(src, macdFast)
+emaS = ta.ema(src, macdSlow)
+macd = emaF - emaS
+sig  = ta.ema(macd, macdSignal)
+hist = macd - sig
+
+crossUp = hist > 0 and hist[1] <= 0
+crossDn = hist < 0 and hist[1] >= 0
+
+MACD_buy  = edgeTrigger == 0 ? (hist > 0 ? 1.0 : 0.0) : (crossUp ? 1.0 : 0.0)
+MACD_sell = edgeTrigger == 0 ? (hist < 0 ? 1.0 : 0.0) : (crossDn ? 1.0 : 0.0)
+
+RSI_buy  = buyRsiSignal(rsiVal, rsiOS, rsiOB)
+RSI_sell = sellRsiSignal(rsiVal, rsiOS, rsiOB)
+
+CONSEC_buy  = consecUp(src, consecGreenN)
+CONSEC_sell = consecDown(src, consecRedN)
+
+[wBRn, wBMn, wBCn] = normalize3(wBR, wBM, wBC)
+[wSRn, wSMn, wSCn] = normalize3(wSR, wSM, wSC)
+
+BUY_SCORE  = wBRn * RSI_buy + wBMn * MACD_buy + wBCn * CONSEC_buy
+SELL_SCORE = wSRn * RSI_sell + wSMn * MACD_sell + wSCn * CONSEC_sell
+
+// =========================
+// Cooldown / no reversal
+// =========================
+var int lastActionBar = na
+coolOk = na(lastActionBar) or (bar_index - lastActionBar >= cooldownBars)
+
+inPos = strategy.position_size > 0
+buyCond  = (not inPos) and coolOk and (BUY_SCORE >= buyTh)
+sellCond = inPos and coolOk and (SELL_SCORE >= sellTh)
+
+if barstate.isconfirmed
+    if buyCond
+        strategy.entry("LONG", strategy.long)
+        lastActionBar := bar_index
+    if sellCond
+        strategy.close("LONG")
+        lastActionBar := bar_index
+
+if inPos
+    ep = strategy.position_avg_price
+    strategy.exit(
+         "TP_SL", from_entry="LONG",
+         limit = ep * (1.0 + tpPct),
+         stop  = ep * (1.0 - slPct)
+    )
+
+plot(BUY_SCORE,  "BUY_SCORE",  color=color.lime)
+plot(SELL_SCORE, "SELL_SCORE", color=color.red)
+hline(buyTh,  "buy_th",  linestyle=hline.style_dotted)
+hline(sellTh, "sell_th", linestyle=hline.style_dotted)
