@@ -111,29 +111,29 @@ GUI_CONNECT_RETRY_SEC = 5.0
 
 
 # =========================
-# GEN 235 (defaults)
+# BEST_GEN (defaults)
 # =========================
 DEFAULT_GEN = {
-  "use_ha": 1,
-  "rsi_period": 10,
-  "rsi_oversold": 40.0,
-  "rsi_overbought": 58.0,
-  "macd_fast": 40,
-  "macd_slow": 83,
-  "macd_signal": 46,
+  "use_ha": 0,
+  "rsi_period": 18,
+  "rsi_oversold": 30.0,
+  "rsi_overbought": 71.0,
+  "macd_fast": 9,
+  "macd_slow": 146,
+  "macd_signal": 27,
   "consec_red": 3,
-  "consec_green": 4,
-  "w_buy_rsi": 0.51,
-  "w_buy_macd": 0.49,
-  "w_buy_consec": 0.00,
-  "buy_th": 0.74,
-  "w_sell_rsi": 0.21,
-  "w_sell_macd": 0.46,
-  "w_sell_consec": 0.33,
-  "sell_th": 0.62,
-  "take_profit": 0.109,
-  "stop_loss": 0.012,
-  "cooldown": 1,
+  "consec_green": 5,
+  "w_buy_rsi": 0.38,
+  "w_buy_macd": 0.31,
+  "w_buy_consec": 0.31,
+  "buy_th": 0.55,
+  "w_sell_rsi": 0.33,
+  "w_sell_macd": 0.15,
+  "w_sell_consec": 0.52,
+  "sell_th": 0.60,
+  "take_profit": 0.150,
+  "stop_loss": 0.050,
+  "cooldown": 11,
   "edge_trigger": 0
 }
 
@@ -1328,16 +1328,48 @@ class BotGUI:
         self._build()
         self._start_auto_connect()
 
+    def _ui_call(self, fn, *args, **kwargs):
+        if threading.current_thread() is threading.main_thread():
+            fn(*args, **kwargs)
+        else:
+            self.root.after(0, lambda: fn(*args, **kwargs))
+
+    def _make_scrollable_tab(self, notebook: ttk.Notebook, title: str, *, padding: int = 10) -> ttk.Frame:
+        outer = ttk.Frame(notebook)
+        outer.grid_rowconfigure(0, weight=1)
+        outer.grid_columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        yscroll = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        xscroll = ttk.Scrollbar(outer, orient="horizontal", command=canvas.xview)
+        canvas.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+
+        canvas.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+
+        inner = ttk.Frame(canvas, padding=padding)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            canvas.itemconfigure(win, width=event.width)
+
+        inner.bind("<Configure>", _on_inner_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        notebook.add(outer, text=title)
+        return inner
+
     def _build(self):
         nb = ttk.Notebook(self.root)
         nb.pack(fill="both", expand=True)
 
-        bot_tab = ttk.Frame(nb, padding=10)
-        wallet_tab = ttk.Frame(nb, padding=10)
-        manual_tab = ttk.Frame(nb, padding=10)
-        nb.add(bot_tab, text="Bot")
-        nb.add(wallet_tab, text="Billetera SPOT")
-        nb.add(manual_tab, text="Manual")
+        bot_tab = self._make_scrollable_tab(nb, "Bot", padding=10)
+        wallet_tab = self._make_scrollable_tab(nb, "Billetera SPOT", padding=10)
+        manual_tab = self._make_scrollable_tab(nb, "Manual", padding=10)
 
         frm = bot_tab
 
@@ -1454,8 +1486,11 @@ class BotGUI:
         self.txt_params.insert("1.0", json.dumps(self.params, indent=2, ensure_ascii=False))
 
     def log(self, msg: str):
-        self.txt_log.insert("end", msg + "\n")
-        self.txt_log.see("end")
+        def _append():
+            self.txt_log.insert("end", msg + "\n")
+            self.txt_log.see("end")
+
+        self._ui_call(_append)
 
     def ui_callback(self, kind: str, payload: dict):
         # thread-safe update
@@ -1521,20 +1556,23 @@ class BotGUI:
         self.root.after(0, _upd)
 
     def _update_wallet_table(self, wallet: list[dict]):
-        if not hasattr(self, "wallet_tree"):
-            return
-        self.wallet_tree.delete(*self.wallet_tree.get_children())
-        for item in wallet:
-            self.wallet_tree.insert(
-                "",
-                "end",
-                values=(
-                    item["asset"],
-                    f"{item['free']:.6f}",
-                    f"{item['locked']:.6f}",
-                    f"{item['total']:.6f}",
-                ),
-            )
+        def _render():
+            if not hasattr(self, "wallet_tree"):
+                return
+            self.wallet_tree.delete(*self.wallet_tree.get_children())
+            for item in wallet:
+                self.wallet_tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        item["asset"],
+                        f"{item['free']:.6f}",
+                        f"{item['locked']:.6f}",
+                        f"{item['total']:.6f}",
+                    ),
+                )
+
+        self._ui_call(_render)
 
     def refresh_wallet(self):
         if not self.client:
@@ -1618,14 +1656,14 @@ class BotGUI:
             )
             self.client.ping()
             self.log("[OK] Conectado a Binance SPOT (ping ok).")
-            self.var_connection.set("online")
-            self.refresh_wallet()
+            self._ui_call(self.var_connection.set, "online")
+            self._ui_call(self.refresh_wallet)
             return True
         except Exception as e:
             self.client = None
-            self.var_connection.set("offline")
+            self._ui_call(self.var_connection.set, "offline")
             if show_errors:
-                messagebox.showerror("Error", str(e))
+                self._ui_call(messagebox.showerror, "Error", str(e))
             else:
                 self.log(f"[NET] Error de conexion: {e}")
             return False

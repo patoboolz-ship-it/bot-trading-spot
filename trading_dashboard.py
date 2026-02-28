@@ -539,12 +539,9 @@ class TradingDashboard(tk.Tk):
         self.notebook = ttk.Notebook(self)
         self.notebook.grid(row=1, column=0, sticky="nsew", padx=8, pady=8)
 
-        tab_dash = ttk.Frame(self.notebook)
-        tab_perf = ttk.Frame(self.notebook)
-        tab_bot = ttk.Frame(self.notebook)
-        self.notebook.add(tab_dash, text="Dashboard 1H")
-        self.notebook.add(tab_perf, text="Rentabilidades")
-        self.notebook.add(tab_bot, text="Bot")
+        tab_dash = self._make_scrollable_tab("Dashboard 1H")
+        tab_perf = self._make_scrollable_tab("Rentabilidades")
+        tab_bot = self._make_scrollable_tab("Bot")
 
         tab_dash.grid_rowconfigure(0, weight=1)
         tab_dash.grid_columnconfigure(0, weight=4)
@@ -627,6 +624,35 @@ class TradingDashboard(tk.Tk):
         self.btn_play.pack(side="left", padx=6)
         self.btn_pause.pack(side="left", padx=6)
         self.btn_stop.pack(side="left", padx=6)
+
+    def _make_scrollable_tab(self, title: str, *, padding: int = 6) -> ttk.Frame:
+        outer = ttk.Frame(self.notebook)
+        outer.grid_rowconfigure(0, weight=1)
+        outer.grid_columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        yscroll = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        xscroll = ttk.Scrollbar(outer, orient="horizontal", command=canvas.xview)
+        canvas.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+
+        canvas.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+
+        inner = ttk.Frame(canvas, padding=padding)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            canvas.itemconfigure(win, width=event.width)
+
+        inner.bind("<Configure>", _on_inner_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        self.notebook.add(outer, text=title)
+        return inner
 
     def _load_initial_data(self) -> None:
         if self._api_mode == "public_fallback":
