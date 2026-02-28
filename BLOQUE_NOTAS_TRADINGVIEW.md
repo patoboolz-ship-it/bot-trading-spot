@@ -281,3 +281,36 @@ Comprobar que la barra usada por estrategia cumple criterio de cerrada y que no 
 - `cooldown`, `take_profit`, `stop_loss`,
 - ejecución solo en barra cerrada (`barstate.isconfirmed`).
 Luego imprime en tabla por barra los componentes y scores para compararlos con mi bot." 
+
+---
+
+## 12) Si no te coincide con Python: 6 diferencias típicas (aplica a tu script)
+
+Si usas una versión como la que compartiste, hay varios puntos que suelen romper la paridad:
+
+1. **RSI en binario vs RSI continuo**
+   - En Python, `buy_rsi_signal` y `sell_rsi_signal` son continuas (0..1 lineal entre oversold/overbought).
+   - Si en Pine pones RSI como 0/1 duro, cambian `BUY_SCORE`/`SELL_SCORE` y la frecuencia de trades.
+
+2. **Pesos sin normalizar por lado**
+   - En Python se normalizan siempre (`normalize3`) antes de combinar.
+   - Si en Pine usas pesos en crudo, las escalas no coinciden.
+
+3. **Modo de ejecución de órdenes**
+   - Simulador Python entra/sale en el **open de la vela siguiente** (`process_orders_on_close=false` en TradingView aproxima mejor esto).
+   - Con `process_orders_on_close=true` te estás llenando al cierre de la misma vela de señal y eso altera resultados.
+
+4. **TP/SL intrabar y prioridad**
+   - En Python, al evaluar la vela siguiente: primero SL (si low toca), luego TP (si high toca), luego señal de salida.
+   - En TradingView `strategy.exit` puede resolver distinto cuando una barra toca ambos extremos.
+
+5. **Consecutivas exactas**
+   - Python usa condición no estricta (`>=` para verdes y `<=` para rojas) sobre los últimos `n` saltos.
+   - Un contador distinto o con resets distintos cambia bastante.
+
+6. **Fuente HA**
+   - Python usa `haClose=(o+h+l+c)/4` para señales cuando `use_ha=1`.
+   - Si en TradingView tomas otra variante de HA (o `close` normal), ya no es 1:1.
+
+> Para acelerar, usa `tradingview_parity_template.pine` como base y solo cambia parámetros del GEN.
+
