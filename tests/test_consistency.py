@@ -112,3 +112,30 @@ def test_simulator_matches_tradingview_formulas():
         sell_sim_cond = sell_sim >= ge.sell_th
         assert buy_ref_cond == buy_sim_cond
         assert sell_ref_cond == sell_sim_cond
+
+
+def test_closed_candle_criterion_matches_spec():
+    interval = "1h"
+    interval_ms = bot.interval_to_ms(interval)
+    server_time = 10_000_000
+    candles = [
+        {"close_time": server_time - (2 * interval_ms), "close": 1.0},
+        {"close_time": server_time - interval_ms - 1, "close": 2.0},
+        {"close_time": server_time - interval_ms, "close": 3.0},
+        {"close_time": server_time - interval_ms + 1, "close": 4.0},
+    ]
+
+    closed = bot.filter_closed_candles(candles, interval, server_time)
+    assert [c["close"] for c in closed] == [1.0, 2.0]
+
+
+def test_bot_simulator_score_parity_on_same_closed_candle():
+    candles = make_candles(300)
+    ge = bot.Genome(**bot.DEFAULT_GEN)
+    bot.assert_bot_simulator_score_parity(ge, candles, index=len(candles) - 2)
+
+
+def test_closed_last_price_validation_supports_heikin_ashi():
+    candles = make_candles(50)
+    ha_last = bot.heikin_ashi(candles)[-1]["close"]
+    bot.assert_simulator_uses_closed_last_price(candles, ha_last, use_ha=True)

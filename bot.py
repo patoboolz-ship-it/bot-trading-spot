@@ -88,6 +88,13 @@ GA_PROGRESS_EVERY = 25
 GA_INDIVIDUAL_WARN_S = 5.0
 
 BLOCK_STUCK_LIMIT = 5
+WEIGHT_BOOST_STUCK_TRIGGER = 5
+WEIGHT_BOOST_MUT_RATE = 0.92
+WEIGHT_BOOST_MUT_SIGMA = 0.16
+WEIGHT_BOOST_PARAM_MUT_RATE = 0.22
+COMBO_PENALTY_FACTOR = 0.65
+COMBO_PENALTY_FLOOR = 0.20
+COMBO_PENALTY_RESET_STUCK = 12
 
 # Capital inicial para reportes de optimización
 START_CAPITAL = 100000.0
@@ -104,31 +111,32 @@ GUI_CONNECT_RETRY_SEC = 5.0
 
 
 # =========================
-# GEN 235 (defaults)
+# BEST_GEN (defaults)
 # =========================
 DEFAULT_GEN = {
-  "use_ha": 1,
-  "rsi_period": 10,
-  "rsi_oversold": 40.0,
-  "rsi_overbought": 58.0,
-  "macd_fast": 40,
-  "macd_slow": 83,
-  "macd_signal": 46,
+  "use_ha": 0,
+  "rsi_period": 18,
+  "rsi_oversold": 30.0,
+  "rsi_overbought": 71.0,
+  "macd_fast": 9,
+  "macd_slow": 146,
+  "macd_signal": 27,
   "consec_red": 3,
-  "consec_green": 4,
-  "w_buy_rsi": 0.51,
-  "w_buy_macd": 0.49,
-  "w_buy_consec": 0.00,
-  "buy_th": 0.74,
-  "w_sell_rsi": 0.21,
-  "w_sell_macd": 0.46,
-  "w_sell_consec": 0.33,
-  "sell_th": 0.62,
-  "take_profit": 0.109,
-  "stop_loss": 0.012,
-  "cooldown": 1,
+  "consec_green": 5,
+  "w_buy_rsi": 0.38,
+  "w_buy_macd": 0.31,
+  "w_buy_consec": 0.31,
+  "buy_th": 0.55,
+  "w_sell_rsi": 0.33,
+  "w_sell_macd": 0.15,
+  "w_sell_consec": 0.52,
+  "sell_th": 0.60,
+  "take_profit": 0.150,
+  "stop_loss": 0.050,
+  "cooldown": 11,
   "edge_trigger": 0
 }
+OPTIMIZER_BEST_PATH = "optimizer_best_gen.json"
 
 
 # =========================
@@ -542,6 +550,82 @@ def compute_scores(params: dict, candles: list):
     return payload["buy_score"], payload["sell_score"], last_close
 
 
+def interval_to_ms(interval: str) -> int:
+    if interval not in INTERVAL_MS:
+        raise ValueError(f"Intervalo no soportado: {interval}")
+    return INTERVAL_MS[interval]
+
+
+def is_candle_closed(close_time_ms: int, server_time_ms: int, interval_ms: int) -> bool:
+    """
+    Criterio único compartido por bot y simulador.
+    """
+    return int(close_time_ms) < int(server_time_ms) - int(interval_ms)
+
+
+def filter_closed_candles(candles: list[dict], interval: str, server_time_ms: int) -> list[dict]:
+    interval_ms = interval_to_ms(interval)
+    return filter_closed_candles_by_interval_ms(candles, interval_ms, server_time_ms)
+
+
+def filter_closed_candles_by_interval_ms(candles: list[dict], interval_ms: int, server_time_ms: int) -> list[dict]:
+    return [c for c in candles if is_candle_closed(c["close_time"], server_time_ms, interval_ms)]
+
+
+def assert_simulator_uses_closed_last_price(candles_closed: list[dict], used_close: float, use_ha: bool):
+    if not candles_closed:
+        return
+
+    if use_ha:
+        if candles_closed[-1].get("ha_close") is not None:
+            expected = float(candles_closed[-1]["ha_close"])
+        else:
+            expected = float(heikin_ashi(candles_closed)[-1]["close"])
+    else:
+        expected = float(candles_closed[-1]["close"])
+
+    if abs(float(used_close) - expected) > 1e-12:
+        src = "ha_close" if use_ha else "close"
+        raise AssertionError(
+            f"[VALIDACION] El simulador no usa el último {src} de vela cerrada. used={used_close} expected={expected}"
+        )
+
+
+def assert_bot_simulator_score_parity(ge: "Genome", candles_closed: list[dict], index: Optional[int] = None):
+    if not candles_closed:
+        return
+    idx = len(candles_closed) - 1 if index is None else int(index)
+    ge_payload, _ = compute_score_snapshot_from_genome(ge, candles_closed, idx)
+    pa_payload, _ = compute_score_snapshot_from_params(asdict(ge), candles_closed, idx)
+    if abs(ge_payload["buy_score"] - pa_payload["buy_score"]) > 1e-12 or abs(ge_payload["sell_score"] - pa_payload["sell_score"]) > 1e-12:
+        raise AssertionError(
+            "[VALIDACION] Score inconsistente bot vs simulador "
+            f"(buy ge={ge_payload['buy_score']} bot={pa_payload['buy_score']} | "
+            f"sell ge={ge_payload['sell_score']} bot={pa_payload['sell_score']})"
+        )
+
+
+def infer_interval_ms_from_candles(candles: list[dict]) -> int:
+    if len(candles) < 2:
+        return INTERVAL_MS.get(INTERVAL, 60_000)
+    diffs = []
+    for c in candles:
+        ot = c.get("open_time")
+        ct = c.get("close_time")
+        if ot is not None and ct is not None and ct > ot:
+            diffs.append(int(ct) - int(ot))
+    if diffs:
+        return int(statistics.median(diffs))
+    for i in range(1, len(candles)):
+        prev = candles[i - 1].get("open_time")
+        cur = candles[i].get("open_time")
+        if prev is not None and cur is not None and cur > prev:
+            diffs.append(int(cur) - int(prev))
+    if diffs:
+        return int(statistics.median(diffs))
+    return INTERVAL_MS.get(INTERVAL, 60_000)
+
+
 # =========================
 # Binance helpers
 # =========================
@@ -597,7 +681,8 @@ def get_spot_balances(client: Client) -> list[dict]:
 
 def fetch_klines_closed(client: Client, symbol: str, interval: str, limit: int):
     """
-    Trae velas y devuelve SOLO velas cerradas (quita la vela actual en formación).
+    Trae velas y devuelve SOLO velas cerradas usando el mismo criterio de cierre
+    compartido por bot y simulador.
     """
     kl = client.get_klines(symbol=symbol, interval=interval, limit=limit)
     # kline format: [open_time, open, high, low, close, volume, close_time, ...]
@@ -612,13 +697,9 @@ def fetch_klines_closed(client: Client, symbol: str, interval: str, limit: int):
             "close": float(row[4]),
             "volume": float(row[5]),
         })
-    # vela cerrada: close_time < now
-    now_ms = int(time.time() * 1000)
-    closed = [c for c in candles if c["close_time"] <= now_ms - 500]  # buffer
-    # a veces Binance devuelve la última cerrada + la actual; nos quedamos con todas menos la última si parece "viva"
-    if len(closed) >= 2 and closed[-1]["close_time"] > now_ms:
-        closed = closed[:-1]
-    return closed
+
+    server_time_ms = int(client.get_server_time()["serverTime"])
+    return filter_closed_candles(candles, interval, server_time_ms)
 
 
 # =========================
@@ -1089,9 +1170,6 @@ class SpotBot:
                     time.sleep(2)
                     continue
                 last_seen_close_time = close_time
-                close_time_utc = datetime.fromtimestamp(close_time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                self._emit("log", {"msg": f"[VELA] Nueva vela cerrada {close_time_utc} close={last_close:.4f}"})
-
                 bScore, sScore, score_close = compute_scores(self.params, candles)
                 last_close = score_close
                 close_time_utc = datetime.fromtimestamp(close_time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -1251,16 +1329,48 @@ class BotGUI:
         self._build()
         self._start_auto_connect()
 
+    def _ui_call(self, fn, *args, **kwargs):
+        if threading.current_thread() is threading.main_thread():
+            fn(*args, **kwargs)
+        else:
+            self.root.after(0, lambda: fn(*args, **kwargs))
+
+    def _make_scrollable_tab(self, notebook: ttk.Notebook, title: str, *, padding: int = 10) -> ttk.Frame:
+        outer = ttk.Frame(notebook)
+        outer.grid_rowconfigure(0, weight=1)
+        outer.grid_columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        yscroll = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        xscroll = ttk.Scrollbar(outer, orient="horizontal", command=canvas.xview)
+        canvas.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+
+        canvas.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+
+        inner = ttk.Frame(canvas, padding=padding)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            canvas.itemconfigure(win, width=event.width)
+
+        inner.bind("<Configure>", _on_inner_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        notebook.add(outer, text=title)
+        return inner
+
     def _build(self):
         nb = ttk.Notebook(self.root)
         nb.pack(fill="both", expand=True)
 
-        bot_tab = ttk.Frame(nb, padding=10)
-        wallet_tab = ttk.Frame(nb, padding=10)
-        manual_tab = ttk.Frame(nb, padding=10)
-        nb.add(bot_tab, text="Bot")
-        nb.add(wallet_tab, text="Billetera SPOT")
-        nb.add(manual_tab, text="Manual")
+        bot_tab = self._make_scrollable_tab(nb, "Bot", padding=10)
+        wallet_tab = self._make_scrollable_tab(nb, "Billetera SPOT", padding=10)
+        manual_tab = self._make_scrollable_tab(nb, "Manual", padding=10)
 
         frm = bot_tab
 
@@ -1295,6 +1405,7 @@ class BotGUI:
         ttk.Button(btns, text="Iniciar", command=self.start).pack(side="left", padx=5)
         ttk.Button(btns, text="Detener", command=self.stop).pack(side="left", padx=5)
         ttk.Button(btns, text="Exportar Excel", command=self.export_excel).pack(side="left", padx=5)
+        ttk.Button(btns, text="Cargar mejor optimizador", command=self.load_optimizer_best).pack(side="right", padx=5)
         ttk.Button(btns, text="Cargar GEN235", command=self.load_gen235).pack(side="right")
 
         # Params quick view
@@ -1377,8 +1488,11 @@ class BotGUI:
         self.txt_params.insert("1.0", json.dumps(self.params, indent=2, ensure_ascii=False))
 
     def log(self, msg: str):
-        self.txt_log.insert("end", msg + "\n")
-        self.txt_log.see("end")
+        def _append():
+            self.txt_log.insert("end", msg + "\n")
+            self.txt_log.see("end")
+
+        self._ui_call(_append)
 
     def ui_callback(self, kind: str, payload: dict):
         # thread-safe update
@@ -1444,20 +1558,23 @@ class BotGUI:
         self.root.after(0, _upd)
 
     def _update_wallet_table(self, wallet: list[dict]):
-        if not hasattr(self, "wallet_tree"):
-            return
-        self.wallet_tree.delete(*self.wallet_tree.get_children())
-        for item in wallet:
-            self.wallet_tree.insert(
-                "",
-                "end",
-                values=(
-                    item["asset"],
-                    f"{item['free']:.6f}",
-                    f"{item['locked']:.6f}",
-                    f"{item['total']:.6f}",
-                ),
-            )
+        def _render():
+            if not hasattr(self, "wallet_tree"):
+                return
+            self.wallet_tree.delete(*self.wallet_tree.get_children())
+            for item in wallet:
+                self.wallet_tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        item["asset"],
+                        f"{item['free']:.6f}",
+                        f"{item['locked']:.6f}",
+                        f"{item['total']:.6f}",
+                    ),
+                )
+
+        self._ui_call(_render)
 
     def refresh_wallet(self):
         if not self.client:
@@ -1541,14 +1658,14 @@ class BotGUI:
             )
             self.client.ping()
             self.log("[OK] Conectado a Binance SPOT (ping ok).")
-            self.var_connection.set("online")
-            self.refresh_wallet()
+            self._ui_call(self.var_connection.set, "online")
+            self._ui_call(self.refresh_wallet)
             return True
         except Exception as e:
             self.client = None
-            self.var_connection.set("offline")
+            self._ui_call(self.var_connection.set, "offline")
             if show_errors:
-                messagebox.showerror("Error", str(e))
+                self._ui_call(messagebox.showerror, "Error", str(e))
             else:
                 self.log(f"[NET] Error de conexion: {e}")
             return False
@@ -1557,6 +1674,22 @@ class BotGUI:
         self.params = DEFAULT_GEN.copy()
         self._refresh_params_box()
         self.log("[OK] GEN235 cargado en parámetros.")
+
+    def load_optimizer_best(self):
+        try:
+            if not os.path.exists(OPTIMIZER_BEST_PATH):
+                messagebox.showwarning("Aviso", f"No existe {OPTIMIZER_BEST_PATH}. Ejecuta el optimizador primero.")
+                return
+            with open(OPTIMIZER_BEST_PATH, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            params = payload.get("params")
+            if not isinstance(params, dict) or not params:
+                raise ValueError(f"Archivo inválido: falta 'params' en {OPTIMIZER_BEST_PATH}")
+            self.set_params(params, log_msg=f"[OK] Parámetros cargados desde {OPTIMIZER_BEST_PATH}.")
+            if "metrics" in payload:
+                self.log(f"[INFO] Métricas mejor GEN: {json.dumps(payload['metrics'], ensure_ascii=False)}")
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo cargar {OPTIMIZER_BEST_PATH}:\n{e}")
 
     def set_params(self, params: dict, log_msg: Optional[str] = None):
         self.params = params.copy()
@@ -1993,6 +2126,10 @@ class Metrics:
 
 
 def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float, trace: bool = False):
+    interval_ms = infer_interval_ms_from_candles(candles)
+    server_time_ms = max(c.get("close_time", 0) for c in candles) + interval_ms + 1 if candles else 0
+    candles = filter_closed_candles_by_interval_ms(candles, interval_ms, server_time_ms)
+
     if len(candles) < 200:
         metrics = Metrics(
             score=-1e9,
@@ -2093,24 +2230,27 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
         if dd > max_dd:
             max_dd = dd
 
-        if i <= 0:
-            prev_close = close_sig[i]
-        else:
-            prev_close = close_sig[i - 1]
+        payload = score_components_at_index(
+            close_sig,
+            rsi_arr,
+            mh_arr,
+            i,
+            rsi_oversold=ge.rsi_oversold,
+            rsi_overbought=ge.rsi_overbought,
+            consec_red=ge.consec_red,
+            consec_green=ge.consec_green,
+            edge_trigger=ge.edge_trigger,
+            w_buy_rsi=ge.w_buy_rsi,
+            w_buy_macd=ge.w_buy_macd,
+            w_buy_consec=ge.w_buy_consec,
+            w_sell_rsi=ge.w_sell_rsi,
+            w_sell_macd=ge.w_sell_macd,
+            w_sell_consec=ge.w_sell_consec,
+        )
+        bs = payload["buy_score"]
+        ss = payload["sell_score"]
         rsi_val = rsi_arr[i]
         mh_val = mh_arr[i]
-
-        rsi_buy = 1.0 if rsi_val <= ge.rsi_oversold else 0.0
-        rsi_sell = 1.0 if rsi_val >= ge.rsi_overbought else 0.0
-        macd_buy = 1.0 if mh_val > 0 else 0.0
-        macd_sell = 1.0 if mh_val < 0 else 0.0
-        consec_buy = 1.0 if close_sig[i] <= prev_close else 0.0
-        consec_sell = 1.0 if close_sig[i] >= prev_close else 0.0
-
-        wbr, wbm, wbc = normalize3(ge.w_buy_rsi, ge.w_buy_macd, ge.w_buy_consec)
-        wsr, wsm, wsc = normalize3(ge.w_sell_rsi, ge.w_sell_macd, ge.w_sell_consec)
-        bs = wbr * rsi_buy + wbm * macd_buy + wbc * consec_buy
-        ss = wsr * rsi_sell + wsm * macd_sell + wsc * consec_sell
         if bs >= ge.buy_th:
             buy_signal_hits += 1
         if ss >= ge.sell_th:
@@ -2197,6 +2337,9 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
             dd_curve.append((peak - equity) / peak if peak > 0 else 0.0)
 
     net = equity - 1.0
+    assert_simulator_uses_closed_last_price(candles, close_sig[-1], ge.use_ha == 1)
+    assert_bot_simulator_score_parity(ge, candles)
+
     balance = START_CAPITAL * equity
     profit = balance - START_CAPITAL
     dd_pct = (max_dd / (peak + 1e-12)) * 100.0
@@ -2581,10 +2724,29 @@ def run_ga(
         for gene in sorted(mutation_counter.keys()):
             print(f"{gene}={mutation_counter[gene]}")
 
+    combo_penalties: dict[tuple[str, ...], float] = {}
+
+    def register_combo_feedback(combo: Optional[list[str]], improved: bool):
+        if not combo:
+            return
+        key = tuple(sorted(combo))
+        cur = combo_penalties.get(key, 1.0)
+        if improved:
+            combo_penalties[key] = min(1.0, cur + 0.20)
+        else:
+            combo_penalties[key] = max(COMBO_PENALTY_FLOOR, cur * COMBO_PENALTY_FACTOR)
+
+    def maybe_reset_combo_penalties(stuck_count: int):
+        if stuck_count >= COMBO_PENALTY_RESET_STUCK and combo_penalties:
+            combo_penalties.clear()
+            print(
+                f"[BLOQUE] reset probabilidades de combinaciones (stuck={stuck_count})",
+                flush=True,
+            )
+
     def pick_random_block_combo() -> Optional[list[str]]:
         if not param_blocks:
             return None
-        weights = [BLOCK_SELECTION_WEIGHTS.get(b, 1.0) for b in param_blocks]
         counts = list(BLOCK_COUNT_WEIGHTS.keys())
         count_weights = [BLOCK_COUNT_WEIGHTS[c] for c in counts]
         while True:
@@ -2592,7 +2754,13 @@ def run_ga(
             count = min(count, len(param_blocks))
             chosen = set()
             while len(chosen) < count:
-                block = random.choices(param_blocks, weights=weights, k=1)[0]
+                current_weights = []
+                for candidate in param_blocks:
+                    hypothetical = tuple(sorted(list(chosen | {candidate})))
+                    combo_bias = combo_penalties.get(hypothetical, 1.0)
+                    block_weight = BLOCK_SELECTION_WEIGHTS.get(candidate, 1.0)
+                    current_weights.append(block_weight * combo_bias)
+                block = random.choices(param_blocks, weights=current_weights, k=1)[0]
                 chosen.add(block)
             combo = tuple(sorted(chosen))
             if combo not in recent_blocks:
@@ -2637,14 +2805,18 @@ def run_ga(
         elite_hashes = [hash(tuple(asdict(ge).items())) for ge in [x[1] for x in scored[:cfg.elite]]]
         elite_unique = len(set(elite_hashes))
 
-        if best_global is None or best_score > best_global[0] + 1e-9:
+        improved_generation = best_global is None or best_score > best_global[0] + 1e-9
+        if improved_generation:
             prev_best_global_score = best_global[0] if best_global else None
             best_global = (best_score, copy.deepcopy(best_ge))
             best_metrics = best_m
             stuck = 0
+            register_combo_feedback(active_param_blocks, improved=True)
             active_param_blocks = None
         else:
             stuck += 1
+            register_combo_feedback(active_param_blocks, improved=False)
+            maybe_reset_combo_penalties(stuck)
             if is_weight_opt:
                 weight_no_improve += 1
 
@@ -2691,10 +2863,18 @@ def run_ga(
         if stuck >= BLOCK_STUCK_LIMIT:
             mask_saturated = True
 
+        weight_boost_mode = stuck >= WEIGHT_BOOST_STUCK_TRIGGER
+        mode_label = "WEIGHT-BOOST" if weight_boost_mode else "NORMAL"
+        curr_weight_mut_rate = WEIGHT_BOOST_MUT_RATE if weight_boost_mode else WEIGHT_MUT_RATE
+        curr_weight_sigma = WEIGHT_BOOST_MUT_SIGMA if weight_boost_mode else WEIGHT_MUT_SIGMA
+        curr_param_mut_rate = WEIGHT_BOOST_PARAM_MUT_RATE if weight_boost_mode else PARAM_MUT_RATE
+
         if active_param_blocks is None:
             active_param_blocks = pick_random_block_combo()
             print(
-                f"[BLOQUE] activos: {active_param_blocks} | pesos siempre mutan | gens={BLOCK_STUCK_LIMIT}",
+                f"[BLOQUE] modo={mode_label} activos: {active_param_blocks} | "
+                f"w_mut_rate={curr_weight_mut_rate:.2f} w_sigma={curr_weight_sigma:.2f} "
+                f"param_mut_rate={curr_param_mut_rate:.2f} | gens={BLOCK_STUCK_LIMIT}",
                 flush=True,
             )
         elif mask_saturated:
@@ -2703,8 +2883,10 @@ def run_ga(
             active_param_blocks = pick_random_block_combo()
             switch_elapsed = time.perf_counter() - before_switch
             print(
-                f"[BLOQUE] activos: {active_param_blocks} | pesos siempre mutan | "
-                f"gens={BLOCK_STUCK_LIMIT} | cambio_en={switch_elapsed:.3f}s",
+                f"[BLOQUE] modo={mode_label} activos: {active_param_blocks} | "
+                f"w_mut_rate={curr_weight_mut_rate:.2f} w_sigma={curr_weight_sigma:.2f} "
+                f"param_mut_rate={curr_param_mut_rate:.2f} | gens={BLOCK_STUCK_LIMIT} | "
+                f"cambio_en={switch_elapsed:.3f}s",
                 flush=True,
             )
             stuck = 0
@@ -2733,6 +2915,9 @@ def run_ga(
                 p1,
                 p2,
                 param_blocks=active_param_blocks,
+                param_mut_rate=curr_param_mut_rate,
+                weight_mut_rate=curr_weight_mut_rate,
+                weight_sigma=curr_weight_sigma,
                 strength=forced_strength if active_param_blocks else 0.55,
                 return_meta=DEBUG_MUTATION,
             )
@@ -2751,6 +2936,9 @@ def run_ga(
                 p1,
                 p2,
                 param_blocks=active_param_blocks,
+                param_mut_rate=curr_param_mut_rate,
+                weight_mut_rate=curr_weight_mut_rate,
+                weight_sigma=curr_weight_sigma,
                 strength=forced_strength if active_param_blocks else 0.80,
                 return_meta=DEBUG_MUTATION,
             )
@@ -2769,6 +2957,9 @@ def run_ga(
                 p1,
                 p2,
                 param_blocks=active_param_blocks,
+                param_mut_rate=curr_param_mut_rate,
+                weight_mut_rate=curr_weight_mut_rate,
+                weight_sigma=curr_weight_sigma,
                 strength=forced_strength if active_param_blocks else 1.00,
                 return_meta=DEBUG_MUTATION,
             )
@@ -2844,6 +3035,9 @@ def run_ga(
                     ge,
                     ge,
                     param_blocks=active_param_blocks,
+                    param_mut_rate=curr_param_mut_rate,
+                    weight_mut_rate=curr_weight_mut_rate,
+                    weight_sigma=curr_weight_sigma,
                     strength=forced_strength if active_param_blocks else 0.80,
                     return_meta=DEBUG_MUTATION,
                 )
@@ -2875,6 +3069,9 @@ def run_ga(
                 seed,
                 seed,
                 param_blocks=active_param_blocks,
+                param_mut_rate=curr_param_mut_rate,
+                weight_mut_rate=curr_weight_mut_rate,
+                weight_sigma=curr_weight_sigma,
                 strength=forced_strength if active_param_blocks else 0.80,
                 return_meta=DEBUG_MUTATION,
             )
@@ -2974,6 +3171,33 @@ class OptimizerGUI:
 
         self.space = self.build_space_defaults()
         self.build_ui()
+
+    def _persist_best_result(self):
+        if not self.best_genome:
+            return
+        metrics_payload = None
+        if self.best_metrics is not None:
+            metrics_payload = {
+                "score": float(getattr(self.best_metrics, "score", 0.0)),
+                "pf": float(getattr(self.best_metrics, "pf", 0.0)),
+                "trades": int(getattr(self.best_metrics, "trades", 0)),
+                "trades_per_year": float(getattr(self.best_metrics, "trades_per_year", 0.0)),
+                "dd_pct": float(getattr(self.best_metrics, "dd_pct", 0.0)),
+                "net": float(getattr(self.best_metrics, "net", 0.0)),
+                "profit": float(getattr(self.best_metrics, "profit", 0.0)),
+                "balance": float(getattr(self.best_metrics, "balance", 0.0)),
+                "winrate": float(getattr(self.best_metrics, "winrate", 0.0)),
+            }
+        payload = {
+            "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+            "symbol": self.var_symbol.get().strip().upper(),
+            "interval": self.var_tf.get().strip(),
+            "params": asdict(self.best_genome),
+            "metrics": metrics_payload,
+        }
+        with open(OPTIMIZER_BEST_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        self.root.after(0, self.log, f"[OK] Mejor GEN guardado en {OPTIMIZER_BEST_PATH}.")
 
     def build_space_defaults(self):
         sp = ParamSpace()
@@ -3488,6 +3712,7 @@ class OptimizerGUI:
                     if self.best_genome:
                         self.root.after(0, self.log, "[FIN] Mejor encontrado:")
                         self.root.after(0, self.log, json.dumps(asdict(self.best_genome), indent=2, ensure_ascii=False))
+                        self._persist_best_result()
                 except Exception as e:
                     print("[ERROR] OptimizerGUI.start failure:", flush=True)
                     print(traceback.format_exc(), flush=True)
@@ -3539,6 +3764,7 @@ class OptimizerGUI:
             return
         params = asdict(self.best_genome)
         self.apply_callback(params)
+        self._persist_best_result()
         self.log("[OK] Parámetros aplicados al Bot.")
 
 
