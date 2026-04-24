@@ -126,17 +126,26 @@ DEFAULT_GEN = {
   "w_buy_rsi": 0.38,
   "w_buy_macd": 0.31,
   "w_buy_consec": 0.31,
+  "w_buy_fng": 0.0,
+  "w_buy_liq": 0.0,
   "buy_th": 0.55,
   "w_sell_rsi": 0.33,
   "w_sell_macd": 0.15,
   "w_sell_consec": 0.52,
+  "w_sell_fng": 0.0,
+  "w_sell_liq": 0.0,
   "sell_th": 0.60,
+  "fng_fear": 35.0,
+  "fng_greed": 65.0,
+  "liq_window": 24,
   "take_profit": 0.150,
   "stop_loss": 0.050,
   "cooldown": 11,
   "edge_trigger": 0
 }
 OPTIMIZER_BEST_PATH = "optimizer_best_gen.json"
+FNG_CACHE_TTL_SEC = 60 * 30
+_FNG_CACHE = {"ts": 0.0, "by_date": {}}
 
 
 # =========================
@@ -386,6 +395,57 @@ def normalize3(a,b,c):
         return (1/3,1/3,1/3)
     return (a/s, b/s, c/s)
 
+def normalize5(a, b, c, d, e):
+    vals = [max(0.0, float(x)) for x in (a, b, c, d, e)]
+    s = sum(vals)
+    if s <= 1e-12:
+        return (0.2, 0.2, 0.2, 0.2, 0.2)
+    return tuple(v / s for v in vals)
+
+def fetch_fng_by_date() -> dict:
+    now = time.time()
+    if (now - _FNG_CACHE["ts"]) < FNG_CACHE_TTL_SEC and _FNG_CACHE["by_date"]:
+        return _FNG_CACHE["by_date"]
+    try:
+        r = requests.get("https://api.alternative.me/fng/?limit=0&format=json", timeout=12)
+        r.raise_for_status()
+        raw = r.json().get("data", [])
+        by_date = {}
+        for row in raw:
+            ts = int(row.get("timestamp", 0))
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+            by_date[dt] = float(row.get("value", 50.0))
+        if by_date:
+            _FNG_CACHE["ts"] = now
+            _FNG_CACHE["by_date"] = by_date
+    except Exception:
+        if not _FNG_CACHE["by_date"]:
+            _FNG_CACHE["by_date"] = {}
+    return _FNG_CACHE["by_date"]
+
+def build_fng_series(candles: list) -> list:
+    by_date = fetch_fng_by_date()
+    out = []
+    for c in candles:
+        ct = int(c.get("close_time", c.get("open_time", c.get("t", 0))))
+        d = datetime.fromtimestamp(ct / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+        out.append(float(by_date.get(d, 50.0)))
+    return out
+
+def build_liquidity_series(candles: list, window: int) -> list:
+    vols = [float(c.get("v", c.get("volume", 0.0)) or 0.0) for c in candles]
+    win = max(5, int(window))
+    out = []
+    for i, v in enumerate(vols):
+        lo = max(0, i - win + 1)
+        chunk = vols[lo : i + 1]
+        mean = sum(chunk) / len(chunk)
+        var = sum((x - mean) ** 2 for x in chunk) / max(1, len(chunk))
+        std = math.sqrt(var)
+        z = (v - mean) / (std + 1e-12)
+        out.append(clamp01((z + 2.0) / 4.0))
+    return out
+
 def normalize3_safe(a: float, b: float, c: float):
     a = max(0.0, a)
     b = max(0.0, b)
@@ -413,11 +473,11 @@ def normalize3_clamped(a: float, b: float, c: float, min_w: float = WEIGHT_MIN, 
     return (a / s, b / s, c / s)
 
 def apply_weight_constraints(child: dict):
-    child["w_buy_rsi"], child["w_buy_macd"], child["w_buy_consec"] = normalize3_clamped(
-        child["w_buy_rsi"], child["w_buy_macd"], child["w_buy_consec"]
+    child["w_buy_rsi"], child["w_buy_macd"], child["w_buy_consec"], child["w_buy_fng"], child["w_buy_liq"] = normalize5(
+        child["w_buy_rsi"], child["w_buy_macd"], child["w_buy_consec"], child["w_buy_fng"], child["w_buy_liq"]
     )
-    child["w_sell_rsi"], child["w_sell_macd"], child["w_sell_consec"] = normalize3_clamped(
-        child["w_sell_rsi"], child["w_sell_macd"], child["w_sell_consec"]
+    child["w_sell_rsi"], child["w_sell_macd"], child["w_sell_consec"], child["w_sell_fng"], child["w_sell_liq"] = normalize5(
+        child["w_sell_rsi"], child["w_sell_macd"], child["w_sell_consec"], child["w_sell_fng"], child["w_sell_liq"]
     )
 
 def score_components_at_index(
@@ -434,9 +494,17 @@ def score_components_at_index(
     w_buy_rsi: float,
     w_buy_macd: float,
     w_buy_consec: float,
+    w_buy_fng: float = 0.0,
+    w_buy_liq: float = 0.0,
     w_sell_rsi: float,
     w_sell_macd: float,
     w_sell_consec: float,
+    w_sell_fng: float = 0.0,
+    w_sell_liq: float = 0.0,
+    fng_value: float = 50.0,
+    liq_value: float = 0.5,
+    fng_fear: float = 35.0,
+    fng_greed: float = 65.0,
 ) -> dict:
     """
     Ecuación (fuente de verdad):
@@ -456,12 +524,20 @@ def score_components_at_index(
     sell_macd = sell_macd_signal(mh, mh_prev, edge_trigger)
     buy_consec = consec_up(close[: i + 1], consec_green)
     sell_consec = consec_down(close[: i + 1], consec_red)
+    fng_val = float(fng_value)
+    fear = min(float(fng_fear), float(fng_greed) - 1e-6)
+    greed = max(float(fng_greed), fear + 1e-6)
+    buy_fng = clamp01((greed - fng_val) / (greed - fear))
+    sell_fng = clamp01((fng_val - fear) / (greed - fear))
+    liq = clamp01(liq_value)
+    buy_liq = liq if (i <= 0 or close[i] >= close[i - 1]) else 0.0
+    sell_liq = liq if (i <= 0 or close[i] <= close[i - 1]) else 0.0
 
-    wbr, wbm, wbc = normalize3(w_buy_rsi, w_buy_macd, w_buy_consec)
-    wsr, wsm, wsc = normalize3(w_sell_rsi, w_sell_macd, w_sell_consec)
+    wbr, wbm, wbc, wbf, wbl = normalize5(w_buy_rsi, w_buy_macd, w_buy_consec, w_buy_fng, w_buy_liq)
+    wsr, wsm, wsc, wsf, wsl = normalize5(w_sell_rsi, w_sell_macd, w_sell_consec, w_sell_fng, w_sell_liq)
 
-    buy_score = wbr * buy_rsi + wbm * buy_macd + wbc * buy_consec
-    sell_score = wsr * sell_rsi + wsm * sell_macd + wsc * sell_consec
+    buy_score = wbr * buy_rsi + wbm * buy_macd + wbc * buy_consec + wbf * buy_fng + wbl * buy_liq
+    sell_score = wsr * sell_rsi + wsm * sell_macd + wsc * sell_consec + wsf * sell_fng + wsl * sell_liq
 
     return {
         "buy_score": buy_score,
@@ -473,6 +549,10 @@ def score_components_at_index(
             "sell_rsi": sell_rsi,
             "sell_macd": sell_macd,
             "sell_consec": sell_consec,
+            "buy_fng": buy_fng,
+            "sell_fng": sell_fng,
+            "buy_liq": buy_liq,
+            "sell_liq": sell_liq,
         },
     }
 
@@ -490,6 +570,8 @@ def compute_score_snapshot_from_params(params: dict, candles: list, index: Optio
     rsi_period = int(params["rsi_period"])
     rsi_vals = rsi(close, rsi_period)
     hist = macd_hist(close, int(params["macd_fast"]), int(params["macd_slow"]), int(params["macd_signal"]))
+    fng_arr = build_fng_series(candles)
+    liq_arr = build_liquidity_series(candles, int(params.get("liq_window", 24)))
 
     idx = len(close) - 1 if index is None else int(index)
     payload = score_components_at_index(
@@ -505,9 +587,17 @@ def compute_score_snapshot_from_params(params: dict, candles: list, index: Optio
         w_buy_rsi=float(params["w_buy_rsi"]),
         w_buy_macd=float(params["w_buy_macd"]),
         w_buy_consec=float(params["w_buy_consec"]),
+        w_buy_fng=float(params.get("w_buy_fng", 0.0)),
+        w_buy_liq=float(params.get("w_buy_liq", 0.0)),
         w_sell_rsi=float(params["w_sell_rsi"]),
         w_sell_macd=float(params["w_sell_macd"]),
         w_sell_consec=float(params["w_sell_consec"]),
+        w_sell_fng=float(params.get("w_sell_fng", 0.0)),
+        w_sell_liq=float(params.get("w_sell_liq", 0.0)),
+        fng_value=float(fng_arr[idx]) if fng_arr else 50.0,
+        liq_value=float(liq_arr[idx]) if liq_arr else 0.5,
+        fng_fear=float(params.get("fng_fear", 35.0)),
+        fng_greed=float(params.get("fng_greed", 65.0)),
     )
     return payload, close[idx]
 
@@ -520,6 +610,8 @@ def compute_score_snapshot_from_genome(ge: "Genome", candles: list, index: Optio
     close = [c["close"] for c in data]
     rsi_arr = rsi(close, ge.rsi_period)
     mh_arr = macd_hist(close, ge.macd_fast, ge.macd_slow, ge.macd_signal)
+    fng_arr = build_fng_series(candles)
+    liq_arr = build_liquidity_series(candles, int(getattr(ge, "liq_window", 24)))
     idx = len(close) - 1 if index is None else int(index)
     payload = score_components_at_index(
         close,
@@ -534,9 +626,17 @@ def compute_score_snapshot_from_genome(ge: "Genome", candles: list, index: Optio
         w_buy_rsi=ge.w_buy_rsi,
         w_buy_macd=ge.w_buy_macd,
         w_buy_consec=ge.w_buy_consec,
+        w_buy_fng=getattr(ge, "w_buy_fng", 0.0),
+        w_buy_liq=getattr(ge, "w_buy_liq", 0.0),
         w_sell_rsi=ge.w_sell_rsi,
         w_sell_macd=ge.w_sell_macd,
         w_sell_consec=ge.w_sell_consec,
+        w_sell_fng=getattr(ge, "w_sell_fng", 0.0),
+        w_sell_liq=getattr(ge, "w_sell_liq", 0.0),
+        fng_value=float(fng_arr[idx]) if fng_arr else 50.0,
+        liq_value=float(liq_arr[idx]) if liq_arr else 0.5,
+        fng_fear=float(getattr(ge, "fng_fear", 35.0)),
+        fng_greed=float(getattr(ge, "fng_greed", 65.0)),
     )
     return payload, close[idx]
 
@@ -1888,9 +1988,16 @@ def tv_indicator_cache_key(params: dict) -> str:
         "w_buy_rsi",
         "w_buy_macd",
         "w_buy_consec",
+        "w_buy_fng",
+        "w_buy_liq",
         "w_sell_rsi",
         "w_sell_macd",
         "w_sell_consec",
+        "w_sell_fng",
+        "w_sell_liq",
+        "fng_fear",
+        "fng_greed",
+        "liq_window",
         "buy_th",
         "sell_th",
     ]
@@ -1918,16 +2025,24 @@ def tv_apply_indicator_cache(tv_df: pd.DataFrame, params: dict):
     )
     rsi_os = float(params.get("rsi_oversold", 30))
     rsi_ob = float(params.get("rsi_overbought", 70))
-    wbr, wbm, wbc = normalize3(
+    wbr, wbm, wbc, wbf, wbl = normalize5(
         float(params.get("w_buy_rsi", 1.0)),
         float(params.get("w_buy_macd", 1.0)),
         float(params.get("w_buy_consec", 1.0)),
+        float(params.get("w_buy_fng", 0.0)),
+        float(params.get("w_buy_liq", 0.0)),
     )
-    wsr, wsm, wsc = normalize3(
+    wsr, wsm, wsc, wsf, wsl = normalize5(
         float(params.get("w_sell_rsi", 1.0)),
         float(params.get("w_sell_macd", 1.0)),
         float(params.get("w_sell_consec", 1.0)),
+        float(params.get("w_sell_fng", 0.0)),
+        float(params.get("w_sell_liq", 0.0)),
     )
+    fng_fear = float(params.get("fng_fear", 35.0))
+    fng_greed = float(params.get("fng_greed", 65.0))
+    fng_arr = build_fng_series(tv_df_to_candles(tv_df, INTERVAL))
+    liq_arr = build_liquidity_series(tv_df_to_candles(tv_df, INTERVAL), int(params.get("liq_window", 24)))
     prev_close = tv_df["close"].shift(1)
     rsi_buy = (tv_df["rsi"] <= rsi_os).astype(float)
     rsi_sell = (tv_df["rsi"] >= rsi_ob).astype(float)
@@ -1935,8 +2050,16 @@ def tv_apply_indicator_cache(tv_df: pd.DataFrame, params: dict):
     macd_sell = (tv_df["macd_hist"] < 0).astype(float)
     consec_buy = (tv_df["close"] <= prev_close).astype(float)
     consec_sell = (tv_df["close"] >= prev_close).astype(float)
-    tv_df["buy_score"] = wbr * rsi_buy + wbm * macd_buy + wbc * consec_buy
-    tv_df["sell_score"] = wsr * rsi_sell + wsm * macd_sell + wsc * consec_sell
+    fear = min(fng_fear, fng_greed - 1e-6)
+    greed = max(fng_greed, fear + 1e-6)
+    fng_series = pd.Series(fng_arr, index=tv_df.index) if fng_arr else pd.Series([50.0] * len(tv_df), index=tv_df.index)
+    liq_series = pd.Series(liq_arr, index=tv_df.index) if liq_arr else pd.Series([0.5] * len(tv_df), index=tv_df.index)
+    buy_fng = ((greed - fng_series) / (greed - fear)).clip(0.0, 1.0)
+    sell_fng = ((fng_series - fear) / (greed - fear)).clip(0.0, 1.0)
+    buy_liq = liq_series.clip(0.0, 1.0) * (tv_df["close"] >= prev_close).astype(float)
+    sell_liq = liq_series.clip(0.0, 1.0) * (tv_df["close"] <= prev_close).astype(float)
+    tv_df["buy_score"] = wbr * rsi_buy + wbm * macd_buy + wbc * consec_buy + wbf * buy_fng + wbl * buy_liq
+    tv_df["sell_score"] = wsr * rsi_sell + wsm * macd_sell + wsc * consec_sell + wsf * sell_fng + wsl * sell_liq
     cache_key = tv_indicator_cache_key(params)
     tv_df["cache_key"] = cache_key
     return tv_df
@@ -2046,12 +2169,19 @@ class Genome:
     w_buy_rsi: float
     w_buy_macd: float
     w_buy_consec: float
+    w_buy_fng: float
+    w_buy_liq: float
     buy_th: float
 
     w_sell_rsi: float
     w_sell_macd: float
     w_sell_consec: float
+    w_sell_fng: float
+    w_sell_liq: float
     sell_th: float
+    fng_fear: float
+    fng_greed: float
+    liq_window: int
 
     take_profit: float
     stop_loss: float
@@ -2091,6 +2221,8 @@ class ParamSpace:
         apply_weight_constraints(g)
         if g["macd_slow"] <= g["macd_fast"]:
             g["macd_slow"] = min(self.spec["macd_slow"]["max"], g["macd_fast"] + 5)
+        if g["fng_greed"] <= g["fng_fear"]:
+            g["fng_greed"] = min(self.spec["fng_greed"]["max"], g["fng_fear"] + 5)
         return Genome(**g)
 
     def clamp_genome(self, ge: Genome):
@@ -2101,6 +2233,8 @@ class ParamSpace:
         apply_weight_constraints(d)
         if d["macd_slow"] <= d["macd_fast"]:
             d["macd_slow"] = min(self.spec["macd_slow"]["max"], d["macd_fast"] + 5)
+        if d["fng_greed"] <= d["fng_fear"]:
+            d["fng_greed"] = min(self.spec["fng_greed"]["max"], d["fng_fear"] + 5)
         return Genome(**d)
 
 
@@ -2172,6 +2306,8 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
         close_sig = [c["close"] for c in data]
         rsi_arr = rsi_wilder_series(close_sig, ge.rsi_period)
         mh_arr = macd_hist_series(close_sig, ge.macd_fast, ge.macd_slow, ge.macd_signal)
+    fng_arr = build_fng_series(candles)
+    liq_arr = build_liquidity_series(candles, int(getattr(ge, "liq_window", 24)))
 
     equity = 1.0
     peak = equity
@@ -2243,9 +2379,17 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
             w_buy_rsi=ge.w_buy_rsi,
             w_buy_macd=ge.w_buy_macd,
             w_buy_consec=ge.w_buy_consec,
+            w_buy_fng=getattr(ge, "w_buy_fng", 0.0),
+            w_buy_liq=getattr(ge, "w_buy_liq", 0.0),
             w_sell_rsi=ge.w_sell_rsi,
             w_sell_macd=ge.w_sell_macd,
             w_sell_consec=ge.w_sell_consec,
+            w_sell_fng=getattr(ge, "w_sell_fng", 0.0),
+            w_sell_liq=getattr(ge, "w_sell_liq", 0.0),
+            fng_value=float(fng_arr[i]) if fng_arr else 50.0,
+            liq_value=float(liq_arr[i]) if liq_arr else 0.5,
+            fng_fear=float(getattr(ge, "fng_fear", 35.0)),
+            fng_greed=float(getattr(ge, "fng_greed", 65.0)),
         )
         bs = payload["buy_score"]
         ss = payload["sell_score"]
@@ -2434,12 +2578,17 @@ PARAM_GENES = [
     "cooldown",
     "edge_trigger",
     "use_ha",
+    "fng_fear",
+    "fng_greed",
+    "liq_window",
 ]
 
-PARAM_BLOCKS = ["RSI", "MACD", "CONSEC", "RISK", "CONF"]
+PARAM_BLOCKS = ["RSI", "MACD", "CONSEC", "FNG", "LIQ", "RISK", "CONF"]
 WEIGHT_KEYS = [
     "w_buy_rsi", "w_buy_macd", "w_buy_consec",
+    "w_buy_fng", "w_buy_liq",
     "w_sell_rsi", "w_sell_macd", "w_sell_consec",
+    "w_sell_fng", "w_sell_liq",
 ]
 
 WEIGHT_MUT_RATE = 0.35
@@ -2449,6 +2598,8 @@ BLOCK_SELECTION_WEIGHTS = {
     "RSI": 1.0,
     "MACD": 1.4,
     "CONSEC": 1.0,
+    "FNG": 1.2,
+    "LIQ": 1.1,
     "RISK": 1.0,
     "CONF": 0.8,
 }
@@ -2462,10 +2613,12 @@ BLOCKS = {
     "RSI": ["rsi_period", "rsi_oversold", "rsi_overbought"],
     "MACD": ["macd_fast", "macd_slow", "macd_signal"],
     "CONSEC": ["consec_red", "consec_green"],
+    "FNG": ["fng_fear", "fng_greed"],
+    "LIQ": ["liq_window"],
     "RISK": ["take_profit", "stop_loss", "cooldown", "edge_trigger", "use_ha"],
     "WEIGHTS": [
-        "w_buy_rsi", "w_buy_macd", "w_buy_consec",
-        "w_sell_rsi", "w_sell_macd", "w_sell_consec",
+        "w_buy_rsi", "w_buy_macd", "w_buy_consec", "w_buy_fng", "w_buy_liq",
+        "w_sell_rsi", "w_sell_macd", "w_sell_consec", "w_sell_fng", "w_sell_liq",
     ],
     "CONF": ["buy_th", "sell_th"],
 }
@@ -2695,6 +2848,9 @@ def run_ga(
         macd_sig = format_gene(ge.macd_signal, "macd_signal" in mutated_genes, "d")
         consec_r = format_gene(ge.consec_red, "consec_red" in mutated_genes, "d")
         consec_g = format_gene(ge.consec_green, "consec_green" in mutated_genes, "d")
+        fng_fear = format_gene(ge.fng_fear, "fng_fear" in mutated_genes, ".0f")
+        fng_greed = format_gene(ge.fng_greed, "fng_greed" in mutated_genes, ".0f")
+        liq_window = format_gene(ge.liq_window, "liq_window" in mutated_genes, "d")
         tp = format_gene(ge.take_profit, "take_profit" in mutated_genes, ".3f")
         sl = format_gene(ge.stop_loss, "stop_loss" in mutated_genes, ".3f")
         cd = format_gene(ge.cooldown, "cooldown" in mutated_genes, "d")
@@ -2702,9 +2858,13 @@ def run_ga(
         wbr = format_gene(ge.w_buy_rsi, "w_buy_rsi" in mutated_genes, ".2f")
         wbm = format_gene(ge.w_buy_macd, "w_buy_macd" in mutated_genes, ".2f")
         wbc = format_gene(ge.w_buy_consec, "w_buy_consec" in mutated_genes, ".2f")
+        wbf = format_gene(ge.w_buy_fng, "w_buy_fng" in mutated_genes, ".2f")
+        wbl = format_gene(ge.w_buy_liq, "w_buy_liq" in mutated_genes, ".2f")
         wsr = format_gene(ge.w_sell_rsi, "w_sell_rsi" in mutated_genes, ".2f")
         wsm = format_gene(ge.w_sell_macd, "w_sell_macd" in mutated_genes, ".2f")
         wsc = format_gene(ge.w_sell_consec, "w_sell_consec" in mutated_genes, ".2f")
+        wsf = format_gene(ge.w_sell_fng, "w_sell_fng" in mutated_genes, ".2f")
+        wsl = format_gene(ge.w_sell_liq, "w_sell_liq" in mutated_genes, ".2f")
         buy_th = format_gene(ge.buy_th, "buy_th" in mutated_genes, ".2f")
         sell_th = format_gene(ge.sell_th, "sell_th" in mutated_genes, ".2f")
         return (
@@ -2712,8 +2872,10 @@ def run_ga(
             f"RSI(p={rsi_p},os={rsi_os},ob={rsi_ob}) "
             f"MACD({macd_f},{macd_s},{macd_sig}) "
             f"consec(R={consec_r},G={consec_g}) "
+            f"FNG(fear={fng_fear},greed={fng_greed}) "
+            f"LIQ(win={liq_window}) "
             f"TP={tp} SL={sl} cd={cd} edge={edge} "
-            f"Wbuy=({wbr},{wbm},{wbc}) Wsell=({wsr},{wsm},{wsc}) "
+            f"Wbuy=({wbr},{wbm},{wbc},{wbf},{wbl}) Wsell=({wsr},{wsm},{wsc},{wsf},{wsl}) "
             f"umbrales(buy={buy_th},sell={sell_th})"
         )
 
@@ -2831,10 +2993,11 @@ def run_ga(
                 f"HA={best_ge.use_ha} RSI(p={best_ge.rsi_period},os={best_ge.rsi_oversold:.0f},ob={best_ge.rsi_overbought:.0f}) | "
                 f"MACD({best_ge.macd_fast},{best_ge.macd_slow},{best_ge.macd_signal}) | "
                 f"consec(R={best_ge.consec_red},G={best_ge.consec_green}) | "
+                f"FNG(fear={best_ge.fng_fear:.0f},greed={best_ge.fng_greed:.0f}) LIQ(win={best_ge.liq_window}) | "
                 f"TP={best_ge.take_profit:.3f} SL={best_ge.stop_loss:.3f} cd={best_ge.cooldown} edge={best_ge.edge_trigger} | "
                 f"buy_th={best_ge.buy_th:.2f} sell_th={best_ge.sell_th:.2f} | "
-                f"Wbuy({best_ge.w_buy_rsi:.2f},{best_ge.w_buy_macd:.2f},{best_ge.w_buy_consec:.2f}) "
-                f"Wsell({best_ge.w_sell_rsi:.2f},{best_ge.w_sell_macd:.2f},{best_ge.w_sell_consec:.2f})"
+                f"Wbuy({best_ge.w_buy_rsi:.2f},{best_ge.w_buy_macd:.2f},{best_ge.w_buy_consec:.2f},{best_ge.w_buy_fng:.2f},{best_ge.w_buy_liq:.2f}) "
+                f"Wsell({best_ge.w_sell_rsi:.2f},{best_ge.w_sell_macd:.2f},{best_ge.w_sell_consec:.2f},{best_ge.w_sell_fng:.2f},{best_ge.w_sell_liq:.2f})"
             )
             log_fn(
                 f"[DBG] uniq={len(unique_hashes)} elite_unique={elite_unique} "
@@ -2982,7 +3145,7 @@ def run_ga(
                     for gene in meta["mutated_genes"]:
                         mutation_counter[gene] += 1
 
-            structural_blocks = {"RSI", "MACD", "CONSEC", "RISK"}
+            structural_blocks = {"RSI", "MACD", "CONSEC", "FNG", "LIQ", "RISK"}
             structural_mutated = any(block_counts[bn] > 0 for bn in structural_blocks)
 
             def log_individual(label: str, ge: Genome, meta: Optional[dict] = None):
@@ -3217,12 +3380,19 @@ class OptimizerGUI:
         sp.add("w_buy_rsi", 0.0, 1.0, 0.01, "float")
         sp.add("w_buy_macd", 0.0, 1.0, 0.01, "float")
         sp.add("w_buy_consec", 0.0, 1.0, 0.01, "float")
+        sp.add("w_buy_fng", 0.0, 1.0, 0.01, "float")
+        sp.add("w_buy_liq", 0.0, 1.0, 0.01, "float")
         sp.add("buy_th", 0.45, 0.85, 0.01, "float")
 
         sp.add("w_sell_rsi", 0.0, 1.0, 0.01, "float")
         sp.add("w_sell_macd", 0.0, 1.0, 0.01, "float")
         sp.add("w_sell_consec", 0.0, 1.0, 0.01, "float")
+        sp.add("w_sell_fng", 0.0, 1.0, 0.01, "float")
+        sp.add("w_sell_liq", 0.0, 1.0, 0.01, "float")
         sp.add("sell_th", 0.45, 0.85, 0.01, "float")
+        sp.add("fng_fear", 15.0, 45.0, 1.0, "float")
+        sp.add("fng_greed", 55.0, 85.0, 1.0, "float")
+        sp.add("liq_window", 8, 96, 1, "int")
 
         sp.add("take_profit", 0.01, 0.08, 0.001, "float")
         sp.add("stop_loss", 0.005, 0.06, 0.001, "float")
@@ -3352,11 +3522,18 @@ class OptimizerGUI:
             "w_buy_rsi": "Peso compra RSI",
             "w_buy_macd": "Peso compra MACD",
             "w_buy_consec": "Peso compra Consecutivas",
+            "w_buy_fng": "Peso compra Miedo/Codicia",
+            "w_buy_liq": "Peso compra Liquidez",
             "buy_th": "Umbral compra",
             "w_sell_rsi": "Peso venta RSI",
             "w_sell_macd": "Peso venta MACD",
             "w_sell_consec": "Peso venta Consecutivas",
+            "w_sell_fng": "Peso venta Miedo/Codicia",
+            "w_sell_liq": "Peso venta Liquidez",
             "sell_th": "Umbral venta",
+            "fng_fear": "FNG zona miedo",
+            "fng_greed": "FNG zona codicia",
+            "liq_window": "Liquidez ventana velas",
             "take_profit": "Take Profit",
             "stop_loss": "Stop Loss",
             "cooldown": "Cooldown (velas)",
