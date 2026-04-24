@@ -35,11 +35,18 @@ BEST_GEN = {
     "w_buy_rsi": 0.38,
     "w_buy_macd": 0.31,
     "w_buy_consec": 0.31,
+    "w_buy_fng": 0.0,
+    "w_buy_liq": 0.0,
     "buy_th": 0.55,
     "w_sell_rsi": 0.33,
     "w_sell_macd": 0.15,
     "w_sell_consec": 0.52,
+    "w_sell_fng": 0.0,
+    "w_sell_liq": 0.0,
     "sell_th": 0.60,
+    "fng_fear": 35.0,
+    "fng_greed": 65.0,
+    "liq_window": 24,
     "take_profit": 0.150,
     "stop_loss": 0.050,
     "cooldown": 11,
@@ -48,6 +55,8 @@ BEST_GEN = {
 
 INTERVAL = "1h"
 INTERVAL_MS = {"1h": 3_600_000}
+FNG_CACHE_TTL_SEC = 60 * 30
+_FNG_CACHE = {"ts": 0.0, "by_date": {}}
 
 
 def add_months(dt: datetime, months: int) -> datetime:
@@ -182,6 +191,60 @@ def normalize3(a: float, b: float, c: float) -> tuple[float, float, float]:
     if s <= 1e-12:
         return (1 / 3, 1 / 3, 1 / 3)
     return (a / s, b / s, c / s)
+
+
+def normalize5(a: float, b: float, c: float, d: float, e: float) -> tuple[float, float, float, float, float]:
+    vals = [max(0.0, float(x)) for x in (a, b, c, d, e)]
+    s = sum(vals)
+    if s <= 1e-12:
+        return (0.2, 0.2, 0.2, 0.2, 0.2)
+    return tuple(v / s for v in vals)
+
+
+def fetch_fng_by_date() -> dict[str, float]:
+    now = time.time()
+    if (now - _FNG_CACHE["ts"]) < FNG_CACHE_TTL_SEC and _FNG_CACHE["by_date"]:
+        return _FNG_CACHE["by_date"]
+    try:
+        with urlopen("https://api.alternative.me/fng/?limit=0&format=json", timeout=12) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        by_date = {}
+        for row in payload.get("data", []):
+            ts = int(row.get("timestamp", 0))
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+            by_date[dt] = float(row.get("value", 50.0))
+        if by_date:
+            _FNG_CACHE["ts"] = now
+            _FNG_CACHE["by_date"] = by_date
+    except Exception:
+        if not _FNG_CACHE["by_date"]:
+            _FNG_CACHE["by_date"] = {}
+    return _FNG_CACHE["by_date"]
+
+
+def build_fng_series(candles: list[dict]) -> list[float]:
+    by_date = fetch_fng_by_date()
+    out: list[float] = []
+    for c in candles:
+        ct = int(c.get("close_time", c.get("open_time", 0)))
+        d = datetime.fromtimestamp(ct / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+        out.append(float(by_date.get(d, 50.0)))
+    return out
+
+
+def build_liquidity_series(candles: list[dict], window: int) -> list[float]:
+    vols = [float(c.get("v", c.get("volume", 0.0)) or 0.0) for c in candles]
+    win = max(5, int(window))
+    out: list[float] = []
+    for i, v in enumerate(vols):
+        lo = max(0, i - win + 1)
+        chunk = vols[lo : i + 1]
+        mean = sum(chunk) / len(chunk)
+        var = sum((x - mean) ** 2 for x in chunk) / max(1, len(chunk))
+        std = math.sqrt(var)
+        z = (v - mean) / (std + 1e-12)
+        out.append(clamp01((z + 2.0) / 4.0))
+    return out
 
 
 def is_candle_closed(close_time_ms: int, server_time_ms: int, interval_ms: int) -> bool:
@@ -702,9 +765,25 @@ class TradingDashboard(tk.Tk):
         close = [float(c["close"]) for c in src]
         rsi_arr = rsi(close, int(self.params["rsi_period"]))
         mh_arr = macd_hist(close, int(self.params["macd_fast"]), int(self.params["macd_slow"]), int(self.params["macd_signal"]))
+        fng_arr = build_fng_series(candles)
+        liq_arr = build_liquidity_series(candles, int(self.params.get("liq_window", 24)))
 
-        wbr, wbm, wbc = normalize3(float(self.params["w_buy_rsi"]), float(self.params["w_buy_macd"]), float(self.params["w_buy_consec"]))
-        wsr, wsm, wsc = normalize3(float(self.params["w_sell_rsi"]), float(self.params["w_sell_macd"]), float(self.params["w_sell_consec"]))
+        wbr, wbm, wbc, wbf, wbl = normalize5(
+            float(self.params["w_buy_rsi"]),
+            float(self.params["w_buy_macd"]),
+            float(self.params["w_buy_consec"]),
+            float(self.params.get("w_buy_fng", 0.0)),
+            float(self.params.get("w_buy_liq", 0.0)),
+        )
+        wsr, wsm, wsc, wsf, wsl = normalize5(
+            float(self.params["w_sell_rsi"]),
+            float(self.params["w_sell_macd"]),
+            float(self.params["w_sell_consec"]),
+            float(self.params.get("w_sell_fng", 0.0)),
+            float(self.params.get("w_sell_liq", 0.0)),
+        )
+        fear = min(float(self.params.get("fng_fear", 35.0)), float(self.params.get("fng_greed", 65.0)) - 1e-6)
+        greed = max(float(self.params.get("fng_greed", 65.0)), fear + 1e-6)
 
         capital = float(self.initial_equity)
         qty = 0.0
@@ -717,15 +796,25 @@ class TradingDashboard(tk.Tk):
         for i in range(len(src)):
             px = float(src[i]["close"])
             mh_prev = mh_arr[i - 1] if i > 0 else mh_arr[i]
+            fng_val = float(fng_arr[i]) if fng_arr else 50.0
+            liq_val = float(liq_arr[i]) if liq_arr else 0.5
+            buy_fng = clamp01((greed - fng_val) / (greed - fear))
+            sell_fng = clamp01((fng_val - fear) / (greed - fear))
+            buy_liq = liq_val if (i <= 0 or close[i] >= close[i - 1]) else 0.0
+            sell_liq = liq_val if (i <= 0 or close[i] <= close[i - 1]) else 0.0
             buy_score = (
                 wbr * buy_rsi_signal(rsi_arr[i], float(self.params["rsi_oversold"]), float(self.params["rsi_overbought"]))
                 + wbm * buy_macd_signal(mh_arr[i], mh_prev, int(self.params["edge_trigger"]))
                 + wbc * consec_up(close[: i + 1], int(self.params["consec_green"]))
+                + wbf * buy_fng
+                + wbl * buy_liq
             )
             sell_score = (
                 wsr * sell_rsi_signal(rsi_arr[i], float(self.params["rsi_oversold"]), float(self.params["rsi_overbought"]))
                 + wsm * sell_macd_signal(mh_arr[i], mh_prev, int(self.params["edge_trigger"]))
                 + wsc * consec_down(close[: i + 1], int(self.params["consec_red"]))
+                + wsf * sell_fng
+                + wsl * sell_liq
             )
 
             if not in_pos and buy_score >= float(self.params["buy_th"]) and (i - last_buy_idx) >= int(self.params["cooldown"]):
