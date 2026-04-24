@@ -952,18 +952,8 @@ class TradingDashboard(tk.Tk):
         tab_bot.grid_columnconfigure(0, weight=1)
 
         self.embedded_bot_gui = None
-        # Intentamos incrustar el BotGUI real de bot.py (igual que en el optimizador original).
-        try:
-            bot_mod = _import_bot_module_from_candidates()
-            if bot_mod and hasattr(bot_mod, "BotGUI"):
-                host = ttk.Frame(tab_bot)
-                host.grid(row=0, column=0, sticky="nsew")
-                self.embedded_bot_gui = bot_mod.BotGUI(host)
-                return
-        except Exception as exc:
-            self._set_error(f"No se pudo incrustar BotGUI real: {exc}")
-
-        # Fallback: panel simplificado (si no existe BotGUI en bot.py)
+        # Panel integrado: evita abrir/renderizar la UI completa de bot.py dentro de esta app.
+        # La ejecución sigue usando las APIs de bot.py (adapter) cuando están disponibles.
         tab_bot.grid_rowconfigure(2, weight=1)
         bot_top = ttk.LabelFrame(tab_bot, text="Control Bot Spot (Long Only)", padding=10)
         bot_top.grid(row=0, column=0, sticky="ew", pady=(0, 8))
@@ -975,6 +965,10 @@ class TradingDashboard(tk.Tk):
         self.btn_bot_pause.pack(side="left", padx=4)
         self.btn_bot_stop.pack(side="left", padx=4)
         self.btn_bot_recalc.pack(side="left", padx=4)
+        ttk.Label(
+            bot_top,
+            text="Motor integrado (usa bot.py por API). Compra 90% USDT y vende 100% SOL cuando cierra.",
+        ).pack(side="left", padx=10)
 
         bot_info = ttk.Frame(tab_bot)
         bot_info.grid(row=1, column=0, sticky="ew", pady=(0, 8))

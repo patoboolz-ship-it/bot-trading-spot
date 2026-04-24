@@ -62,8 +62,8 @@ INTERVAL = "1h"
 LOOKBACK = 800  # para indicadores, 800 suele sobrar (MACD lento 83)
 
 # Ordenes
-USE_98_PERCENT = True
-ORDER_PCT = 0.98  # 98% del USDT libre
+USE_98_PERCENT = False
+ORDER_PCT = 0.90  # 90% del USDT libre para entradas automáticas
 MIN_FILL_RATIO = 0.90  # verificación: gastado >= 90% de objetivo
 MAX_RETRY_BUY = 2       # reintentos si quedó muy parcial
 RETRY_SLEEP_SEC = 2
@@ -1245,6 +1245,22 @@ class SpotBot:
             sell_trade.pnl_usdt_real = pnl_usdt_real
             self.closed_trades.append(sell_trade)
             self._append_journal(sell_trade)
+            self._emit("log", {"msg": f"[CLOSE] {reason} qty={sell_trade.qty:.6f} price={sell_trade.price:.4f} pnl={sell_trade.pnl_pct_real*100:.2f}% ({sell_trade.pnl_usdt_real:.4f} USDT)"})
+            for retry_idx in range(2):
+                rem = round_step(get_free_balance(self.client, BASE_ASSET), self.step)
+                if rem <= 0:
+                    break
+                self._emit("log", {"msg": f"[CLOSE] remanente detectado {rem:.6f} {BASE_ASSET}, reintento #{retry_idx + 1}"})
+                dust_trade = self._place_market_sell_qty(rem, reason=f"{reason}_CLEANUP")
+                if not dust_trade:
+                    break
+            rem_final = round_step(get_free_balance(self.client, BASE_ASSET), self.step)
+            if rem_final > 0:
+                self._emit("log", {"msg": f"[CLOSE] quedó remanente no vendible: {rem_final:.6f} {BASE_ASSET} (dust/minNotional)."})
+            else:
+                self._emit("log", {"msg": f"[CLOSE] verificación OK: 0 {BASE_ASSET} libre tras cierre."})
+        else:
+            self._emit("log", {"msg": f"[CLOSE] Falló venta de cierre ({reason})."})
 
         self.position = None
         self.last_action_bar_close_time = last_close_time_ms
@@ -1331,7 +1347,7 @@ class SpotBot:
                         self._emit("log", {"msg": "[BUY] USDT libre = 0, no compro"})
                         continue
 
-                    target = usdt_free * ORDER_PCT if USE_98_PERCENT else usdt_free
+                    target = usdt_free * ORDER_PCT
                     target = float(target)
 
                     # Verificación y reintento si llenó poco
