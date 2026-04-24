@@ -136,6 +136,7 @@ DEFAULT_GEN = {
   "cooldown": 11,
   "edge_trigger": 0
 }
+OPTIMIZER_BEST_PATH = "optimizer_best_gen.json"
 
 
 # =========================
@@ -1404,6 +1405,7 @@ class BotGUI:
         ttk.Button(btns, text="Iniciar", command=self.start).pack(side="left", padx=5)
         ttk.Button(btns, text="Detener", command=self.stop).pack(side="left", padx=5)
         ttk.Button(btns, text="Exportar Excel", command=self.export_excel).pack(side="left", padx=5)
+        ttk.Button(btns, text="Cargar mejor optimizador", command=self.load_optimizer_best).pack(side="right", padx=5)
         ttk.Button(btns, text="Cargar GEN235", command=self.load_gen235).pack(side="right")
 
         # Params quick view
@@ -1672,6 +1674,22 @@ class BotGUI:
         self.params = DEFAULT_GEN.copy()
         self._refresh_params_box()
         self.log("[OK] GEN235 cargado en parámetros.")
+
+    def load_optimizer_best(self):
+        try:
+            if not os.path.exists(OPTIMIZER_BEST_PATH):
+                messagebox.showwarning("Aviso", f"No existe {OPTIMIZER_BEST_PATH}. Ejecuta el optimizador primero.")
+                return
+            with open(OPTIMIZER_BEST_PATH, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            params = payload.get("params")
+            if not isinstance(params, dict) or not params:
+                raise ValueError(f"Archivo inválido: falta 'params' en {OPTIMIZER_BEST_PATH}")
+            self.set_params(params, log_msg=f"[OK] Parámetros cargados desde {OPTIMIZER_BEST_PATH}.")
+            if "metrics" in payload:
+                self.log(f"[INFO] Métricas mejor GEN: {json.dumps(payload['metrics'], ensure_ascii=False)}")
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo cargar {OPTIMIZER_BEST_PATH}:\n{e}")
 
     def set_params(self, params: dict, log_msg: Optional[str] = None):
         self.params = params.copy()
@@ -3154,6 +3172,33 @@ class OptimizerGUI:
         self.space = self.build_space_defaults()
         self.build_ui()
 
+    def _persist_best_result(self):
+        if not self.best_genome:
+            return
+        metrics_payload = None
+        if self.best_metrics is not None:
+            metrics_payload = {
+                "score": float(getattr(self.best_metrics, "score", 0.0)),
+                "pf": float(getattr(self.best_metrics, "pf", 0.0)),
+                "trades": int(getattr(self.best_metrics, "trades", 0)),
+                "trades_per_year": float(getattr(self.best_metrics, "trades_per_year", 0.0)),
+                "dd_pct": float(getattr(self.best_metrics, "dd_pct", 0.0)),
+                "net": float(getattr(self.best_metrics, "net", 0.0)),
+                "profit": float(getattr(self.best_metrics, "profit", 0.0)),
+                "balance": float(getattr(self.best_metrics, "balance", 0.0)),
+                "winrate": float(getattr(self.best_metrics, "winrate", 0.0)),
+            }
+        payload = {
+            "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+            "symbol": self.var_symbol.get().strip().upper(),
+            "interval": self.var_tf.get().strip(),
+            "params": asdict(self.best_genome),
+            "metrics": metrics_payload,
+        }
+        with open(OPTIMIZER_BEST_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        self.root.after(0, self.log, f"[OK] Mejor GEN guardado en {OPTIMIZER_BEST_PATH}.")
+
     def build_space_defaults(self):
         sp = ParamSpace()
         sp.add("use_ha", 0, 1, 1, "int")
@@ -3667,6 +3712,7 @@ class OptimizerGUI:
                     if self.best_genome:
                         self.root.after(0, self.log, "[FIN] Mejor encontrado:")
                         self.root.after(0, self.log, json.dumps(asdict(self.best_genome), indent=2, ensure_ascii=False))
+                        self._persist_best_result()
                 except Exception as e:
                     print("[ERROR] OptimizerGUI.start failure:", flush=True)
                     print(traceback.format_exc(), flush=True)
@@ -3718,6 +3764,7 @@ class OptimizerGUI:
             return
         params = asdict(self.best_genome)
         self.apply_callback(params)
+        self._persist_best_result()
         self.log("[OK] Parámetros aplicados al Bot.")
 
 
