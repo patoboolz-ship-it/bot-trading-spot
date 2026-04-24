@@ -1,5 +1,6 @@
 import importlib
 import importlib.util
+import json
 import math
 import queue
 import threading
@@ -11,6 +12,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tkinter import filedialog, ttk
 from typing import Any, Callable, Optional
+from urllib.parse import urlencode
+from urllib.request import urlopen
 
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from matplotlib.figure import Figure
@@ -443,12 +446,16 @@ class TradingDashboard(tk.Tk):
         self.strategy_ops: list[SimOp] = []
         self.strategy_equity_curve: list[tuple[int, float]] = []
         self.period_rows: list[dict[str, Any]] = []
+        self.fng_rows: list[dict[str, Any]] = []
         self.active_candles: list[dict[str, Any]] = []
 
         self.date_from_var = tk.StringVar(value="")
         self.date_to_var = tk.StringVar(value="")
+        self.fng_from_var = tk.StringVar(value="")
+        self.fng_to_var = tk.StringVar(value="")
         self.range_locked = False
         self.range_loading = False
+        self.fng_loading = False
         self.selected_start_ms: Optional[int] = None
         self.selected_end_ms: Optional[int] = None
         self.chart_segments: list[tuple[int, int]] = []
@@ -542,6 +549,7 @@ class TradingDashboard(tk.Tk):
         tab_dash = self._make_scrollable_tab("Dashboard 1H")
         tab_perf = self._make_scrollable_tab("Rentabilidades")
         tab_bot = self._make_scrollable_tab("Bot")
+        tab_fng = self._make_scrollable_tab("Miedo y Codicia")
 
         tab_dash.grid_rowconfigure(0, weight=1)
         tab_dash.grid_columnconfigure(0, weight=4)
@@ -615,6 +623,7 @@ class TradingDashboard(tk.Tk):
 
         # Tab BOT integrado con el bot real (si está disponible)
         self._build_bot_tab(tab_bot)
+        self._build_fng_tab(tab_fng)
 
         bottom = ttk.Frame(self, padding=8)
         bottom.grid(row=2, column=0, sticky="ew")
@@ -893,6 +902,155 @@ class TradingDashboard(tk.Tk):
         bot_ops_frame.grid_columnconfigure(0, weight=1)
         self.bot_ops_listbox = tk.Listbox(bot_ops_frame, font=("Consolas", 10))
         self.bot_ops_listbox.grid(row=0, column=0, sticky="nsew")
+
+    def _build_fng_tab(self, tab_fng: ttk.Frame) -> None:
+        tab_fng.grid_rowconfigure(1, weight=1)
+        tab_fng.grid_rowconfigure(2, weight=2)
+        tab_fng.grid_columnconfigure(0, weight=1)
+
+        filters = ttk.LabelFrame(tab_fng, text="Fear & Greed (alternative.me)", padding=8)
+        filters.grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        ttk.Label(filters, text="Desde (YYYY-MM-DD):").pack(side="left", padx=(2, 4))
+        ttk.Entry(filters, textvariable=self.fng_from_var, width=14).pack(side="left", padx=(0, 8))
+        ttk.Label(filters, text="Hasta (YYYY-MM-DD):").pack(side="left", padx=(2, 4))
+        ttk.Entry(filters, textvariable=self.fng_to_var, width=14).pack(side="left", padx=(0, 8))
+        self.btn_fng_fetch = ttk.Button(filters, text="Descargar Índice", command=self.fetch_fng_data)
+        self.btn_fng_fetch.pack(side="left", padx=4)
+        ttk.Button(filters, text="Exportar Excel/CSV", command=self.export_fng_data).pack(side="left", padx=4)
+
+        table_frame = ttk.LabelFrame(tab_fng, text="Historial", padding=8)
+        table_frame.grid(row=1, column=0, sticky="nsew")
+        table_frame.grid_rowconfigure(0, weight=1)
+        table_frame.grid_columnconfigure(0, weight=1)
+        self.fng_table = ttk.Treeview(
+            table_frame,
+            columns=("fecha", "valor", "estado"),
+            show="headings",
+            height=10,
+        )
+        for col, width in [("fecha", 120), ("valor", 80), ("estado", 200)]:
+            self.fng_table.heading(col, text=col.upper())
+            self.fng_table.column(col, width=width, anchor="center" if col != "estado" else "w")
+        self.fng_table.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(table_frame, orient="vertical", command=self.fng_table.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        self.fng_table.configure(yscrollcommand=scroll.set)
+
+        chart_frame = ttk.LabelFrame(tab_fng, text="Gráfico Fear & Greed", padding=8)
+        chart_frame.grid(row=2, column=0, sticky="nsew", pady=(8, 0))
+        chart_frame.grid_rowconfigure(0, weight=1)
+        chart_frame.grid_columnconfigure(0, weight=1)
+        self.figure_fng = Figure(figsize=(9.0, 3.8), dpi=100)
+        self.ax_fng = self.figure_fng.add_subplot(111)
+        self.canvas_fng = FigureCanvasTkAgg(self.figure_fng, master=chart_frame)
+        self.canvas_fng.get_tk_widget().grid(row=0, column=0, sticky="nsew")
+
+    def _parse_ymd(self, raw: str) -> Optional[datetime]:
+        text = (raw or "").strip()
+        if not text:
+            return None
+        return datetime.strptime(text, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+
+    def fetch_fng_data(self) -> None:
+        if self.fng_loading:
+            self._set_error("Fear & Greed: descarga en curso...")
+            return
+        try:
+            start_dt = self._parse_ymd(self.fng_from_var.get())
+            end_dt = self._parse_ymd(self.fng_to_var.get())
+        except ValueError:
+            self._set_error("Fear & Greed: formato inválido. Usa YYYY-MM-DD.")
+            return
+        if start_dt and end_dt and start_dt > end_dt:
+            self._set_error("Fear & Greed: fecha inicio > fecha fin.")
+            return
+
+        self.fng_loading = True
+        self.btn_fng_fetch.config(state="disabled")
+        self._set_error("Fear & Greed: descargando historial...")
+
+        def worker() -> None:
+            try:
+                rows = self._fetch_fng_history(start_dt, end_dt)
+                self._ui_queue.put({"kind": "fng_loaded", "rows": rows})
+            except Exception:
+                self._ui_queue.put({"kind": "error", "message": f"Fear & Greed error:\n{traceback.format_exc(limit=2)}"})
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _fetch_fng_history(self, start_dt: Optional[datetime], end_dt: Optional[datetime]) -> list[dict[str, Any]]:
+        qs = urlencode({"limit": 0, "format": "json"})
+        with urlopen(f"https://api.alternative.me/fng/?{qs}", timeout=15) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        rows = []
+        for item in payload.get("data", []):
+            dt = datetime.fromtimestamp(int(item["timestamp"]), tz=timezone.utc)
+            if start_dt and dt < start_dt:
+                continue
+            if end_dt and dt > end_dt + timedelta(days=1):
+                continue
+            rows.append(
+                {
+                    "fecha": dt.strftime("%Y-%m-%d"),
+                    "valor": int(item["value"]),
+                    "estado": item.get("value_classification", ""),
+                }
+            )
+        rows.sort(key=lambda r: r["fecha"])
+        return rows
+
+    def _render_fng(self) -> None:
+        for iid in self.fng_table.get_children():
+            self.fng_table.delete(iid)
+        for row in self.fng_rows:
+            self.fng_table.insert("", tk.END, values=(row["fecha"], row["valor"], row["estado"]))
+
+        self.ax_fng.clear()
+        if self.fng_rows:
+            x = list(range(len(self.fng_rows)))
+            y = [int(r["valor"]) for r in self.fng_rows]
+            self.ax_fng.plot(x, y, linewidth=1.8, color="#3949ab")
+            for lvl in (25, 50, 75):
+                self.ax_fng.axhline(lvl, linestyle="--", linewidth=0.8, alpha=0.7, color="#546e7a")
+            ticks = sorted(set([0, len(x) // 3, (2 * len(x)) // 3, len(x) - 1]))
+            labels = [self.fng_rows[i]["fecha"] for i in ticks]
+            self.ax_fng.set_xticks(ticks)
+            self.ax_fng.set_xticklabels(labels, rotation=25, ha="right", fontsize=8)
+            self.ax_fng.set_ylim(0, 100)
+            self.ax_fng.set_ylabel("Valor 0-100")
+            self.ax_fng.set_title("Crypto Fear & Greed Index")
+            self.ax_fng.grid(alpha=0.2)
+        self.canvas_fng.draw_idle()
+
+    def export_fng_data(self) -> None:
+        if not self.fng_rows:
+            self._set_error("Fear & Greed: no hay datos para exportar.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Exportar Fear & Greed",
+            defaultextension=".xlsx",
+            filetypes=[("Excel", "*.xlsx"), ("CSV", "*.csv")],
+        )
+        if not path:
+            return
+        try:
+            import pandas as pd
+
+            pd.DataFrame(self.fng_rows).to_excel(path, index=False)
+            png = str(Path(path).with_suffix(".png"))
+            self.figure_fng.savefig(png, dpi=180, bbox_inches="tight")
+            self._set_error(f"Fear & Greed exportado: {path} y {png}")
+        except Exception:
+            import csv
+
+            out_csv = str(Path(path).with_suffix(".csv"))
+            with open(out_csv, "w", newline="", encoding="utf-8") as f:
+                w = csv.DictWriter(f, fieldnames=list(self.fng_rows[0].keys()))
+                w.writeheader()
+                w.writerows(self.fng_rows)
+            png = str(Path(path).with_suffix(".png"))
+            self.figure_fng.savefig(png, dpi=180, bbox_inches="tight")
+            self._set_error(f"Fear & Greed exportado CSV: {out_csv} y {png}")
 
     def _refresh_bot_tab(self) -> None:
         if getattr(self, "embedded_bot_gui", None) is not None:
@@ -1228,10 +1386,22 @@ class TradingDashboard(tk.Tk):
                         self.selected_end_ms = int(payload["end_ms"])
                         self._recompute_strategy_views()
                         self._save_current_range_chart()
+                elif payload["kind"] == "fng_loaded":
+                    self.fng_loading = False
+                    self.btn_fng_fetch.config(state="normal")
+                    self.fng_rows = payload.get("rows", [])
+                    self._render_fng()
+                    if self.fng_rows:
+                        self._set_error(f"Fear & Greed: {len(self.fng_rows)} filas cargadas.")
+                    else:
+                        self._set_error("Fear & Greed: no hay datos para ese rango.")
                 else:
                     self.range_loading = False
                     self.btn_apply_range.config(state="normal")
                     self.btn_recalc.config(state="normal")
+                    if self.fng_loading:
+                        self.fng_loading = False
+                        self.btn_fng_fetch.config(state="normal")
                     self._set_error(payload["message"])
         except queue.Empty:
             pass
