@@ -23,33 +23,33 @@ API_KEY_PATH = r"C:\Users\EQCONF\Documents\programas python\claves\bot trading\C
 API_SECRET_PATH = r"C:\Users\EQCONF\Documents\programas python\claves\bot trading\Clave secreta.txt"
 
 BEST_GEN = {
-    "use_ha": 0,
+    "use_ha": 1,
     "rsi_period": 18,
-    "rsi_oversold": 30.0,
-    "rsi_overbought": 71.0,
-    "macd_fast": 9,
-    "macd_slow": 146,
-    "macd_signal": 27,
-    "consec_red": 3,
-    "consec_green": 5,
-    "w_buy_rsi": 0.38,
-    "w_buy_macd": 0.31,
-    "w_buy_consec": 0.31,
-    "w_buy_fng": 0.0,
-    "w_buy_liq": 0.0,
-    "buy_th": 0.55,
-    "w_sell_rsi": 0.33,
-    "w_sell_macd": 0.15,
-    "w_sell_consec": 0.52,
-    "w_sell_fng": 0.0,
-    "w_sell_liq": 0.0,
-    "sell_th": 0.60,
-    "fng_fear": 35.0,
-    "fng_greed": 65.0,
-    "liq_window": 24,
-    "take_profit": 0.150,
-    "stop_loss": 0.050,
-    "cooldown": 11,
+    "rsi_oversold": 9.0,
+    "rsi_overbought": 82.0,
+    "macd_fast": 48,
+    "macd_slow": 73,
+    "macd_signal": 35,
+    "consec_red": 2,
+    "consec_green": 1,
+    "w_buy_rsi": 0.28,
+    "w_buy_macd": 0.08,
+    "w_buy_consec": 0.08,
+    "w_buy_fng": 0.05,
+    "w_buy_liq": 0.51,
+    "buy_th": 0.72,
+    "w_sell_rsi": 0.16129032258064516,
+    "w_sell_macd": 0.21505376344086025,
+    "w_sell_consec": 0.12903225806451613,
+    "w_sell_fng": 0.10752688172043012,
+    "w_sell_liq": 0.3870967741935484,
+    "sell_th": 0.65,
+    "fng_fear": 17.0,
+    "fng_greed": 82.0,
+    "liq_window": 75,
+    "take_profit": 0.04,
+    "stop_loss": 0.01,
+    "cooldown": 6,
     "edge_trigger": 0,
 }
 
@@ -377,6 +377,9 @@ class _BotModuleAdapter:
         self._bot = None
         self._params = getattr(bot_mod, "DEFAULT_GEN", {}).copy() if hasattr(bot_mod, "DEFAULT_GEN") else BEST_GEN.copy()
 
+    def set_params(self, params: dict[str, Any]):
+        self._params = dict(params or {})
+
     def _build_client(self):
         key_path = getattr(self.bot_mod, "API_KEY_PATH", API_KEY_PATH)
         sec_path = getattr(self.bot_mod, "API_SECRET_PATH", API_SECRET_PATH)
@@ -573,6 +576,7 @@ class TradingDashboard(tk.Tk):
                 "start_bot": adapter.start_bot,
                 "pause_bot": adapter.pause_bot,
                 "stop_bot": adapter.stop_bot,
+                "set_params": adapter.set_params,
             }, "bot_adapter"
 
         fb = _BinancePublicFallbackAPI(self.symbol)
@@ -1610,6 +1614,8 @@ class TradingDashboard(tk.Tk):
 
     def start_bot(self) -> None:
         try:
+            if "set_params" in self._api and callable(self._api["set_params"]):
+                self._api["set_params"](self.params)
             self._api["start_bot"]()
             self.bot_running = True
             self.status_text = "RUNNING"

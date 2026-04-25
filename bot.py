@@ -1490,8 +1490,18 @@ class SpotBot:
                 next_state = self.get_strategy_state(candles)
                 self.current_state = next_state
                 self._emit("log", {"msg": f"[STATE] estado={next_state} | último_operado={self.last_operated_state}"})
+                prev_sig = self._last_wallet_signature
                 wallet_now = self.sync_wallet(remember=False)
                 wallet_sig = (round(wallet_now["usdt_free"], 8), round(wallet_now["sol_free"], 8))
+                usdt_now = float(wallet_now["usdt_free"])
+                sol_now = float(wallet_now["sol_free"])
+                usdt_prev = float(prev_sig[0]) if prev_sig else 0.0
+                sol_prev = float(prev_sig[1]) if prev_sig else 0.0
+                sol_value_now = sol_now * float(spot_price)
+                same_state_external_refill = (
+                    (next_state == "VENTA" and sol_now > (sol_prev + 1e-9) and sol_value_now >= MIN_TRADE_VALUE_USDT)
+                    or (next_state == "COMPRA" and usdt_now > (usdt_prev + 1e-9) and usdt_now >= MIN_TRADE_VALUE_USDT)
+                )
                 if (
                     self.last_result == "NO_EJECUTABLE"
                     and self.last_action == next_state
@@ -1499,9 +1509,11 @@ class SpotBot:
                 ):
                     self._emit("log", {"msg": f"[STATE] {next_state} no ejecutable y saldo sin cambios; no repito en bucle."})
                     continue
-                if self.last_operated_state == next_state:
+                if self.last_operated_state == next_state and not same_state_external_refill:
                     self._emit("log", {"msg": f"[STATE] Ya ejecutado en estado {next_state}; esperando cambio de estado."})
                     continue
+                if self.last_operated_state == next_state and same_state_external_refill:
+                    self._emit("log", {"msg": f"[STATE] Detecté cambio manual de cartera en estado {next_state}; re-ejecuto acción."})
 
                 if next_state == "COMPRA":
                     self.buy_all_usdt()
