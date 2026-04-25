@@ -63,10 +63,12 @@ LOOKBACK = 800  # para indicadores, 800 suele sobrar (MACD lento 83)
 
 # Ordenes
 USE_98_PERCENT = False
-ORDER_PCT = 0.90  # 90% del USDT libre para entradas automáticas
+ORDER_PCT = 1.00  # COMPRA: 100% del USDT libre
+SELL_PCT = 0.90   # VENTA: 90% del SOL libre (dejar 10% holdeado)
 MIN_FILL_RATIO = 0.90  # verificación: gastado >= 90% de objetivo
 MAX_RETRY_BUY = 2       # reintentos si quedó muy parcial
 RETRY_SLEEP_SEC = 2
+MIN_TRADE_VALUE_USDT = 1.0
 
 # Ejecutar real o simulación
 DRY_RUN = True
@@ -735,6 +737,9 @@ def round_step(qty: float, step: float) -> float:
         return qty
     return math.floor(qty / step) * step
 
+def round_step_size(qty: float, step: float) -> float:
+    return round_step(qty, step)
+
 def get_filters(client: Client, symbol: str):
     info = client.get_symbol_info(symbol)
     if not info:
@@ -759,6 +764,12 @@ def get_free_balance(client: Client, asset: str) -> float:
     if not bal:
         return 0.0
     return float(bal["free"])
+
+def get_price(client: Client, symbol: str) -> float:
+    return float(client.get_symbol_ticker(symbol=symbol)["price"])
+
+def check_min_notional(qty: float, price: float, min_notional: float) -> bool:
+    return (float(qty) * float(price)) >= max(float(min_notional or 0.0), MIN_TRADE_VALUE_USDT)
 
 def get_spot_balances(client: Client) -> list[dict]:
     account = client.get_account()
@@ -824,6 +835,13 @@ class SpotBot:
 
         self.position: Position | None = None
         self.last_action_bar_close_time = None  # cooldown por vela cerrada
+        self.current_state = "COMPRA"
+        self.last_operated_state: Optional[str] = None
+        self.last_action: str = "-"
+        self.last_result: str = "-"
+        self.last_error: str = "-"
+        self.last_action_ts_utc: str = "-"
+        self._last_wallet_signature: Optional[tuple[float, float]] = None
 
         self.closed_trades: list[Trade] = []
         self.open_trades: list[Trade] = []
@@ -833,6 +851,71 @@ class SpotBot:
     def _emit(self, kind: str, payload: dict):
         if self.ui_cb:
             self.ui_cb(kind, payload)
+
+    def round_step_size(self, qty: float) -> float:
+        return round_step(qty, self.step)
+
+    def get_price(self) -> float:
+        return float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
+
+    def get_spot_balances(self) -> dict:
+        usdt = get_free_balance(self.client, QUOTE_ASSET)
+        sol = get_free_balance(self.client, BASE_ASSET)
+        px = self.get_price()
+        sol_value = sol * px
+        total = usdt + sol_value
+        return {
+            "usdt_free": usdt,
+            "sol_free": sol,
+            "price": px,
+            "sol_value_usdt": sol_value,
+            "wallet_total_usdt": total,
+        }
+
+    def sync_wallet(self, *, remember: bool = True) -> dict:
+        snap = self.get_spot_balances()
+        if remember:
+            self._last_wallet_signature = (round(snap["usdt_free"], 8), round(snap["sol_free"], 8))
+        return snap
+
+    def check_min_notional(self, qty: float, price: float) -> bool:
+        notional = float(qty) * float(price)
+        return notional >= max(MIN_TRADE_VALUE_USDT, float(self.min_notional or 0.0))
+
+    def update_status(self, *, action: str, result: str, error: str = "-"):
+        self.last_action = action
+        self.last_result = result
+        self.last_error = error
+        self.last_action_ts_utc = self._now_utc()
+        self._emit(
+            "status",
+            {
+                "state": self.current_state,
+                "last_action": self.last_action,
+                "last_result": self.last_result,
+                "last_error": self.last_error,
+                "time_utc": self.last_action_ts_utc,
+            },
+        )
+
+    def confirm_execution(self, before: dict, action: str, order_obj):
+        after = self.sync_wallet()
+        self._emit("log", {"msg": f"[CONFIRM] Saldo antes: USDT={before['usdt_free']:.6f} SOL={before['sol_free']:.6f}"})
+        self._emit("log", {"msg": f"[CONFIRM] Acción: {action}"})
+        self._emit("log", {"msg": f"[CONFIRM] Orden enviada: {order_obj.trade_id if order_obj else 'NO_EJECUTADA'}"})
+        self._emit("log", {"msg": f"[CONFIRM] Respuesta: {order_obj.raw[:280] if order_obj and order_obj.raw else 'N/A'}"})
+        self._emit("log", {"msg": f"[CONFIRM] Saldo después: USDT={after['usdt_free']:.6f} SOL={after['sol_free']:.6f}"})
+        self._emit("log", {"msg": f"[CONFIRM] Estado={self.current_state} Última acción={self.last_action} Resultado={self.last_result}"})
+
+    def get_strategy_state(self, candles: list[dict]) -> str:
+        b_score, s_score, _ = compute_scores(self.params, candles)
+        buy_th = float(self.params.get("buy_th", 0.5))
+        sell_th = float(self.params.get("sell_th", 0.5))
+        if b_score >= buy_th and b_score >= s_score:
+            return "COMPRA"
+        if s_score >= sell_th and s_score > b_score:
+            return "VENTA"
+        return "COMPRA" if b_score >= s_score else "VENTA"
 
     def _load_journal(self):
         if os.path.exists(JOURNAL_CSV):
@@ -1190,6 +1273,69 @@ class SpotBot:
             return None
         return self._place_market_sell_qty(qty, reason="MANUAL_SELL")
 
+    def buy_all_usdt(self) -> Optional[Trade]:
+        before = self.sync_wallet()
+        usdt_free = before["usdt_free"]
+        if usdt_free < MIN_TRADE_VALUE_USDT:
+            msg = f"[BUY] USDT menor a {MIN_TRADE_VALUE_USDT:.1f}, no se compra (evitar bucle)"
+            self._emit("log", {"msg": msg})
+            self.update_status(action="COMPRA", result="NO_EJECUTABLE", error=msg)
+            return None
+        target = usdt_free * ORDER_PCT
+        trade = self._place_market_buy_by_quote(target, reason="STATE_COMPRA")
+        if trade:
+            self.update_status(action="COMPRA", result="OK")
+            self.confirm_execution(before, "COMPRA", trade)
+            self.last_operated_state = "COMPRA"
+            self._open_position_from_trade(trade, int(time.time() * 1000))
+        else:
+            self.update_status(action="COMPRA", result="NO_EJECUTABLE", error="Orden de compra rechazada/fallida")
+        return trade
+
+    def sell_90_percent_sol(self) -> Optional[Trade]:
+        before = self.sync_wallet()
+        sol_free = before["sol_free"]
+        qty_to_sell = self.round_step_size(sol_free * SELL_PCT)
+        sol_value = qty_to_sell * before["price"]
+        if sol_value < MIN_TRADE_VALUE_USDT:
+            msg = f"[SELL] SOL menor a {MIN_TRADE_VALUE_USDT:.1f} USDT, no se vende (evitar bucle)"
+            self._emit("log", {"msg": msg})
+            self.update_status(action="VENTA", result="NO_EJECUTABLE", error=msg)
+            return None
+        if not self.check_min_notional(qty_to_sell, before["price"]):
+            msg = "[SELL] No cumple MIN_NOTIONAL/NOTIONAL con qty calculada; no se vende."
+            self._emit("log", {"msg": msg})
+            self.update_status(action="VENTA", result="NO_EJECUTABLE", error=msg)
+            return None
+        trade = self._place_market_sell_qty(qty_to_sell, reason="STATE_VENTA")
+        if trade:
+            self.update_status(action="VENTA", result="OK")
+            self.confirm_execution(before, "VENTA", trade)
+            self.last_operated_state = "VENTA"
+            rem = self.round_step_size(get_free_balance(self.client, BASE_ASSET))
+            self._emit("log", {"msg": f"[SELL] Verificación remanente SOL={rem:.6f} (incluye hold + dust)."})
+            self.position = None
+            self._emit("position", {"pos": None})
+        else:
+            self.update_status(action="VENTA", result="NO_EJECUTABLE", error="Orden de venta rechazada/fallida")
+        return trade
+
+    def execute_initial_state(self):
+        try:
+            candles = fetch_klines_closed(self.client, self.symbol, self.interval, LOOKBACK)
+            if len(candles) < 50:
+                self._emit("log", {"msg": "[INIT] No hay suficientes velas cerradas para estado inicial."})
+                return
+            self.current_state = self.get_strategy_state(candles)
+            self._emit("log", {"msg": f"[INIT] Estado estrategia={self.current_state}. Ejecutando de inmediato..."})
+            if self.current_state == "COMPRA":
+                self.buy_all_usdt()
+            else:
+                self.sell_90_percent_sol()
+        except Exception as e:
+            self.update_status(action="INIT", result="ERROR", error=str(e))
+            self._emit("log", {"msg": f"[INIT][ERROR] {e}"})
+
     def _open_position_from_trade(self, buy_trade: Trade, last_close_time_ms: int):
         ep = buy_trade.price
         qty = buy_trade.qty
@@ -1268,6 +1414,7 @@ class SpotBot:
 
     def _loop(self):
         self._emit("log", {"msg": f"[BOT] Inicio {self.symbol} {self.interval} | DRY_RUN={DRY_RUN} | tick={self.tick} step={self.step} minNot={self.min_notional} minQty={self.min_qty}"})
+        self.execute_initial_state()
 
         last_seen_close_time = None
 
@@ -1340,60 +1487,26 @@ class SpotBot:
                     "recent_candles": recent_candles,
                 })
 
-                # Ejecutar
-                if not in_pos and buy_cond:
-                    usdt_free = get_free_balance(self.client, QUOTE_ASSET)
-                    if usdt_free <= 0:
-                        self._emit("log", {"msg": "[BUY] USDT libre = 0, no compro"})
-                        continue
-
-                    target = usdt_free * ORDER_PCT
-                    target = float(target)
-
-                    # Verificación y reintento si llenó poco
-                    spent_total = 0.0
-                    last_trade = None
-                    for attempt in range(MAX_RETRY_BUY + 1):
-                        remaining_target = max(0.0, target - spent_total)
-                        if remaining_target <= 0:
-                            break
-
-                        t = self._place_market_buy_by_quote(remaining_target, reason="SIGNAL_BUY")
-                        if not t:
-                            break
-                        spent_total += float(t.quote_spent)
-                        last_trade = t
-
-                        fill_ratio = spent_total / target if target > 0 else 0.0
-                        self._emit("log", {"msg": f"[BUY] intento {attempt} gastado={spent_total:.4f}/{target:.4f} ({fill_ratio*100:.1f}%) qty={t.qty:.6f} avg={t.price:.4f}"})
-
-                        if fill_ratio >= MIN_FILL_RATIO:
-                            break
-
-                        time.sleep(RETRY_SLEEP_SEC)
-
-                    if last_trade:
-                        if spent_total >= (MIN_FILL_RATIO * target):
-                            # Consolidar posición por “precio” usando último trade (simple). En real podrías promediar.
-                            self._open_position_from_trade(last_trade, close_time)
-                        else:
-                            self._emit("log", {"msg": f"[BUY] Fill insuficiente: spent={spent_total:.4f} < {MIN_FILL_RATIO*100:.0f}% target={target:.4f}. No abro posición."})
-
-                # Cierre por TP/SL primero
-                if in_pos and tp_hit:
-                    self._emit("log", {"msg": "[TP] Take Profit alcanzado -> cierro"})
-                    self._close_position(reason="TP", last_close_time_ms=close_time)
+                next_state = self.get_strategy_state(candles)
+                self.current_state = next_state
+                self._emit("log", {"msg": f"[STATE] estado={next_state} | último_operado={self.last_operated_state}"})
+                wallet_now = self.sync_wallet(remember=False)
+                wallet_sig = (round(wallet_now["usdt_free"], 8), round(wallet_now["sol_free"], 8))
+                if (
+                    self.last_result == "NO_EJECUTABLE"
+                    and self.last_action == next_state
+                    and self._last_wallet_signature == wallet_sig
+                ):
+                    self._emit("log", {"msg": f"[STATE] {next_state} no ejecutable y saldo sin cambios; no repito en bucle."})
                     continue
-                if in_pos and sl_hit:
-                    self._emit("log", {"msg": "[SL] Stop Loss alcanzado -> cierro"})
-                    self._close_position(reason="SL", last_close_time_ms=close_time)
+                if self.last_operated_state == next_state:
+                    self._emit("log", {"msg": f"[STATE] Ya ejecutado en estado {next_state}; esperando cambio de estado."})
                     continue
 
-                # Cierre por señal
-                if in_pos and sell_cond:
-                    self._emit("log", {"msg": "[SELL] Señal de cierre -> cierro"})
-                    self._close_position(reason="SIGNAL_SELL", last_close_time_ms=close_time)
-                    continue
+                if next_state == "COMPRA":
+                    self.buy_all_usdt()
+                else:
+                    self.sell_90_percent_sol()
 
             except Exception as e:
                 self._emit("log", {"msg": f"[ERROR] {e}"})
@@ -1646,6 +1759,15 @@ class BotGUI:
                     )
             elif kind == "net":
                 self.var_connection.set(payload["status"])
+            elif kind == "status":
+                self.var_status.set(payload.get("state", self.var_status.get()))
+                self.var_last.set(payload.get("time_utc", self.var_last.get()))
+                self.log(
+                    f"[STATUS] estado={payload.get('state','-')} "
+                    f"accion={payload.get('last_action','-')} "
+                    f"resultado={payload.get('last_result','-')} "
+                    f"error={payload.get('last_error','-')}"
+                )
             # refresh table
             if self.bot:
                 # render last 200 closed trades

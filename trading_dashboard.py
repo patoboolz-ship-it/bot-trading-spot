@@ -55,6 +55,7 @@ BEST_GEN = {
 
 INTERVAL = "1h"
 INTERVAL_MS = {"1h": 3_600_000}
+FEE_RATE = 0.001  # 0.1% Binance spot por lado
 FNG_CACHE_TTL_SEC = 60 * 30
 _FNG_CACHE = {"ts": 0.0, "by_date": {}}
 
@@ -258,6 +259,9 @@ class SimOp:
     time_ms: int
     price: float
     qty: float
+    gross_value: float
+    fee: float
+    net_value: float
     equity_after: float
     reason: str
 
@@ -597,6 +601,7 @@ class TradingDashboard(tk.Tk):
         self.lbl_pnl = ttk.Label(top, text="PnL: 0.00 (0.00%)", font=("Segoe UI", 11, "bold"))
         self.lbl_price = ttk.Label(top, text=f"Precio {self.symbol}: 0.00", font=("Segoe UI", 11, "bold"))
         self.lbl_state = ttk.Label(top, text="Estado: IDLE", font=("Segoe UI", 11, "bold"))
+        self.lbl_mode = ttk.Label(top, text="Modo velas: NORMAL", font=("Segoe UI", 11, "bold"))
         self.lbl_error = ttk.Label(top, text="", foreground="#b71c1c")
 
         self.lbl_balance.grid(row=0, column=0, sticky="w")
@@ -604,6 +609,7 @@ class TradingDashboard(tk.Tk):
         self.lbl_pnl.grid(row=0, column=2, sticky="w")
         self.lbl_price.grid(row=0, column=3, sticky="w")
         self.lbl_state.grid(row=0, column=4, sticky="w")
+        self.lbl_mode.grid(row=0, column=5, sticky="w")
         self.lbl_error.grid(row=1, column=0, columnspan=6, sticky="w", pady=(6, 0))
 
         self.notebook = ttk.Notebook(self)
@@ -756,6 +762,13 @@ class TradingDashboard(tk.Tk):
         self.lbl_pnl.config(text=f"PnL: {self.pnl:,.4f} ({self.pnl_percent:.2f}%)", foreground=color)
         self.lbl_price.config(text=f"Precio {self.symbol}: {self.price:,.4f}")
         self.lbl_state.config(text=f"Estado: {self.status_text}")
+        mode = "HEIKIN-ASHI" if int(self.params.get("use_ha", 0)) == 1 else "NORMAL"
+        self.lbl_mode.config(text=f"Modo velas: {mode}")
+
+    def _chart_source_candles(self, candles: list[dict]) -> list[dict]:
+        if int(self.params.get("use_ha", 0)) == 1:
+            return heikin_ashi(candles)
+        return candles
 
     def _compute_strategy_ops(self, candles: list[dict]) -> tuple[list[SimOp], list[tuple[int, float]]]:
         if not candles:
@@ -792,9 +805,13 @@ class TradingDashboard(tk.Tk):
 
         ops: list[SimOp] = []
         curve: list[tuple[int, float]] = []
+        interval_ms = INTERVAL_MS[self.interval]
+        server_ref_ms = int(time.time() * 1000)
 
         for i in range(len(src)):
             px = float(src[i]["close"])
+            candle_close_ms = int(src[i].get("close_time", 0))
+            candle_closed = is_candle_closed(candle_close_ms, server_ref_ms, interval_ms)
             mh_prev = mh_arr[i - 1] if i > 0 else mh_arr[i]
             fng_val = float(fng_arr[i]) if fng_arr else 50.0
             liq_val = float(liq_arr[i]) if liq_arr else 0.5
@@ -817,31 +834,45 @@ class TradingDashboard(tk.Tk):
                 + wsl * sell_liq
             )
 
-            if not in_pos and buy_score >= float(self.params["buy_th"]) and (i - last_buy_idx) >= int(self.params["cooldown"]):
-                qty = capital / px if px > 0 else 0.0
+            if (not candle_closed) and i == (len(src) - 1):
+                # Validación explícita: jamás operar con vela en formación.
+                eq = qty * px if in_pos else capital
+                curve.append((candle_close_ms or i, eq))
+                continue
+
+            if candle_closed and (not in_pos) and buy_score >= float(self.params["buy_th"]) and (i - last_buy_idx) >= int(self.params["cooldown"]):
+                gross_value = capital
+                fee = gross_value * FEE_RATE
+                net_value = gross_value - fee
+                qty = net_value / px if px > 0 else 0.0
                 in_pos = qty > 0
                 if in_pos:
-                    ops.append(SimOp("BUY", i, int(src[i].get("close_time", 0)), px, qty, capital, "SIG"))
+                    capital = 0.0
+                    equity_after = qty * px
+                    ops.append(SimOp("BUY", i, candle_close_ms, px, qty, gross_value, fee, net_value, equity_after, "SIG"))
                     last_buy_idx = i
-            elif in_pos:
+            elif candle_closed and in_pos:
                 entry = ops[-1].price if ops else px
                 ret = (px - entry) / entry if entry > 0 else 0.0
                 reason = None
-                if ret >= float(self.params["take_profit"]):
-                    reason = "TP"
-                elif ret <= -float(self.params["stop_loss"]):
+                if ret <= -float(self.params["stop_loss"]):
                     reason = "SL"
+                elif ret >= float(self.params["take_profit"]):
+                    reason = "TP"
                 elif sell_score >= float(self.params["sell_th"]):
                     reason = "SIG"
 
                 if reason is not None:
-                    capital = qty * px
-                    ops.append(SimOp("SELL", i, int(src[i].get("close_time", 0)), px, qty, capital, reason))
+                    gross_value = qty * px
+                    fee = gross_value * FEE_RATE
+                    net_value = gross_value - fee
+                    capital = net_value
+                    ops.append(SimOp("SELL", i, candle_close_ms, px, qty, gross_value, fee, net_value, capital, reason))
                     qty = 0.0
                     in_pos = False
 
             eq = qty * px if in_pos else capital
-            curve.append((int(src[i].get("close_time", i)), eq))
+            curve.append((candle_close_ms or i, eq))
 
         return ops, curve
 
@@ -943,7 +974,10 @@ class TradingDashboard(tk.Tk):
         for op in self.strategy_ops[-300:]:
             self.trades_listbox.insert(
                 tk.END,
-                f"{op.side:<4} {self.symbol:<8} {op.price:>10.4f} qty {op.qty:<10.6f} {op.reason} t={op.time_ms}",
+                (
+                    f"{op.side:<4} {self.symbol:<8} px {op.price:>9.4f} qty {op.qty:<10.6f} "
+                    f"fee {op.fee:>8.4f} eq {op.equity_after:>10.2f} {op.reason} t={op.time_ms}"
+                ),
             )
         self.trades_listbox.yview_moveto(1.0)
 
@@ -1384,10 +1418,12 @@ class TradingDashboard(tk.Tk):
             self.canvas.draw_idle()
             return
 
+        chart_candles = self._chart_source_candles(candles)
+
         # Mostrar todo el rango, reduciendo densidad visual si hay demasiadas velas.
         max_draw = 1200
-        step = max(1, len(candles) // max_draw)
-        data = candles[::step]
+        step = max(1, len(chart_candles) // max_draw)
+        data = chart_candles[::step]
 
         min_p = min(float(c["low"]) for c in data)
         max_p = max(float(c["high"]) for c in data)
@@ -1423,7 +1459,8 @@ class TradingDashboard(tk.Tk):
         self.ax.set_xlim(-1, len(data) + 1)
         self.ax.set_ylim(min_p * 0.995, max_p * 1.005)
         title_extra = f" | vista comprimida x{step}" if step > 1 else ""
-        self.ax.set_title(f"{self.symbol} - 1h (solo cierre de vela){title_extra}")
+        mode = "HA" if int(self.params.get("use_ha", 0)) == 1 else "NORMAL"
+        self.ax.set_title(f"{self.symbol} - 1h (solo cierre de vela) | {mode}{title_extra}")
         self.ax.grid(alpha=0.2)
 
         n = len(data)
@@ -1523,9 +1560,13 @@ class TradingDashboard(tk.Tk):
         ops_rows = [
             {
                 "side": o.side,
+                "index": o.index,
                 "time_ms": o.time_ms,
                 "price": o.price,
                 "qty": o.qty,
+                "gross_value": o.gross_value,
+                "fee": o.fee,
+                "net_value": o.net_value,
                 "equity_after": o.equity_after,
                 "reason": o.reason,
             }
