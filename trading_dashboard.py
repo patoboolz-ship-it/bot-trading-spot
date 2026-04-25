@@ -380,6 +380,57 @@ class _BotModuleAdapter:
     def set_params(self, params: dict[str, Any]):
         self._params = dict(params or {})
 
+    def get_strategy_state(self) -> str:
+        candles = self.get_candles(self.symbol, INTERVAL)
+        if not candles:
+            return "COMPRA"
+        b_score, s_score, _ = self.bot_mod.compute_scores(self._params, candles)
+        buy_th = float(self._params.get("buy_th", 0.5))
+        sell_th = float(self._params.get("sell_th", 0.5))
+        if b_score >= buy_th and b_score >= s_score:
+            return "COMPRA"
+        if s_score >= sell_th and s_score > b_score:
+            return "VENTA"
+        return "COMPRA" if b_score >= s_score else "VENTA"
+
+    def rebalance_sell_mode_90_10(self, tolerance_usdt: float = 1.0) -> str:
+        quote = getattr(self.bot_mod, "QUOTE_ASSET", "USDT")
+        base = getattr(self.bot_mod, "BASE_ASSET", self.symbol.replace(quote, ""))
+        usdt_free = float(self.bot_mod.get_free_balance(self.client, quote))
+        sol_free = float(self.bot_mod.get_free_balance(self.client, base))
+        px = float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
+        sol_value = sol_free * px
+        total = usdt_free + sol_value
+        if total <= 0:
+            return "[REBALANCE] Sin saldo para rebalancear."
+
+        target_sol_value = total * 0.10
+        excess_sol_value = sol_value - target_sol_value
+        if excess_sol_value <= float(tolerance_usdt):
+            return f"[REBALANCE] OK 90/10 | USDT={usdt_free:.4f} SOL={sol_free:.6f} ({sol_value:.4f} USDT)."
+
+        tick, step, min_notional, min_qty = self.bot_mod.get_filters(self.client, self.symbol)
+        _ = tick
+        qty_to_sell = self.bot_mod.round_step(excess_sol_value / px, step)
+        if qty_to_sell <= 0:
+            return "[REBALANCE] qty a vender <= 0 tras redondeo."
+        if min_qty and qty_to_sell < float(min_qty):
+            return f"[REBALANCE] qty {qty_to_sell:.8f} < minQty {float(min_qty):.8f}; no ejecuto."
+        gross = qty_to_sell * px
+        if min_notional and gross < float(min_notional):
+            return f"[REBALANCE] notional {gross:.4f} < minNotional {float(min_notional):.4f}; no ejecuto."
+
+        order = self.client.create_order(
+            symbol=self.symbol,
+            side=self.bot_mod.Client.SIDE_SELL,
+            type=self.bot_mod.Client.ORDER_TYPE_MARKET,
+            quantity=f"{qty_to_sell:.8f}",
+        )
+        return (
+            f"[REBALANCE] SELL ejecutada qty={qty_to_sell:.6f} px={px:.4f} "
+            f"gross={gross:.4f} orderId={order.get('orderId', 'N/A')}"
+        )
+
     def _build_client(self):
         key_path = getattr(self.bot_mod, "API_KEY_PATH", API_KEY_PATH)
         sec_path = getattr(self.bot_mod, "API_SECRET_PATH", API_SECRET_PATH)
@@ -512,6 +563,7 @@ class TradingDashboard(tk.Tk):
         self.pnl_percent = 0.0
         self.status_text = "IDLE"
         self.last_error = ""
+        self.last_rebalance_check_ts = 0.0
 
         self.strategy_ops: list[SimOp] = []
         self.strategy_equity_curve: list[tuple[int, float]] = []
@@ -573,6 +625,8 @@ class TradingDashboard(tk.Tk):
                 "get_trades": adapter.get_trades,
                 "get_candles": adapter.get_candles,
                 "get_candles_range": adapter.get_candles_range,
+                "get_strategy_state": adapter.get_strategy_state,
+                "rebalance_sell_mode_90_10": adapter.rebalance_sell_mode_90_10,
                 "start_bot": adapter.start_bot,
                 "pause_bot": adapter.pause_bot,
                 "stop_bot": adapter.stop_bot,
@@ -606,6 +660,7 @@ class TradingDashboard(tk.Tk):
         self.lbl_price = ttk.Label(top, text=f"Precio {self.symbol}: 0.00", font=("Segoe UI", 11, "bold"))
         self.lbl_state = ttk.Label(top, text="Estado: IDLE", font=("Segoe UI", 11, "bold"))
         self.lbl_mode = ttk.Label(top, text="Modo velas: NORMAL", font=("Segoe UI", 11, "bold"))
+        self.lbl_assets = ttk.Label(top, text=f"Spot: USDT 0.0000 | {self.symbol.replace('USDT','')} 0.000000", font=("Segoe UI", 11, "bold"))
         self.lbl_error = ttk.Label(top, text="", foreground="#b71c1c")
 
         self.lbl_balance.grid(row=0, column=0, sticky="w")
@@ -614,7 +669,8 @@ class TradingDashboard(tk.Tk):
         self.lbl_price.grid(row=0, column=3, sticky="w")
         self.lbl_state.grid(row=0, column=4, sticky="w")
         self.lbl_mode.grid(row=0, column=5, sticky="w")
-        self.lbl_error.grid(row=1, column=0, columnspan=6, sticky="w", pady=(6, 0))
+        self.lbl_assets.grid(row=1, column=0, columnspan=6, sticky="w")
+        self.lbl_error.grid(row=2, column=0, columnspan=6, sticky="w", pady=(6, 0))
 
         self.notebook = ttk.Notebook(self)
         self.notebook.grid(row=1, column=0, sticky="nsew", padx=8, pady=8)
@@ -768,6 +824,8 @@ class TradingDashboard(tk.Tk):
         self.lbl_state.config(text=f"Estado: {self.status_text}")
         mode = "HEIKIN-ASHI" if int(self.params.get("use_ha", 0)) == 1 else "NORMAL"
         self.lbl_mode.config(text=f"Modo velas: {mode}")
+        base = self.symbol.replace("USDT", "")
+        self.lbl_assets.config(text=f"Spot: USDT {self.balance:,.4f} | {base} {self.asset_qty:,.6f}")
 
     def _chart_source_candles(self, candles: list[dict]) -> list[dict]:
         if int(self.params.get("use_ha", 0)) == 1:
@@ -1548,6 +1606,22 @@ class TradingDashboard(tk.Tk):
                         "status": "RUNNING" if self.bot_running else "PAUSED",
                     }
                 )
+                if (
+                    self.bot_running
+                    and "rebalance_sell_mode_90_10" in self._api
+                    and callable(self._api["rebalance_sell_mode_90_10"])
+                    and "get_strategy_state" in self._api
+                    and callable(self._api["get_strategy_state"])
+                    and (time.time() - self.last_rebalance_check_ts) >= 60.0
+                ):
+                    self.last_rebalance_check_ts = time.time()
+                    try:
+                        live_state = str(self._api["get_strategy_state"]())
+                        if live_state == "VENTA":
+                            msg = str(self._api["rebalance_sell_mode_90_10"](1.0))
+                            self._ui_queue.put({"kind": "error", "message": msg})
+                    except Exception as reb_ex:
+                        self._ui_queue.put({"kind": "error", "message": f"Rebalance error: {reb_ex}"})
             except Exception:
                 self._ui_queue.put({"kind": "error", "message": f"Loop error:\n{traceback.format_exc(limit=2)}"})
             time.sleep(1)
@@ -1618,6 +1692,7 @@ class TradingDashboard(tk.Tk):
                 self._api["set_params"](self.params)
             self._api["start_bot"]()
             self.bot_running = True
+            self.last_rebalance_check_ts = 0.0
             self.status_text = "RUNNING"
             self._set_error("")
         except Exception as exc:
