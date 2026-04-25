@@ -62,11 +62,13 @@ INTERVAL = "1h"
 LOOKBACK = 800  # para indicadores, 800 suele sobrar (MACD lento 83)
 
 # Ordenes
-USE_98_PERCENT = True
-ORDER_PCT = 0.98  # 98% del USDT libre
+USE_98_PERCENT = False
+ORDER_PCT = 1.00  # COMPRA: 100% del USDT libre
+SELL_PCT = 0.90   # VENTA: 90% del SOL libre (dejar 10% holdeado)
 MIN_FILL_RATIO = 0.90  # verificación: gastado >= 90% de objetivo
 MAX_RETRY_BUY = 2       # reintentos si quedó muy parcial
 RETRY_SLEEP_SEC = 2
+MIN_TRADE_VALUE_USDT = 1.0
 
 # Ejecutar real o simulación
 DRY_RUN = True
@@ -88,6 +90,13 @@ GA_PROGRESS_EVERY = 25
 GA_INDIVIDUAL_WARN_S = 5.0
 
 BLOCK_STUCK_LIMIT = 5
+WEIGHT_BOOST_STUCK_TRIGGER = 5
+WEIGHT_BOOST_MUT_RATE = 0.92
+WEIGHT_BOOST_MUT_SIGMA = 0.16
+WEIGHT_BOOST_PARAM_MUT_RATE = 0.22
+COMBO_PENALTY_FACTOR = 0.65
+COMBO_PENALTY_FLOOR = 0.20
+COMBO_PENALTY_RESET_STUCK = 12
 
 # Capital inicial para reportes de optimización
 START_CAPITAL = 100000.0
@@ -104,31 +113,41 @@ GUI_CONNECT_RETRY_SEC = 5.0
 
 
 # =========================
-# GEN 235 (defaults)
+# BEST_GEN (defaults)
 # =========================
 DEFAULT_GEN = {
-  "use_ha": 1,
-  "rsi_period": 10,
-  "rsi_oversold": 40.0,
-  "rsi_overbought": 58.0,
-  "macd_fast": 40,
-  "macd_slow": 83,
-  "macd_signal": 46,
+  "use_ha": 0,
+  "rsi_period": 18,
+  "rsi_oversold": 30.0,
+  "rsi_overbought": 71.0,
+  "macd_fast": 9,
+  "macd_slow": 146,
+  "macd_signal": 27,
   "consec_red": 3,
-  "consec_green": 4,
-  "w_buy_rsi": 0.51,
-  "w_buy_macd": 0.49,
-  "w_buy_consec": 0.00,
-  "buy_th": 0.74,
-  "w_sell_rsi": 0.21,
-  "w_sell_macd": 0.46,
-  "w_sell_consec": 0.33,
-  "sell_th": 0.62,
-  "take_profit": 0.109,
-  "stop_loss": 0.012,
-  "cooldown": 1,
+  "consec_green": 5,
+  "w_buy_rsi": 0.38,
+  "w_buy_macd": 0.31,
+  "w_buy_consec": 0.31,
+  "w_buy_fng": 0.0,
+  "w_buy_liq": 0.0,
+  "buy_th": 0.55,
+  "w_sell_rsi": 0.33,
+  "w_sell_macd": 0.15,
+  "w_sell_consec": 0.52,
+  "w_sell_fng": 0.0,
+  "w_sell_liq": 0.0,
+  "sell_th": 0.60,
+  "fng_fear": 35.0,
+  "fng_greed": 65.0,
+  "liq_window": 24,
+  "take_profit": 0.150,
+  "stop_loss": 0.050,
+  "cooldown": 11,
   "edge_trigger": 0
 }
+OPTIMIZER_BEST_PATH = "optimizer_best_gen.json"
+FNG_CACHE_TTL_SEC = 60 * 30
+_FNG_CACHE = {"ts": 0.0, "by_date": {}}
 
 
 # =========================
@@ -378,6 +397,57 @@ def normalize3(a,b,c):
         return (1/3,1/3,1/3)
     return (a/s, b/s, c/s)
 
+def normalize5(a, b, c, d, e):
+    vals = [max(0.0, float(x)) for x in (a, b, c, d, e)]
+    s = sum(vals)
+    if s <= 1e-12:
+        return (0.2, 0.2, 0.2, 0.2, 0.2)
+    return tuple(v / s for v in vals)
+
+def fetch_fng_by_date() -> dict:
+    now = time.time()
+    if (now - _FNG_CACHE["ts"]) < FNG_CACHE_TTL_SEC and _FNG_CACHE["by_date"]:
+        return _FNG_CACHE["by_date"]
+    try:
+        r = requests.get("https://api.alternative.me/fng/?limit=0&format=json", timeout=12)
+        r.raise_for_status()
+        raw = r.json().get("data", [])
+        by_date = {}
+        for row in raw:
+            ts = int(row.get("timestamp", 0))
+            dt = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+            by_date[dt] = float(row.get("value", 50.0))
+        if by_date:
+            _FNG_CACHE["ts"] = now
+            _FNG_CACHE["by_date"] = by_date
+    except Exception:
+        if not _FNG_CACHE["by_date"]:
+            _FNG_CACHE["by_date"] = {}
+    return _FNG_CACHE["by_date"]
+
+def build_fng_series(candles: list) -> list:
+    by_date = fetch_fng_by_date()
+    out = []
+    for c in candles:
+        ct = int(c.get("close_time", c.get("open_time", c.get("t", 0))))
+        d = datetime.fromtimestamp(ct / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+        out.append(float(by_date.get(d, 50.0)))
+    return out
+
+def build_liquidity_series(candles: list, window: int) -> list:
+    vols = [float(c.get("v", c.get("volume", 0.0)) or 0.0) for c in candles]
+    win = max(5, int(window))
+    out = []
+    for i, v in enumerate(vols):
+        lo = max(0, i - win + 1)
+        chunk = vols[lo : i + 1]
+        mean = sum(chunk) / len(chunk)
+        var = sum((x - mean) ** 2 for x in chunk) / max(1, len(chunk))
+        std = math.sqrt(var)
+        z = (v - mean) / (std + 1e-12)
+        out.append(clamp01((z + 2.0) / 4.0))
+    return out
+
 def normalize3_safe(a: float, b: float, c: float):
     a = max(0.0, a)
     b = max(0.0, b)
@@ -405,11 +475,11 @@ def normalize3_clamped(a: float, b: float, c: float, min_w: float = WEIGHT_MIN, 
     return (a / s, b / s, c / s)
 
 def apply_weight_constraints(child: dict):
-    child["w_buy_rsi"], child["w_buy_macd"], child["w_buy_consec"] = normalize3_clamped(
-        child["w_buy_rsi"], child["w_buy_macd"], child["w_buy_consec"]
+    child["w_buy_rsi"], child["w_buy_macd"], child["w_buy_consec"], child["w_buy_fng"], child["w_buy_liq"] = normalize5(
+        child["w_buy_rsi"], child["w_buy_macd"], child["w_buy_consec"], child["w_buy_fng"], child["w_buy_liq"]
     )
-    child["w_sell_rsi"], child["w_sell_macd"], child["w_sell_consec"] = normalize3_clamped(
-        child["w_sell_rsi"], child["w_sell_macd"], child["w_sell_consec"]
+    child["w_sell_rsi"], child["w_sell_macd"], child["w_sell_consec"], child["w_sell_fng"], child["w_sell_liq"] = normalize5(
+        child["w_sell_rsi"], child["w_sell_macd"], child["w_sell_consec"], child["w_sell_fng"], child["w_sell_liq"]
     )
 
 def score_components_at_index(
@@ -426,9 +496,17 @@ def score_components_at_index(
     w_buy_rsi: float,
     w_buy_macd: float,
     w_buy_consec: float,
+    w_buy_fng: float = 0.0,
+    w_buy_liq: float = 0.0,
     w_sell_rsi: float,
     w_sell_macd: float,
     w_sell_consec: float,
+    w_sell_fng: float = 0.0,
+    w_sell_liq: float = 0.0,
+    fng_value: float = 50.0,
+    liq_value: float = 0.5,
+    fng_fear: float = 35.0,
+    fng_greed: float = 65.0,
 ) -> dict:
     """
     Ecuación (fuente de verdad):
@@ -448,12 +526,20 @@ def score_components_at_index(
     sell_macd = sell_macd_signal(mh, mh_prev, edge_trigger)
     buy_consec = consec_up(close[: i + 1], consec_green)
     sell_consec = consec_down(close[: i + 1], consec_red)
+    fng_val = float(fng_value)
+    fear = min(float(fng_fear), float(fng_greed) - 1e-6)
+    greed = max(float(fng_greed), fear + 1e-6)
+    buy_fng = clamp01((greed - fng_val) / (greed - fear))
+    sell_fng = clamp01((fng_val - fear) / (greed - fear))
+    liq = clamp01(liq_value)
+    buy_liq = liq if (i <= 0 or close[i] >= close[i - 1]) else 0.0
+    sell_liq = liq if (i <= 0 or close[i] <= close[i - 1]) else 0.0
 
-    wbr, wbm, wbc = normalize3(w_buy_rsi, w_buy_macd, w_buy_consec)
-    wsr, wsm, wsc = normalize3(w_sell_rsi, w_sell_macd, w_sell_consec)
+    wbr, wbm, wbc, wbf, wbl = normalize5(w_buy_rsi, w_buy_macd, w_buy_consec, w_buy_fng, w_buy_liq)
+    wsr, wsm, wsc, wsf, wsl = normalize5(w_sell_rsi, w_sell_macd, w_sell_consec, w_sell_fng, w_sell_liq)
 
-    buy_score = wbr * buy_rsi + wbm * buy_macd + wbc * buy_consec
-    sell_score = wsr * sell_rsi + wsm * sell_macd + wsc * sell_consec
+    buy_score = wbr * buy_rsi + wbm * buy_macd + wbc * buy_consec + wbf * buy_fng + wbl * buy_liq
+    sell_score = wsr * sell_rsi + wsm * sell_macd + wsc * sell_consec + wsf * sell_fng + wsl * sell_liq
 
     return {
         "buy_score": buy_score,
@@ -465,6 +551,10 @@ def score_components_at_index(
             "sell_rsi": sell_rsi,
             "sell_macd": sell_macd,
             "sell_consec": sell_consec,
+            "buy_fng": buy_fng,
+            "sell_fng": sell_fng,
+            "buy_liq": buy_liq,
+            "sell_liq": sell_liq,
         },
     }
 
@@ -482,6 +572,8 @@ def compute_score_snapshot_from_params(params: dict, candles: list, index: Optio
     rsi_period = int(params["rsi_period"])
     rsi_vals = rsi(close, rsi_period)
     hist = macd_hist(close, int(params["macd_fast"]), int(params["macd_slow"]), int(params["macd_signal"]))
+    fng_arr = build_fng_series(candles)
+    liq_arr = build_liquidity_series(candles, int(params.get("liq_window", 24)))
 
     idx = len(close) - 1 if index is None else int(index)
     payload = score_components_at_index(
@@ -497,9 +589,17 @@ def compute_score_snapshot_from_params(params: dict, candles: list, index: Optio
         w_buy_rsi=float(params["w_buy_rsi"]),
         w_buy_macd=float(params["w_buy_macd"]),
         w_buy_consec=float(params["w_buy_consec"]),
+        w_buy_fng=float(params.get("w_buy_fng", 0.0)),
+        w_buy_liq=float(params.get("w_buy_liq", 0.0)),
         w_sell_rsi=float(params["w_sell_rsi"]),
         w_sell_macd=float(params["w_sell_macd"]),
         w_sell_consec=float(params["w_sell_consec"]),
+        w_sell_fng=float(params.get("w_sell_fng", 0.0)),
+        w_sell_liq=float(params.get("w_sell_liq", 0.0)),
+        fng_value=float(fng_arr[idx]) if fng_arr else 50.0,
+        liq_value=float(liq_arr[idx]) if liq_arr else 0.5,
+        fng_fear=float(params.get("fng_fear", 35.0)),
+        fng_greed=float(params.get("fng_greed", 65.0)),
     )
     return payload, close[idx]
 
@@ -512,6 +612,8 @@ def compute_score_snapshot_from_genome(ge: "Genome", candles: list, index: Optio
     close = [c["close"] for c in data]
     rsi_arr = rsi(close, ge.rsi_period)
     mh_arr = macd_hist(close, ge.macd_fast, ge.macd_slow, ge.macd_signal)
+    fng_arr = build_fng_series(candles)
+    liq_arr = build_liquidity_series(candles, int(getattr(ge, "liq_window", 24)))
     idx = len(close) - 1 if index is None else int(index)
     payload = score_components_at_index(
         close,
@@ -526,9 +628,17 @@ def compute_score_snapshot_from_genome(ge: "Genome", candles: list, index: Optio
         w_buy_rsi=ge.w_buy_rsi,
         w_buy_macd=ge.w_buy_macd,
         w_buy_consec=ge.w_buy_consec,
+        w_buy_fng=getattr(ge, "w_buy_fng", 0.0),
+        w_buy_liq=getattr(ge, "w_buy_liq", 0.0),
         w_sell_rsi=ge.w_sell_rsi,
         w_sell_macd=ge.w_sell_macd,
         w_sell_consec=ge.w_sell_consec,
+        w_sell_fng=getattr(ge, "w_sell_fng", 0.0),
+        w_sell_liq=getattr(ge, "w_sell_liq", 0.0),
+        fng_value=float(fng_arr[idx]) if fng_arr else 50.0,
+        liq_value=float(liq_arr[idx]) if liq_arr else 0.5,
+        fng_fear=float(getattr(ge, "fng_fear", 35.0)),
+        fng_greed=float(getattr(ge, "fng_greed", 65.0)),
     )
     return payload, close[idx]
 
@@ -542,6 +652,82 @@ def compute_scores(params: dict, candles: list):
     return payload["buy_score"], payload["sell_score"], last_close
 
 
+def interval_to_ms(interval: str) -> int:
+    if interval not in INTERVAL_MS:
+        raise ValueError(f"Intervalo no soportado: {interval}")
+    return INTERVAL_MS[interval]
+
+
+def is_candle_closed(close_time_ms: int, server_time_ms: int, interval_ms: int) -> bool:
+    """
+    Criterio único compartido por bot y simulador.
+    """
+    return int(close_time_ms) < int(server_time_ms) - int(interval_ms)
+
+
+def filter_closed_candles(candles: list[dict], interval: str, server_time_ms: int) -> list[dict]:
+    interval_ms = interval_to_ms(interval)
+    return filter_closed_candles_by_interval_ms(candles, interval_ms, server_time_ms)
+
+
+def filter_closed_candles_by_interval_ms(candles: list[dict], interval_ms: int, server_time_ms: int) -> list[dict]:
+    return [c for c in candles if is_candle_closed(c["close_time"], server_time_ms, interval_ms)]
+
+
+def assert_simulator_uses_closed_last_price(candles_closed: list[dict], used_close: float, use_ha: bool):
+    if not candles_closed:
+        return
+
+    if use_ha:
+        if candles_closed[-1].get("ha_close") is not None:
+            expected = float(candles_closed[-1]["ha_close"])
+        else:
+            expected = float(heikin_ashi(candles_closed)[-1]["close"])
+    else:
+        expected = float(candles_closed[-1]["close"])
+
+    if abs(float(used_close) - expected) > 1e-12:
+        src = "ha_close" if use_ha else "close"
+        raise AssertionError(
+            f"[VALIDACION] El simulador no usa el último {src} de vela cerrada. used={used_close} expected={expected}"
+        )
+
+
+def assert_bot_simulator_score_parity(ge: "Genome", candles_closed: list[dict], index: Optional[int] = None):
+    if not candles_closed:
+        return
+    idx = len(candles_closed) - 1 if index is None else int(index)
+    ge_payload, _ = compute_score_snapshot_from_genome(ge, candles_closed, idx)
+    pa_payload, _ = compute_score_snapshot_from_params(asdict(ge), candles_closed, idx)
+    if abs(ge_payload["buy_score"] - pa_payload["buy_score"]) > 1e-12 or abs(ge_payload["sell_score"] - pa_payload["sell_score"]) > 1e-12:
+        raise AssertionError(
+            "[VALIDACION] Score inconsistente bot vs simulador "
+            f"(buy ge={ge_payload['buy_score']} bot={pa_payload['buy_score']} | "
+            f"sell ge={ge_payload['sell_score']} bot={pa_payload['sell_score']})"
+        )
+
+
+def infer_interval_ms_from_candles(candles: list[dict]) -> int:
+    if len(candles) < 2:
+        return INTERVAL_MS.get(INTERVAL, 60_000)
+    diffs = []
+    for c in candles:
+        ot = c.get("open_time")
+        ct = c.get("close_time")
+        if ot is not None and ct is not None and ct > ot:
+            diffs.append(int(ct) - int(ot))
+    if diffs:
+        return int(statistics.median(diffs))
+    for i in range(1, len(candles)):
+        prev = candles[i - 1].get("open_time")
+        cur = candles[i].get("open_time")
+        if prev is not None and cur is not None and cur > prev:
+            diffs.append(int(cur) - int(prev))
+    if diffs:
+        return int(statistics.median(diffs))
+    return INTERVAL_MS.get(INTERVAL, 60_000)
+
+
 # =========================
 # Binance helpers
 # =========================
@@ -550,6 +736,9 @@ def round_step(qty: float, step: float) -> float:
     if step <= 0:
         return qty
     return math.floor(qty / step) * step
+
+def round_step_size(qty: float, step: float) -> float:
+    return round_step(qty, step)
 
 def get_filters(client: Client, symbol: str):
     info = client.get_symbol_info(symbol)
@@ -576,6 +765,12 @@ def get_free_balance(client: Client, asset: str) -> float:
         return 0.0
     return float(bal["free"])
 
+def get_price(client: Client, symbol: str) -> float:
+    return float(client.get_symbol_ticker(symbol=symbol)["price"])
+
+def check_min_notional(qty: float, price: float, min_notional: float) -> bool:
+    return (float(qty) * float(price)) >= max(float(min_notional or 0.0), MIN_TRADE_VALUE_USDT)
+
 def get_spot_balances(client: Client) -> list[dict]:
     account = client.get_account()
     balances = []
@@ -597,7 +792,8 @@ def get_spot_balances(client: Client) -> list[dict]:
 
 def fetch_klines_closed(client: Client, symbol: str, interval: str, limit: int):
     """
-    Trae velas y devuelve SOLO velas cerradas (quita la vela actual en formación).
+    Trae velas y devuelve SOLO velas cerradas usando el mismo criterio de cierre
+    compartido por bot y simulador.
     """
     kl = client.get_klines(symbol=symbol, interval=interval, limit=limit)
     # kline format: [open_time, open, high, low, close, volume, close_time, ...]
@@ -612,13 +808,9 @@ def fetch_klines_closed(client: Client, symbol: str, interval: str, limit: int):
             "close": float(row[4]),
             "volume": float(row[5]),
         })
-    # vela cerrada: close_time < now
-    now_ms = int(time.time() * 1000)
-    closed = [c for c in candles if c["close_time"] <= now_ms - 500]  # buffer
-    # a veces Binance devuelve la última cerrada + la actual; nos quedamos con todas menos la última si parece "viva"
-    if len(closed) >= 2 and closed[-1]["close_time"] > now_ms:
-        closed = closed[:-1]
-    return closed
+
+    server_time_ms = int(client.get_server_time()["serverTime"])
+    return filter_closed_candles(candles, interval, server_time_ms)
 
 
 # =========================
@@ -643,6 +835,13 @@ class SpotBot:
 
         self.position: Position | None = None
         self.last_action_bar_close_time = None  # cooldown por vela cerrada
+        self.current_state = "COMPRA"
+        self.last_operated_state: Optional[str] = None
+        self.last_action: str = "-"
+        self.last_result: str = "-"
+        self.last_error: str = "-"
+        self.last_action_ts_utc: str = "-"
+        self._last_wallet_signature: Optional[tuple[float, float]] = None
 
         self.closed_trades: list[Trade] = []
         self.open_trades: list[Trade] = []
@@ -652,6 +851,71 @@ class SpotBot:
     def _emit(self, kind: str, payload: dict):
         if self.ui_cb:
             self.ui_cb(kind, payload)
+
+    def round_step_size(self, qty: float) -> float:
+        return round_step(qty, self.step)
+
+    def get_price(self) -> float:
+        return float(self.client.get_symbol_ticker(symbol=self.symbol)["price"])
+
+    def get_spot_balances(self) -> dict:
+        usdt = get_free_balance(self.client, QUOTE_ASSET)
+        sol = get_free_balance(self.client, BASE_ASSET)
+        px = self.get_price()
+        sol_value = sol * px
+        total = usdt + sol_value
+        return {
+            "usdt_free": usdt,
+            "sol_free": sol,
+            "price": px,
+            "sol_value_usdt": sol_value,
+            "wallet_total_usdt": total,
+        }
+
+    def sync_wallet(self, *, remember: bool = True) -> dict:
+        snap = self.get_spot_balances()
+        if remember:
+            self._last_wallet_signature = (round(snap["usdt_free"], 8), round(snap["sol_free"], 8))
+        return snap
+
+    def check_min_notional(self, qty: float, price: float) -> bool:
+        notional = float(qty) * float(price)
+        return notional >= max(MIN_TRADE_VALUE_USDT, float(self.min_notional or 0.0))
+
+    def update_status(self, *, action: str, result: str, error: str = "-"):
+        self.last_action = action
+        self.last_result = result
+        self.last_error = error
+        self.last_action_ts_utc = self._now_utc()
+        self._emit(
+            "status",
+            {
+                "state": self.current_state,
+                "last_action": self.last_action,
+                "last_result": self.last_result,
+                "last_error": self.last_error,
+                "time_utc": self.last_action_ts_utc,
+            },
+        )
+
+    def confirm_execution(self, before: dict, action: str, order_obj):
+        after = self.sync_wallet()
+        self._emit("log", {"msg": f"[CONFIRM] Saldo antes: USDT={before['usdt_free']:.6f} SOL={before['sol_free']:.6f}"})
+        self._emit("log", {"msg": f"[CONFIRM] Acción: {action}"})
+        self._emit("log", {"msg": f"[CONFIRM] Orden enviada: {order_obj.trade_id if order_obj else 'NO_EJECUTADA'}"})
+        self._emit("log", {"msg": f"[CONFIRM] Respuesta: {order_obj.raw[:280] if order_obj and order_obj.raw else 'N/A'}"})
+        self._emit("log", {"msg": f"[CONFIRM] Saldo después: USDT={after['usdt_free']:.6f} SOL={after['sol_free']:.6f}"})
+        self._emit("log", {"msg": f"[CONFIRM] Estado={self.current_state} Última acción={self.last_action} Resultado={self.last_result}"})
+
+    def get_strategy_state(self, candles: list[dict]) -> str:
+        b_score, s_score, _ = compute_scores(self.params, candles)
+        buy_th = float(self.params.get("buy_th", 0.5))
+        sell_th = float(self.params.get("sell_th", 0.5))
+        if b_score >= buy_th and b_score >= s_score:
+            return "COMPRA"
+        if s_score >= sell_th and s_score > b_score:
+            return "VENTA"
+        return "COMPRA" if b_score >= s_score else "VENTA"
 
     def _load_journal(self):
         if os.path.exists(JOURNAL_CSV):
@@ -1009,6 +1273,69 @@ class SpotBot:
             return None
         return self._place_market_sell_qty(qty, reason="MANUAL_SELL")
 
+    def buy_all_usdt(self) -> Optional[Trade]:
+        before = self.sync_wallet()
+        usdt_free = before["usdt_free"]
+        if usdt_free < MIN_TRADE_VALUE_USDT:
+            msg = f"[BUY] USDT menor a {MIN_TRADE_VALUE_USDT:.1f}, no se compra (evitar bucle)"
+            self._emit("log", {"msg": msg})
+            self.update_status(action="COMPRA", result="NO_EJECUTABLE", error=msg)
+            return None
+        target = usdt_free * ORDER_PCT
+        trade = self._place_market_buy_by_quote(target, reason="STATE_COMPRA")
+        if trade:
+            self.update_status(action="COMPRA", result="OK")
+            self.confirm_execution(before, "COMPRA", trade)
+            self.last_operated_state = "COMPRA"
+            self._open_position_from_trade(trade, int(time.time() * 1000))
+        else:
+            self.update_status(action="COMPRA", result="NO_EJECUTABLE", error="Orden de compra rechazada/fallida")
+        return trade
+
+    def sell_90_percent_sol(self) -> Optional[Trade]:
+        before = self.sync_wallet()
+        sol_free = before["sol_free"]
+        qty_to_sell = self.round_step_size(sol_free * SELL_PCT)
+        sol_value = qty_to_sell * before["price"]
+        if sol_value < MIN_TRADE_VALUE_USDT:
+            msg = f"[SELL] SOL menor a {MIN_TRADE_VALUE_USDT:.1f} USDT, no se vende (evitar bucle)"
+            self._emit("log", {"msg": msg})
+            self.update_status(action="VENTA", result="NO_EJECUTABLE", error=msg)
+            return None
+        if not self.check_min_notional(qty_to_sell, before["price"]):
+            msg = "[SELL] No cumple MIN_NOTIONAL/NOTIONAL con qty calculada; no se vende."
+            self._emit("log", {"msg": msg})
+            self.update_status(action="VENTA", result="NO_EJECUTABLE", error=msg)
+            return None
+        trade = self._place_market_sell_qty(qty_to_sell, reason="STATE_VENTA")
+        if trade:
+            self.update_status(action="VENTA", result="OK")
+            self.confirm_execution(before, "VENTA", trade)
+            self.last_operated_state = "VENTA"
+            rem = self.round_step_size(get_free_balance(self.client, BASE_ASSET))
+            self._emit("log", {"msg": f"[SELL] Verificación remanente SOL={rem:.6f} (incluye hold + dust)."})
+            self.position = None
+            self._emit("position", {"pos": None})
+        else:
+            self.update_status(action="VENTA", result="NO_EJECUTABLE", error="Orden de venta rechazada/fallida")
+        return trade
+
+    def execute_initial_state(self):
+        try:
+            candles = fetch_klines_closed(self.client, self.symbol, self.interval, LOOKBACK)
+            if len(candles) < 50:
+                self._emit("log", {"msg": "[INIT] No hay suficientes velas cerradas para estado inicial."})
+                return
+            self.current_state = self.get_strategy_state(candles)
+            self._emit("log", {"msg": f"[INIT] Estado estrategia={self.current_state}. Ejecutando de inmediato..."})
+            if self.current_state == "COMPRA":
+                self.buy_all_usdt()
+            else:
+                self.sell_90_percent_sol()
+        except Exception as e:
+            self.update_status(action="INIT", result="ERROR", error=str(e))
+            self._emit("log", {"msg": f"[INIT][ERROR] {e}"})
+
     def _open_position_from_trade(self, buy_trade: Trade, last_close_time_ms: int):
         ep = buy_trade.price
         qty = buy_trade.qty
@@ -1064,6 +1391,22 @@ class SpotBot:
             sell_trade.pnl_usdt_real = pnl_usdt_real
             self.closed_trades.append(sell_trade)
             self._append_journal(sell_trade)
+            self._emit("log", {"msg": f"[CLOSE] {reason} qty={sell_trade.qty:.6f} price={sell_trade.price:.4f} pnl={sell_trade.pnl_pct_real*100:.2f}% ({sell_trade.pnl_usdt_real:.4f} USDT)"})
+            for retry_idx in range(2):
+                rem = round_step(get_free_balance(self.client, BASE_ASSET), self.step)
+                if rem <= 0:
+                    break
+                self._emit("log", {"msg": f"[CLOSE] remanente detectado {rem:.6f} {BASE_ASSET}, reintento #{retry_idx + 1}"})
+                dust_trade = self._place_market_sell_qty(rem, reason=f"{reason}_CLEANUP")
+                if not dust_trade:
+                    break
+            rem_final = round_step(get_free_balance(self.client, BASE_ASSET), self.step)
+            if rem_final > 0:
+                self._emit("log", {"msg": f"[CLOSE] quedó remanente no vendible: {rem_final:.6f} {BASE_ASSET} (dust/minNotional)."})
+            else:
+                self._emit("log", {"msg": f"[CLOSE] verificación OK: 0 {BASE_ASSET} libre tras cierre."})
+        else:
+            self._emit("log", {"msg": f"[CLOSE] Falló venta de cierre ({reason})."})
 
         self.position = None
         self.last_action_bar_close_time = last_close_time_ms
@@ -1071,6 +1414,7 @@ class SpotBot:
 
     def _loop(self):
         self._emit("log", {"msg": f"[BOT] Inicio {self.symbol} {self.interval} | DRY_RUN={DRY_RUN} | tick={self.tick} step={self.step} minNot={self.min_notional} minQty={self.min_qty}"})
+        self.execute_initial_state()
 
         last_seen_close_time = None
 
@@ -1089,9 +1433,6 @@ class SpotBot:
                     time.sleep(2)
                     continue
                 last_seen_close_time = close_time
-                close_time_utc = datetime.fromtimestamp(close_time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-                self._emit("log", {"msg": f"[VELA] Nueva vela cerrada {close_time_utc} close={last_close:.4f}"})
-
                 bScore, sScore, score_close = compute_scores(self.params, candles)
                 last_close = score_close
                 close_time_utc = datetime.fromtimestamp(close_time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
@@ -1146,60 +1487,38 @@ class SpotBot:
                     "recent_candles": recent_candles,
                 })
 
-                # Ejecutar
-                if not in_pos and buy_cond:
-                    usdt_free = get_free_balance(self.client, QUOTE_ASSET)
-                    if usdt_free <= 0:
-                        self._emit("log", {"msg": "[BUY] USDT libre = 0, no compro"})
-                        continue
-
-                    target = usdt_free * ORDER_PCT if USE_98_PERCENT else usdt_free
-                    target = float(target)
-
-                    # Verificación y reintento si llenó poco
-                    spent_total = 0.0
-                    last_trade = None
-                    for attempt in range(MAX_RETRY_BUY + 1):
-                        remaining_target = max(0.0, target - spent_total)
-                        if remaining_target <= 0:
-                            break
-
-                        t = self._place_market_buy_by_quote(remaining_target, reason="SIGNAL_BUY")
-                        if not t:
-                            break
-                        spent_total += float(t.quote_spent)
-                        last_trade = t
-
-                        fill_ratio = spent_total / target if target > 0 else 0.0
-                        self._emit("log", {"msg": f"[BUY] intento {attempt} gastado={spent_total:.4f}/{target:.4f} ({fill_ratio*100:.1f}%) qty={t.qty:.6f} avg={t.price:.4f}"})
-
-                        if fill_ratio >= MIN_FILL_RATIO:
-                            break
-
-                        time.sleep(RETRY_SLEEP_SEC)
-
-                    if last_trade:
-                        if spent_total >= (MIN_FILL_RATIO * target):
-                            # Consolidar posición por “precio” usando último trade (simple). En real podrías promediar.
-                            self._open_position_from_trade(last_trade, close_time)
-                        else:
-                            self._emit("log", {"msg": f"[BUY] Fill insuficiente: spent={spent_total:.4f} < {MIN_FILL_RATIO*100:.0f}% target={target:.4f}. No abro posición."})
-
-                # Cierre por TP/SL primero
-                if in_pos and tp_hit:
-                    self._emit("log", {"msg": "[TP] Take Profit alcanzado -> cierro"})
-                    self._close_position(reason="TP", last_close_time_ms=close_time)
+                next_state = self.get_strategy_state(candles)
+                self.current_state = next_state
+                self._emit("log", {"msg": f"[STATE] estado={next_state} | último_operado={self.last_operated_state}"})
+                prev_sig = self._last_wallet_signature
+                wallet_now = self.sync_wallet(remember=False)
+                wallet_sig = (round(wallet_now["usdt_free"], 8), round(wallet_now["sol_free"], 8))
+                usdt_now = float(wallet_now["usdt_free"])
+                sol_now = float(wallet_now["sol_free"])
+                usdt_prev = float(prev_sig[0]) if prev_sig else 0.0
+                sol_prev = float(prev_sig[1]) if prev_sig else 0.0
+                sol_value_now = sol_now * float(spot_price)
+                same_state_external_refill = (
+                    (next_state == "VENTA" and sol_now > (sol_prev + 1e-9) and sol_value_now >= MIN_TRADE_VALUE_USDT)
+                    or (next_state == "COMPRA" and usdt_now > (usdt_prev + 1e-9) and usdt_now >= MIN_TRADE_VALUE_USDT)
+                )
+                if (
+                    self.last_result == "NO_EJECUTABLE"
+                    and self.last_action == next_state
+                    and self._last_wallet_signature == wallet_sig
+                ):
+                    self._emit("log", {"msg": f"[STATE] {next_state} no ejecutable y saldo sin cambios; no repito en bucle."})
                     continue
-                if in_pos and sl_hit:
-                    self._emit("log", {"msg": "[SL] Stop Loss alcanzado -> cierro"})
-                    self._close_position(reason="SL", last_close_time_ms=close_time)
+                if self.last_operated_state == next_state and not same_state_external_refill:
+                    self._emit("log", {"msg": f"[STATE] Ya ejecutado en estado {next_state}; esperando cambio de estado."})
                     continue
+                if self.last_operated_state == next_state and same_state_external_refill:
+                    self._emit("log", {"msg": f"[STATE] Detecté cambio manual de cartera en estado {next_state}; re-ejecuto acción."})
 
-                # Cierre por señal
-                if in_pos and sell_cond:
-                    self._emit("log", {"msg": "[SELL] Señal de cierre -> cierro"})
-                    self._close_position(reason="SIGNAL_SELL", last_close_time_ms=close_time)
-                    continue
+                if next_state == "COMPRA":
+                    self.buy_all_usdt()
+                else:
+                    self.sell_90_percent_sol()
 
             except Exception as e:
                 self._emit("log", {"msg": f"[ERROR] {e}"})
@@ -1251,16 +1570,48 @@ class BotGUI:
         self._build()
         self._start_auto_connect()
 
+    def _ui_call(self, fn, *args, **kwargs):
+        if threading.current_thread() is threading.main_thread():
+            fn(*args, **kwargs)
+        else:
+            self.root.after(0, lambda: fn(*args, **kwargs))
+
+    def _make_scrollable_tab(self, notebook: ttk.Notebook, title: str, *, padding: int = 10) -> ttk.Frame:
+        outer = ttk.Frame(notebook)
+        outer.grid_rowconfigure(0, weight=1)
+        outer.grid_columnconfigure(0, weight=1)
+
+        canvas = tk.Canvas(outer, highlightthickness=0)
+        yscroll = ttk.Scrollbar(outer, orient="vertical", command=canvas.yview)
+        xscroll = ttk.Scrollbar(outer, orient="horizontal", command=canvas.xview)
+        canvas.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
+
+        canvas.grid(row=0, column=0, sticky="nsew")
+        yscroll.grid(row=0, column=1, sticky="ns")
+        xscroll.grid(row=1, column=0, sticky="ew")
+
+        inner = ttk.Frame(canvas, padding=padding)
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(_event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            canvas.itemconfigure(win, width=event.width)
+
+        inner.bind("<Configure>", _on_inner_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+
+        notebook.add(outer, text=title)
+        return inner
+
     def _build(self):
         nb = ttk.Notebook(self.root)
         nb.pack(fill="both", expand=True)
 
-        bot_tab = ttk.Frame(nb, padding=10)
-        wallet_tab = ttk.Frame(nb, padding=10)
-        manual_tab = ttk.Frame(nb, padding=10)
-        nb.add(bot_tab, text="Bot")
-        nb.add(wallet_tab, text="Billetera SPOT")
-        nb.add(manual_tab, text="Manual")
+        bot_tab = self._make_scrollable_tab(nb, "Bot", padding=10)
+        wallet_tab = self._make_scrollable_tab(nb, "Billetera SPOT", padding=10)
+        manual_tab = self._make_scrollable_tab(nb, "Manual", padding=10)
 
         frm = bot_tab
 
@@ -1295,6 +1646,7 @@ class BotGUI:
         ttk.Button(btns, text="Iniciar", command=self.start).pack(side="left", padx=5)
         ttk.Button(btns, text="Detener", command=self.stop).pack(side="left", padx=5)
         ttk.Button(btns, text="Exportar Excel", command=self.export_excel).pack(side="left", padx=5)
+        ttk.Button(btns, text="Cargar mejor optimizador", command=self.load_optimizer_best).pack(side="right", padx=5)
         ttk.Button(btns, text="Cargar GEN235", command=self.load_gen235).pack(side="right")
 
         # Params quick view
@@ -1377,8 +1729,11 @@ class BotGUI:
         self.txt_params.insert("1.0", json.dumps(self.params, indent=2, ensure_ascii=False))
 
     def log(self, msg: str):
-        self.txt_log.insert("end", msg + "\n")
-        self.txt_log.see("end")
+        def _append():
+            self.txt_log.insert("end", msg + "\n")
+            self.txt_log.see("end")
+
+        self._ui_call(_append)
 
     def ui_callback(self, kind: str, payload: dict):
         # thread-safe update
@@ -1416,6 +1771,15 @@ class BotGUI:
                     )
             elif kind == "net":
                 self.var_connection.set(payload["status"])
+            elif kind == "status":
+                self.var_status.set(payload.get("state", self.var_status.get()))
+                self.var_last.set(payload.get("time_utc", self.var_last.get()))
+                self.log(
+                    f"[STATUS] estado={payload.get('state','-')} "
+                    f"accion={payload.get('last_action','-')} "
+                    f"resultado={payload.get('last_result','-')} "
+                    f"error={payload.get('last_error','-')}"
+                )
             # refresh table
             if self.bot:
                 # render last 200 closed trades
@@ -1444,20 +1808,23 @@ class BotGUI:
         self.root.after(0, _upd)
 
     def _update_wallet_table(self, wallet: list[dict]):
-        if not hasattr(self, "wallet_tree"):
-            return
-        self.wallet_tree.delete(*self.wallet_tree.get_children())
-        for item in wallet:
-            self.wallet_tree.insert(
-                "",
-                "end",
-                values=(
-                    item["asset"],
-                    f"{item['free']:.6f}",
-                    f"{item['locked']:.6f}",
-                    f"{item['total']:.6f}",
-                ),
-            )
+        def _render():
+            if not hasattr(self, "wallet_tree"):
+                return
+            self.wallet_tree.delete(*self.wallet_tree.get_children())
+            for item in wallet:
+                self.wallet_tree.insert(
+                    "",
+                    "end",
+                    values=(
+                        item["asset"],
+                        f"{item['free']:.6f}",
+                        f"{item['locked']:.6f}",
+                        f"{item['total']:.6f}",
+                    ),
+                )
+
+        self._ui_call(_render)
 
     def refresh_wallet(self):
         if not self.client:
@@ -1541,14 +1908,14 @@ class BotGUI:
             )
             self.client.ping()
             self.log("[OK] Conectado a Binance SPOT (ping ok).")
-            self.var_connection.set("online")
-            self.refresh_wallet()
+            self._ui_call(self.var_connection.set, "online")
+            self._ui_call(self.refresh_wallet)
             return True
         except Exception as e:
             self.client = None
-            self.var_connection.set("offline")
+            self._ui_call(self.var_connection.set, "offline")
             if show_errors:
-                messagebox.showerror("Error", str(e))
+                self._ui_call(messagebox.showerror, "Error", str(e))
             else:
                 self.log(f"[NET] Error de conexion: {e}")
             return False
@@ -1557,6 +1924,22 @@ class BotGUI:
         self.params = DEFAULT_GEN.copy()
         self._refresh_params_box()
         self.log("[OK] GEN235 cargado en parámetros.")
+
+    def load_optimizer_best(self):
+        try:
+            if not os.path.exists(OPTIMIZER_BEST_PATH):
+                messagebox.showwarning("Aviso", f"No existe {OPTIMIZER_BEST_PATH}. Ejecuta el optimizador primero.")
+                return
+            with open(OPTIMIZER_BEST_PATH, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            params = payload.get("params")
+            if not isinstance(params, dict) or not params:
+                raise ValueError(f"Archivo inválido: falta 'params' en {OPTIMIZER_BEST_PATH}")
+            self.set_params(params, log_msg=f"[OK] Parámetros cargados desde {OPTIMIZER_BEST_PATH}.")
+            if "metrics" in payload:
+                self.log(f"[INFO] Métricas mejor GEN: {json.dumps(payload['metrics'], ensure_ascii=False)}")
+        except Exception as e:
+            messagebox.showerror("Error", f"No se pudo cargar {OPTIMIZER_BEST_PATH}:\n{e}")
 
     def set_params(self, params: dict, log_msg: Optional[str] = None):
         self.params = params.copy()
@@ -1755,9 +2138,16 @@ def tv_indicator_cache_key(params: dict) -> str:
         "w_buy_rsi",
         "w_buy_macd",
         "w_buy_consec",
+        "w_buy_fng",
+        "w_buy_liq",
         "w_sell_rsi",
         "w_sell_macd",
         "w_sell_consec",
+        "w_sell_fng",
+        "w_sell_liq",
+        "fng_fear",
+        "fng_greed",
+        "liq_window",
         "buy_th",
         "sell_th",
     ]
@@ -1785,16 +2175,24 @@ def tv_apply_indicator_cache(tv_df: pd.DataFrame, params: dict):
     )
     rsi_os = float(params.get("rsi_oversold", 30))
     rsi_ob = float(params.get("rsi_overbought", 70))
-    wbr, wbm, wbc = normalize3(
+    wbr, wbm, wbc, wbf, wbl = normalize5(
         float(params.get("w_buy_rsi", 1.0)),
         float(params.get("w_buy_macd", 1.0)),
         float(params.get("w_buy_consec", 1.0)),
+        float(params.get("w_buy_fng", 0.0)),
+        float(params.get("w_buy_liq", 0.0)),
     )
-    wsr, wsm, wsc = normalize3(
+    wsr, wsm, wsc, wsf, wsl = normalize5(
         float(params.get("w_sell_rsi", 1.0)),
         float(params.get("w_sell_macd", 1.0)),
         float(params.get("w_sell_consec", 1.0)),
+        float(params.get("w_sell_fng", 0.0)),
+        float(params.get("w_sell_liq", 0.0)),
     )
+    fng_fear = float(params.get("fng_fear", 35.0))
+    fng_greed = float(params.get("fng_greed", 65.0))
+    fng_arr = build_fng_series(tv_df_to_candles(tv_df, INTERVAL))
+    liq_arr = build_liquidity_series(tv_df_to_candles(tv_df, INTERVAL), int(params.get("liq_window", 24)))
     prev_close = tv_df["close"].shift(1)
     rsi_buy = (tv_df["rsi"] <= rsi_os).astype(float)
     rsi_sell = (tv_df["rsi"] >= rsi_ob).astype(float)
@@ -1802,8 +2200,16 @@ def tv_apply_indicator_cache(tv_df: pd.DataFrame, params: dict):
     macd_sell = (tv_df["macd_hist"] < 0).astype(float)
     consec_buy = (tv_df["close"] <= prev_close).astype(float)
     consec_sell = (tv_df["close"] >= prev_close).astype(float)
-    tv_df["buy_score"] = wbr * rsi_buy + wbm * macd_buy + wbc * consec_buy
-    tv_df["sell_score"] = wsr * rsi_sell + wsm * macd_sell + wsc * consec_sell
+    fear = min(fng_fear, fng_greed - 1e-6)
+    greed = max(fng_greed, fear + 1e-6)
+    fng_series = pd.Series(fng_arr, index=tv_df.index) if fng_arr else pd.Series([50.0] * len(tv_df), index=tv_df.index)
+    liq_series = pd.Series(liq_arr, index=tv_df.index) if liq_arr else pd.Series([0.5] * len(tv_df), index=tv_df.index)
+    buy_fng = ((greed - fng_series) / (greed - fear)).clip(0.0, 1.0)
+    sell_fng = ((fng_series - fear) / (greed - fear)).clip(0.0, 1.0)
+    buy_liq = liq_series.clip(0.0, 1.0) * (tv_df["close"] >= prev_close).astype(float)
+    sell_liq = liq_series.clip(0.0, 1.0) * (tv_df["close"] <= prev_close).astype(float)
+    tv_df["buy_score"] = wbr * rsi_buy + wbm * macd_buy + wbc * consec_buy + wbf * buy_fng + wbl * buy_liq
+    tv_df["sell_score"] = wsr * rsi_sell + wsm * macd_sell + wsc * consec_sell + wsf * sell_fng + wsl * sell_liq
     cache_key = tv_indicator_cache_key(params)
     tv_df["cache_key"] = cache_key
     return tv_df
@@ -1913,12 +2319,19 @@ class Genome:
     w_buy_rsi: float
     w_buy_macd: float
     w_buy_consec: float
+    w_buy_fng: float
+    w_buy_liq: float
     buy_th: float
 
     w_sell_rsi: float
     w_sell_macd: float
     w_sell_consec: float
+    w_sell_fng: float
+    w_sell_liq: float
     sell_th: float
+    fng_fear: float
+    fng_greed: float
+    liq_window: int
 
     take_profit: float
     stop_loss: float
@@ -1958,6 +2371,8 @@ class ParamSpace:
         apply_weight_constraints(g)
         if g["macd_slow"] <= g["macd_fast"]:
             g["macd_slow"] = min(self.spec["macd_slow"]["max"], g["macd_fast"] + 5)
+        if g["fng_greed"] <= g["fng_fear"]:
+            g["fng_greed"] = min(self.spec["fng_greed"]["max"], g["fng_fear"] + 5)
         return Genome(**g)
 
     def clamp_genome(self, ge: Genome):
@@ -1968,6 +2383,8 @@ class ParamSpace:
         apply_weight_constraints(d)
         if d["macd_slow"] <= d["macd_fast"]:
             d["macd_slow"] = min(self.spec["macd_slow"]["max"], d["macd_fast"] + 5)
+        if d["fng_greed"] <= d["fng_fear"]:
+            d["fng_greed"] = min(self.spec["fng_greed"]["max"], d["fng_fear"] + 5)
         return Genome(**d)
 
 
@@ -1993,6 +2410,10 @@ class Metrics:
 
 
 def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float, trace: bool = False):
+    interval_ms = infer_interval_ms_from_candles(candles)
+    server_time_ms = max(c.get("close_time", 0) for c in candles) + interval_ms + 1 if candles else 0
+    candles = filter_closed_candles_by_interval_ms(candles, interval_ms, server_time_ms)
+
     if len(candles) < 200:
         metrics = Metrics(
             score=-1e9,
@@ -2035,6 +2456,8 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
         close_sig = [c["close"] for c in data]
         rsi_arr = rsi_wilder_series(close_sig, ge.rsi_period)
         mh_arr = macd_hist_series(close_sig, ge.macd_fast, ge.macd_slow, ge.macd_signal)
+    fng_arr = build_fng_series(candles)
+    liq_arr = build_liquidity_series(candles, int(getattr(ge, "liq_window", 24)))
 
     equity = 1.0
     peak = equity
@@ -2093,24 +2516,35 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
         if dd > max_dd:
             max_dd = dd
 
-        if i <= 0:
-            prev_close = close_sig[i]
-        else:
-            prev_close = close_sig[i - 1]
+        payload = score_components_at_index(
+            close_sig,
+            rsi_arr,
+            mh_arr,
+            i,
+            rsi_oversold=ge.rsi_oversold,
+            rsi_overbought=ge.rsi_overbought,
+            consec_red=ge.consec_red,
+            consec_green=ge.consec_green,
+            edge_trigger=ge.edge_trigger,
+            w_buy_rsi=ge.w_buy_rsi,
+            w_buy_macd=ge.w_buy_macd,
+            w_buy_consec=ge.w_buy_consec,
+            w_buy_fng=getattr(ge, "w_buy_fng", 0.0),
+            w_buy_liq=getattr(ge, "w_buy_liq", 0.0),
+            w_sell_rsi=ge.w_sell_rsi,
+            w_sell_macd=ge.w_sell_macd,
+            w_sell_consec=ge.w_sell_consec,
+            w_sell_fng=getattr(ge, "w_sell_fng", 0.0),
+            w_sell_liq=getattr(ge, "w_sell_liq", 0.0),
+            fng_value=float(fng_arr[i]) if fng_arr else 50.0,
+            liq_value=float(liq_arr[i]) if liq_arr else 0.5,
+            fng_fear=float(getattr(ge, "fng_fear", 35.0)),
+            fng_greed=float(getattr(ge, "fng_greed", 65.0)),
+        )
+        bs = payload["buy_score"]
+        ss = payload["sell_score"]
         rsi_val = rsi_arr[i]
         mh_val = mh_arr[i]
-
-        rsi_buy = 1.0 if rsi_val <= ge.rsi_oversold else 0.0
-        rsi_sell = 1.0 if rsi_val >= ge.rsi_overbought else 0.0
-        macd_buy = 1.0 if mh_val > 0 else 0.0
-        macd_sell = 1.0 if mh_val < 0 else 0.0
-        consec_buy = 1.0 if close_sig[i] <= prev_close else 0.0
-        consec_sell = 1.0 if close_sig[i] >= prev_close else 0.0
-
-        wbr, wbm, wbc = normalize3(ge.w_buy_rsi, ge.w_buy_macd, ge.w_buy_consec)
-        wsr, wsm, wsc = normalize3(ge.w_sell_rsi, ge.w_sell_macd, ge.w_sell_consec)
-        bs = wbr * rsi_buy + wbm * macd_buy + wbc * consec_buy
-        ss = wsr * rsi_sell + wsm * macd_sell + wsc * consec_sell
         if bs >= ge.buy_th:
             buy_signal_hits += 1
         if ss >= ge.sell_th:
@@ -2197,6 +2631,9 @@ def simulate_spot(candles, ge: Genome, fee_per_side: float, slip_per_side: float
             dd_curve.append((peak - equity) / peak if peak > 0 else 0.0)
 
     net = equity - 1.0
+    assert_simulator_uses_closed_last_price(candles, close_sig[-1], ge.use_ha == 1)
+    assert_bot_simulator_score_parity(ge, candles)
+
     balance = START_CAPITAL * equity
     profit = balance - START_CAPITAL
     dd_pct = (max_dd / (peak + 1e-12)) * 100.0
@@ -2291,12 +2728,17 @@ PARAM_GENES = [
     "cooldown",
     "edge_trigger",
     "use_ha",
+    "fng_fear",
+    "fng_greed",
+    "liq_window",
 ]
 
-PARAM_BLOCKS = ["RSI", "MACD", "CONSEC", "RISK", "CONF"]
+PARAM_BLOCKS = ["RSI", "MACD", "CONSEC", "FNG", "LIQ", "RISK", "CONF"]
 WEIGHT_KEYS = [
     "w_buy_rsi", "w_buy_macd", "w_buy_consec",
+    "w_buy_fng", "w_buy_liq",
     "w_sell_rsi", "w_sell_macd", "w_sell_consec",
+    "w_sell_fng", "w_sell_liq",
 ]
 
 WEIGHT_MUT_RATE = 0.35
@@ -2306,6 +2748,8 @@ BLOCK_SELECTION_WEIGHTS = {
     "RSI": 1.0,
     "MACD": 1.4,
     "CONSEC": 1.0,
+    "FNG": 1.2,
+    "LIQ": 1.1,
     "RISK": 1.0,
     "CONF": 0.8,
 }
@@ -2319,10 +2763,12 @@ BLOCKS = {
     "RSI": ["rsi_period", "rsi_oversold", "rsi_overbought"],
     "MACD": ["macd_fast", "macd_slow", "macd_signal"],
     "CONSEC": ["consec_red", "consec_green"],
+    "FNG": ["fng_fear", "fng_greed"],
+    "LIQ": ["liq_window"],
     "RISK": ["take_profit", "stop_loss", "cooldown", "edge_trigger", "use_ha"],
     "WEIGHTS": [
-        "w_buy_rsi", "w_buy_macd", "w_buy_consec",
-        "w_sell_rsi", "w_sell_macd", "w_sell_consec",
+        "w_buy_rsi", "w_buy_macd", "w_buy_consec", "w_buy_fng", "w_buy_liq",
+        "w_sell_rsi", "w_sell_macd", "w_sell_consec", "w_sell_fng", "w_sell_liq",
     ],
     "CONF": ["buy_th", "sell_th"],
 }
@@ -2552,6 +2998,9 @@ def run_ga(
         macd_sig = format_gene(ge.macd_signal, "macd_signal" in mutated_genes, "d")
         consec_r = format_gene(ge.consec_red, "consec_red" in mutated_genes, "d")
         consec_g = format_gene(ge.consec_green, "consec_green" in mutated_genes, "d")
+        fng_fear = format_gene(ge.fng_fear, "fng_fear" in mutated_genes, ".0f")
+        fng_greed = format_gene(ge.fng_greed, "fng_greed" in mutated_genes, ".0f")
+        liq_window = format_gene(ge.liq_window, "liq_window" in mutated_genes, "d")
         tp = format_gene(ge.take_profit, "take_profit" in mutated_genes, ".3f")
         sl = format_gene(ge.stop_loss, "stop_loss" in mutated_genes, ".3f")
         cd = format_gene(ge.cooldown, "cooldown" in mutated_genes, "d")
@@ -2559,9 +3008,13 @@ def run_ga(
         wbr = format_gene(ge.w_buy_rsi, "w_buy_rsi" in mutated_genes, ".2f")
         wbm = format_gene(ge.w_buy_macd, "w_buy_macd" in mutated_genes, ".2f")
         wbc = format_gene(ge.w_buy_consec, "w_buy_consec" in mutated_genes, ".2f")
+        wbf = format_gene(ge.w_buy_fng, "w_buy_fng" in mutated_genes, ".2f")
+        wbl = format_gene(ge.w_buy_liq, "w_buy_liq" in mutated_genes, ".2f")
         wsr = format_gene(ge.w_sell_rsi, "w_sell_rsi" in mutated_genes, ".2f")
         wsm = format_gene(ge.w_sell_macd, "w_sell_macd" in mutated_genes, ".2f")
         wsc = format_gene(ge.w_sell_consec, "w_sell_consec" in mutated_genes, ".2f")
+        wsf = format_gene(ge.w_sell_fng, "w_sell_fng" in mutated_genes, ".2f")
+        wsl = format_gene(ge.w_sell_liq, "w_sell_liq" in mutated_genes, ".2f")
         buy_th = format_gene(ge.buy_th, "buy_th" in mutated_genes, ".2f")
         sell_th = format_gene(ge.sell_th, "sell_th" in mutated_genes, ".2f")
         return (
@@ -2569,8 +3022,10 @@ def run_ga(
             f"RSI(p={rsi_p},os={rsi_os},ob={rsi_ob}) "
             f"MACD({macd_f},{macd_s},{macd_sig}) "
             f"consec(R={consec_r},G={consec_g}) "
+            f"FNG(fear={fng_fear},greed={fng_greed}) "
+            f"LIQ(win={liq_window}) "
             f"TP={tp} SL={sl} cd={cd} edge={edge} "
-            f"Wbuy=({wbr},{wbm},{wbc}) Wsell=({wsr},{wsm},{wsc}) "
+            f"Wbuy=({wbr},{wbm},{wbc},{wbf},{wbl}) Wsell=({wsr},{wsm},{wsc},{wsf},{wsl}) "
             f"umbrales(buy={buy_th},sell={sell_th})"
         )
 
@@ -2581,10 +3036,29 @@ def run_ga(
         for gene in sorted(mutation_counter.keys()):
             print(f"{gene}={mutation_counter[gene]}")
 
+    combo_penalties: dict[tuple[str, ...], float] = {}
+
+    def register_combo_feedback(combo: Optional[list[str]], improved: bool):
+        if not combo:
+            return
+        key = tuple(sorted(combo))
+        cur = combo_penalties.get(key, 1.0)
+        if improved:
+            combo_penalties[key] = min(1.0, cur + 0.20)
+        else:
+            combo_penalties[key] = max(COMBO_PENALTY_FLOOR, cur * COMBO_PENALTY_FACTOR)
+
+    def maybe_reset_combo_penalties(stuck_count: int):
+        if stuck_count >= COMBO_PENALTY_RESET_STUCK and combo_penalties:
+            combo_penalties.clear()
+            print(
+                f"[BLOQUE] reset probabilidades de combinaciones (stuck={stuck_count})",
+                flush=True,
+            )
+
     def pick_random_block_combo() -> Optional[list[str]]:
         if not param_blocks:
             return None
-        weights = [BLOCK_SELECTION_WEIGHTS.get(b, 1.0) for b in param_blocks]
         counts = list(BLOCK_COUNT_WEIGHTS.keys())
         count_weights = [BLOCK_COUNT_WEIGHTS[c] for c in counts]
         while True:
@@ -2592,7 +3066,13 @@ def run_ga(
             count = min(count, len(param_blocks))
             chosen = set()
             while len(chosen) < count:
-                block = random.choices(param_blocks, weights=weights, k=1)[0]
+                current_weights = []
+                for candidate in param_blocks:
+                    hypothetical = tuple(sorted(list(chosen | {candidate})))
+                    combo_bias = combo_penalties.get(hypothetical, 1.0)
+                    block_weight = BLOCK_SELECTION_WEIGHTS.get(candidate, 1.0)
+                    current_weights.append(block_weight * combo_bias)
+                block = random.choices(param_blocks, weights=current_weights, k=1)[0]
                 chosen.add(block)
             combo = tuple(sorted(chosen))
             if combo not in recent_blocks:
@@ -2637,14 +3117,18 @@ def run_ga(
         elite_hashes = [hash(tuple(asdict(ge).items())) for ge in [x[1] for x in scored[:cfg.elite]]]
         elite_unique = len(set(elite_hashes))
 
-        if best_global is None or best_score > best_global[0] + 1e-9:
+        improved_generation = best_global is None or best_score > best_global[0] + 1e-9
+        if improved_generation:
             prev_best_global_score = best_global[0] if best_global else None
             best_global = (best_score, copy.deepcopy(best_ge))
             best_metrics = best_m
             stuck = 0
+            register_combo_feedback(active_param_blocks, improved=True)
             active_param_blocks = None
         else:
             stuck += 1
+            register_combo_feedback(active_param_blocks, improved=False)
+            maybe_reset_combo_penalties(stuck)
             if is_weight_opt:
                 weight_no_improve += 1
 
@@ -2659,10 +3143,11 @@ def run_ga(
                 f"HA={best_ge.use_ha} RSI(p={best_ge.rsi_period},os={best_ge.rsi_oversold:.0f},ob={best_ge.rsi_overbought:.0f}) | "
                 f"MACD({best_ge.macd_fast},{best_ge.macd_slow},{best_ge.macd_signal}) | "
                 f"consec(R={best_ge.consec_red},G={best_ge.consec_green}) | "
+                f"FNG(fear={best_ge.fng_fear:.0f},greed={best_ge.fng_greed:.0f}) LIQ(win={best_ge.liq_window}) | "
                 f"TP={best_ge.take_profit:.3f} SL={best_ge.stop_loss:.3f} cd={best_ge.cooldown} edge={best_ge.edge_trigger} | "
                 f"buy_th={best_ge.buy_th:.2f} sell_th={best_ge.sell_th:.2f} | "
-                f"Wbuy({best_ge.w_buy_rsi:.2f},{best_ge.w_buy_macd:.2f},{best_ge.w_buy_consec:.2f}) "
-                f"Wsell({best_ge.w_sell_rsi:.2f},{best_ge.w_sell_macd:.2f},{best_ge.w_sell_consec:.2f})"
+                f"Wbuy({best_ge.w_buy_rsi:.2f},{best_ge.w_buy_macd:.2f},{best_ge.w_buy_consec:.2f},{best_ge.w_buy_fng:.2f},{best_ge.w_buy_liq:.2f}) "
+                f"Wsell({best_ge.w_sell_rsi:.2f},{best_ge.w_sell_macd:.2f},{best_ge.w_sell_consec:.2f},{best_ge.w_sell_fng:.2f},{best_ge.w_sell_liq:.2f})"
             )
             log_fn(
                 f"[DBG] uniq={len(unique_hashes)} elite_unique={elite_unique} "
@@ -2691,10 +3176,18 @@ def run_ga(
         if stuck >= BLOCK_STUCK_LIMIT:
             mask_saturated = True
 
+        weight_boost_mode = stuck >= WEIGHT_BOOST_STUCK_TRIGGER
+        mode_label = "WEIGHT-BOOST" if weight_boost_mode else "NORMAL"
+        curr_weight_mut_rate = WEIGHT_BOOST_MUT_RATE if weight_boost_mode else WEIGHT_MUT_RATE
+        curr_weight_sigma = WEIGHT_BOOST_MUT_SIGMA if weight_boost_mode else WEIGHT_MUT_SIGMA
+        curr_param_mut_rate = WEIGHT_BOOST_PARAM_MUT_RATE if weight_boost_mode else PARAM_MUT_RATE
+
         if active_param_blocks is None:
             active_param_blocks = pick_random_block_combo()
             print(
-                f"[BLOQUE] activos: {active_param_blocks} | pesos siempre mutan | gens={BLOCK_STUCK_LIMIT}",
+                f"[BLOQUE] modo={mode_label} activos: {active_param_blocks} | "
+                f"w_mut_rate={curr_weight_mut_rate:.2f} w_sigma={curr_weight_sigma:.2f} "
+                f"param_mut_rate={curr_param_mut_rate:.2f} | gens={BLOCK_STUCK_LIMIT}",
                 flush=True,
             )
         elif mask_saturated:
@@ -2703,8 +3196,10 @@ def run_ga(
             active_param_blocks = pick_random_block_combo()
             switch_elapsed = time.perf_counter() - before_switch
             print(
-                f"[BLOQUE] activos: {active_param_blocks} | pesos siempre mutan | "
-                f"gens={BLOCK_STUCK_LIMIT} | cambio_en={switch_elapsed:.3f}s",
+                f"[BLOQUE] modo={mode_label} activos: {active_param_blocks} | "
+                f"w_mut_rate={curr_weight_mut_rate:.2f} w_sigma={curr_weight_sigma:.2f} "
+                f"param_mut_rate={curr_param_mut_rate:.2f} | gens={BLOCK_STUCK_LIMIT} | "
+                f"cambio_en={switch_elapsed:.3f}s",
                 flush=True,
             )
             stuck = 0
@@ -2733,6 +3228,9 @@ def run_ga(
                 p1,
                 p2,
                 param_blocks=active_param_blocks,
+                param_mut_rate=curr_param_mut_rate,
+                weight_mut_rate=curr_weight_mut_rate,
+                weight_sigma=curr_weight_sigma,
                 strength=forced_strength if active_param_blocks else 0.55,
                 return_meta=DEBUG_MUTATION,
             )
@@ -2751,6 +3249,9 @@ def run_ga(
                 p1,
                 p2,
                 param_blocks=active_param_blocks,
+                param_mut_rate=curr_param_mut_rate,
+                weight_mut_rate=curr_weight_mut_rate,
+                weight_sigma=curr_weight_sigma,
                 strength=forced_strength if active_param_blocks else 0.80,
                 return_meta=DEBUG_MUTATION,
             )
@@ -2769,6 +3270,9 @@ def run_ga(
                 p1,
                 p2,
                 param_blocks=active_param_blocks,
+                param_mut_rate=curr_param_mut_rate,
+                weight_mut_rate=curr_weight_mut_rate,
+                weight_sigma=curr_weight_sigma,
                 strength=forced_strength if active_param_blocks else 1.00,
                 return_meta=DEBUG_MUTATION,
             )
@@ -2791,7 +3295,7 @@ def run_ga(
                     for gene in meta["mutated_genes"]:
                         mutation_counter[gene] += 1
 
-            structural_blocks = {"RSI", "MACD", "CONSEC", "RISK"}
+            structural_blocks = {"RSI", "MACD", "CONSEC", "FNG", "LIQ", "RISK"}
             structural_mutated = any(block_counts[bn] > 0 for bn in structural_blocks)
 
             def log_individual(label: str, ge: Genome, meta: Optional[dict] = None):
@@ -2844,6 +3348,9 @@ def run_ga(
                     ge,
                     ge,
                     param_blocks=active_param_blocks,
+                    param_mut_rate=curr_param_mut_rate,
+                    weight_mut_rate=curr_weight_mut_rate,
+                    weight_sigma=curr_weight_sigma,
                     strength=forced_strength if active_param_blocks else 0.80,
                     return_meta=DEBUG_MUTATION,
                 )
@@ -2875,6 +3382,9 @@ def run_ga(
                 seed,
                 seed,
                 param_blocks=active_param_blocks,
+                param_mut_rate=curr_param_mut_rate,
+                weight_mut_rate=curr_weight_mut_rate,
+                weight_sigma=curr_weight_sigma,
                 strength=forced_strength if active_param_blocks else 0.80,
                 return_meta=DEBUG_MUTATION,
             )
@@ -2975,6 +3485,33 @@ class OptimizerGUI:
         self.space = self.build_space_defaults()
         self.build_ui()
 
+    def _persist_best_result(self):
+        if not self.best_genome:
+            return
+        metrics_payload = None
+        if self.best_metrics is not None:
+            metrics_payload = {
+                "score": float(getattr(self.best_metrics, "score", 0.0)),
+                "pf": float(getattr(self.best_metrics, "pf", 0.0)),
+                "trades": int(getattr(self.best_metrics, "trades", 0)),
+                "trades_per_year": float(getattr(self.best_metrics, "trades_per_year", 0.0)),
+                "dd_pct": float(getattr(self.best_metrics, "dd_pct", 0.0)),
+                "net": float(getattr(self.best_metrics, "net", 0.0)),
+                "profit": float(getattr(self.best_metrics, "profit", 0.0)),
+                "balance": float(getattr(self.best_metrics, "balance", 0.0)),
+                "winrate": float(getattr(self.best_metrics, "winrate", 0.0)),
+            }
+        payload = {
+            "saved_at_utc": datetime.now(timezone.utc).isoformat(),
+            "symbol": self.var_symbol.get().strip().upper(),
+            "interval": self.var_tf.get().strip(),
+            "params": asdict(self.best_genome),
+            "metrics": metrics_payload,
+        }
+        with open(OPTIMIZER_BEST_PATH, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+        self.root.after(0, self.log, f"[OK] Mejor GEN guardado en {OPTIMIZER_BEST_PATH}.")
+
     def build_space_defaults(self):
         sp = ParamSpace()
         sp.add("use_ha", 0, 1, 1, "int")
@@ -2993,12 +3530,19 @@ class OptimizerGUI:
         sp.add("w_buy_rsi", 0.0, 1.0, 0.01, "float")
         sp.add("w_buy_macd", 0.0, 1.0, 0.01, "float")
         sp.add("w_buy_consec", 0.0, 1.0, 0.01, "float")
+        sp.add("w_buy_fng", 0.0, 1.0, 0.01, "float")
+        sp.add("w_buy_liq", 0.0, 1.0, 0.01, "float")
         sp.add("buy_th", 0.45, 0.85, 0.01, "float")
 
         sp.add("w_sell_rsi", 0.0, 1.0, 0.01, "float")
         sp.add("w_sell_macd", 0.0, 1.0, 0.01, "float")
         sp.add("w_sell_consec", 0.0, 1.0, 0.01, "float")
+        sp.add("w_sell_fng", 0.0, 1.0, 0.01, "float")
+        sp.add("w_sell_liq", 0.0, 1.0, 0.01, "float")
         sp.add("sell_th", 0.45, 0.85, 0.01, "float")
+        sp.add("fng_fear", 15.0, 45.0, 1.0, "float")
+        sp.add("fng_greed", 55.0, 85.0, 1.0, "float")
+        sp.add("liq_window", 8, 96, 1, "int")
 
         sp.add("take_profit", 0.01, 0.08, 0.001, "float")
         sp.add("stop_loss", 0.005, 0.06, 0.001, "float")
@@ -3128,11 +3672,18 @@ class OptimizerGUI:
             "w_buy_rsi": "Peso compra RSI",
             "w_buy_macd": "Peso compra MACD",
             "w_buy_consec": "Peso compra Consecutivas",
+            "w_buy_fng": "Peso compra Miedo/Codicia",
+            "w_buy_liq": "Peso compra Liquidez",
             "buy_th": "Umbral compra",
             "w_sell_rsi": "Peso venta RSI",
             "w_sell_macd": "Peso venta MACD",
             "w_sell_consec": "Peso venta Consecutivas",
+            "w_sell_fng": "Peso venta Miedo/Codicia",
+            "w_sell_liq": "Peso venta Liquidez",
             "sell_th": "Umbral venta",
+            "fng_fear": "FNG zona miedo",
+            "fng_greed": "FNG zona codicia",
+            "liq_window": "Liquidez ventana velas",
             "take_profit": "Take Profit",
             "stop_loss": "Stop Loss",
             "cooldown": "Cooldown (velas)",
@@ -3488,6 +4039,7 @@ class OptimizerGUI:
                     if self.best_genome:
                         self.root.after(0, self.log, "[FIN] Mejor encontrado:")
                         self.root.after(0, self.log, json.dumps(asdict(self.best_genome), indent=2, ensure_ascii=False))
+                        self._persist_best_result()
                 except Exception as e:
                     print("[ERROR] OptimizerGUI.start failure:", flush=True)
                     print(traceback.format_exc(), flush=True)
@@ -3539,6 +4091,7 @@ class OptimizerGUI:
             return
         params = asdict(self.best_genome)
         self.apply_callback(params)
+        self._persist_best_result()
         self.log("[OK] Parámetros aplicados al Bot.")
 
 
